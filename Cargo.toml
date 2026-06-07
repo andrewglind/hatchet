@@ -1,0 +1,18 @@
+[package]
+name = "hatchet"
+version = "0.0.1"
+edition = "2021"
+description = "Hatchet - a Haxe 4.x to C++98 transpiler for legacy platforms (Visual C++ 6.0, Windows 9x, older Unix)"
+license = "MIT"
+readme = "README.md"
+
+[[bin]]
+name = "hatchet"
+path = "src/main.rs"
+
+[lib]
+name = "hatchet"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
