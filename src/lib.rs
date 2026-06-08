@@ -4,7 +4,8 @@
 //! (and so targets Windows 9x and older Unix toolchains). This is a *transpiler*,
 //! not a compiler: it emits portable C++ source and never produces a custom C++
 //! runtime — every Haxe construct maps to a hand-writable C++ idiom. The
-//! transpilation rules live in `SKILL.md`.
+//! transpilation rules are documented in `README.md` and the module-level docs
+//! throughout this crate.
 //!
 //! Pipeline:
 //!   discover → lex → parse → semantic analysis → code generation

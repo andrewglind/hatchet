@@ -264,7 +264,7 @@ impl Program {
             };
             // local-ness dominates, then non-native, then nearest scope
             let key = ((scope != 0) as u8, t.is_native as u8, scope);
-            if best.map_or(true, |(_, bk)| key < bk) {
+            if best.is_none_or(|(_, bk)| key < bk) {
                 best = Some((t, key));
             }
         }

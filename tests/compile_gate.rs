@@ -32,12 +32,9 @@ fn find_gxx() -> Option<String> {
         Some("g++".to_string()),
         Some(r"C:\msys64\mingw32\bin\g++.exe".to_string()),
     ];
-    for c in candidates.into_iter().flatten() {
-        if Command::new(&c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
-            return Some(c);
-        }
-    }
-    None
+    candidates.into_iter().flatten().find(|c| {
+        Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    })
 }
 
 /// Absolute paths of every `.hx` file directly inside `dir` (non-recursive).

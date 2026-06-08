@@ -62,6 +62,11 @@ pub struct Args {
     #[arg(long, default_value_t = 1)]
     pub depth: usize,
 
+    /// Strip all `trace(...)` calls from the generated C++ (lowered to no-ops,
+    /// arguments not evaluated), mirroring hxcpp's `-D no-traces`.
+    #[arg(long)]
+    pub no_traces: bool,
+
     /// Name (stem) of the prelude source/header. e.g. `--stdafx MyGame` to use `MyGame.hx` instead of `StdAfx.hx`.
     #[arg(long, default_value = "StdAfx")]
     pub stdafx: String,
@@ -108,6 +113,8 @@ pub struct Config {
     pub force: bool,
     /// Buried-`Null<T>` auto-extraction depth (see `Args::depth`).
     pub extract_depth: usize,
+    /// Strip all `trace(...)` calls from the generated C++ (see `Args::no_trace`).
+    pub no_traces: bool,
     pub mode: OutputMode,
     /// Stem of the prelude source/header (default `StdAfx`).
     pub stdafx_stem: String,
@@ -189,7 +196,7 @@ fn run(args: Args) -> Result<(), String> {
         // expression-type inference, so it surfaces here rather than in sema.
         // Treat it like a sema error — collect it and skip the whole module
         // (header included) rather than emit a half-written pair.
-        let source = codegen::generate_source_diagnostics(&prog, i, cfg.extract_depth);
+        let source = codegen::generate_source_diagnostics(&prog, i, cfg.extract_depth, cfg.no_traces);
         if let Some((_, _, body_errors)) = &source {
             if !body_errors.is_empty() {
                 let rel = m.path.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -403,9 +410,9 @@ fn resolve_config(args: Args) -> Result<Config, String> {
             _ => {}
         }
     }
+    
     let root_dir = root_dir.expect("at least one file present");
-    info(&format!("Project root (from package): {}", root_dir.display()));
-
+    
     // The output directory is only meaningful when writing files; it defaults to
     // the inferred project root, so generated files land beside their sources.
     let out_dir = if mode == OutputMode::Files {
@@ -422,10 +429,6 @@ fn resolve_config(args: Args) -> Result<Config, String> {
         PathBuf::new()
     };
 
-    // The C++ namespace is always the Haxe `package` of each module (resolved in
-    // codegen), so there is no namespace flag or prompt here.
-    info("C++ namespace follows each module's Haxe package.");
-
     let stdafx_stem = {
         let s = args.stdafx.trim();
         if s.is_empty() { "StdAfx".to_string() } else { s.to_string() }
@@ -441,6 +444,7 @@ fn resolve_config(args: Args) -> Result<Config, String> {
         out_dir,
         force: args.force,
         extract_depth: args.depth.max(1),
+        no_traces: args.no_traces,
         mode,
         stdafx_stem,
         export_macro,

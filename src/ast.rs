@@ -150,6 +150,17 @@ pub enum Expr {
     TypeCheck { expr: Box<Expr>, ty: Type },
     /// Parenthesised expression (grouping preserved for fidelity).
     Paren(Box<Expr>),
+
+    /// `untyped <rest of statement>` — the operand is captured as raw source and
+    /// emitted to C++ verbatim, bypassing all type checking and transpilation.
+    /// Used to drop down to C/C++ APIs the Haxe side cannot see (e.g. a
+    /// platform intrinsic inside a `#if`/`#end` block).
+    Verbatim(String),
+
+    /// A regular-expression literal `~/pattern/flags`. Hatchet does not transpile
+    /// regex; this is carried only so the validation pass can flag it as
+    /// `Unsupported` with a precise location.
+    Regex { pattern: String, flags: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -212,7 +223,11 @@ pub enum Stmt {
         line: usize,
     },
     For {
+        /// The loop binding. For `for (v in coll)` this is the element/value; for
+        /// the key/value form `for (k => v in map)` this is the **key**.
         var: String,
+        /// The value binding of a `for (k => v in map)` loop; `None` otherwise.
+        value_var: Option<String>,
         iter: Iterable,
         body: Box<Stmt>,
         line: usize,
@@ -377,11 +392,20 @@ pub struct Import {
     pub alias: Option<String>,
 }
 
+/// A `using` static-extension declaration. Hatchet has no lowering for static
+/// extensions (they rewrite `a.f(b)` into `Module.f(a, b)` at the call site by
+/// type), so the `line` is retained to report it as unsupported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Using {
+    pub path: Vec<String>,
+    pub line: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct File {
     pub package: Vec<String>,
     pub imports: Vec<Import>,
-    pub usings: Vec<Vec<String>>,
+    pub usings: Vec<Using>,
     pub decls: Vec<Decl>,
     /// File-level metadata that precedes no declaration — a class-less Haxe file
     /// (e.g. a `StdAfx.hx` carrying only `@:headerCode`). Empty for ordinary files.

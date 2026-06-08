@@ -3,8 +3,7 @@
 //! Per the rules, when a `StdAfx.hx` is found we create a `StdAfx.h` and inject
 //! the code exactly as specified in the `@:headerCode(...)` metadata; no
 //! `StdAfx.cpp` is generated. The include guard is derived from the package, e.g.
-//! package `modules` → `STDAFX_MODULES_H` (this matches the committed goldens and
-//! supersedes the older `_STDAFX_H_` text in SKILL.md — see milestone 8).
+//! package `modules` → `STDAFX_MODULES_H` (this matches the committed goldens).
 
 use std::path::{Path, PathBuf};
 
@@ -150,8 +149,8 @@ pub fn export_macros(prefix: &str) -> String {
 
 /// The fixed-width unsigned integer shim. Hatchet emits `uint8_t`/`uint16_t`/
 /// `uint32_t` (from Haxe `UInt8`/`UInt16`/`UInt32`), but C++98 / Visual C++ 6.0 has
-/// no `<cstdint>`; this defines them portably — via MSVC's `__intN` builtins, and
-/// plain unsigned types elsewhere — and falls through to `<cstdint>` on C++11 and
+/// no `<stdint.h>`; this defines them portably — via MSVC's `__intN` builtins, and
+/// plain unsigned types elsewhere — and falls through to `<stdint.h>` on C++11 and
 /// later. It is emitted **first** in the prelude so the types are available to any
 /// developer `@:headerCode` and to every engine header the modules include.
 pub fn stdint_shim() -> &'static str {
@@ -166,7 +165,7 @@ pub fn stdint_shim() -> &'static str {
      \t\ttypedef unsigned int uint32_t;\n\
      \t#endif\n\
      #else\n\
-     \t#include <cstdint>\n\
+     \t#include <stdint.h>\n\
      #endif\n"
 }
 
@@ -266,7 +265,7 @@ mod tests {
         assert!(!out.contains("<float.h>"), "float.h is not part of the required set:\n{out}");
         // The uint*_t shim is present and precedes the includes (types first).
         assert!(out.contains("typedef unsigned __int32 uint32_t;"), "MSVC uint shim:\n{out}");
-        assert!(out.contains("#include <cstdint>"), "C++11 fallthrough:\n{out}");
+        assert!(out.contains("#include <stdint.h>"), "C++11 fallthrough:\n{out}");
         assert!(
             out.find("uint32_t").unwrap() < out.find("#include <stdlib.h>").unwrap(),
             "the shim comes before the required includes:\n{out}"

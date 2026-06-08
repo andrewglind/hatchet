@@ -6,12 +6,8 @@ older Unix toolchains. It is a *transpiler*, not a compiler: it emits C++ source
 target, and it never produces a custom C++ runtime — every Haxe construct maps to an equivalent,
 hand-writable C++ idiom.
 
-The name is a small play on Haxe — a *hatchet* is a small axe (Hatchet implements a focused subset of
+The name is a play on Haxe — a *hatchet* is a small axe (Hatchet implements a focused subset of
 Haxe 4.x) — and on "hatch it": develop on a modern machine, then hatch your ideas onto legacy targets.
-
-The transpilation rules are specified in [`SKILL.md`](SKILL.md). Hatchet began life as a "skill" for
-coding agents (e.g. [Claude Code](https://claude.com/product/claude-code)); this repository is a
-concrete, deterministic Rust implementation of that specification.
 
 ## Motivation
 
@@ -37,14 +33,29 @@ Supported today, end to end:
   (which emits no code of its own, only the includes it contributes).
 - **Members & access** — `(default,set)` / `(default,null)` property accessors (`GetX`/`SetX`, with
   the value-vs-pointer `const` rule), `@:protected`, `@:readOnly` (const-return), `@:decl` (DLL-export
-  class), `extern inline` (`extern "C"` export via a portable macro), and the base-from-member
+  class), `@:overload(...)` (a call is resolved to the matching C++ overload by argument type, else a
+  hard error), `extern inline` (`extern "C"` export via a portable macro), and the base-from-member
   `Holder` idiom for constructors whose `super(...)` is not the first statement.
 - **Statements & expressions** — `super(...)` initializer lists; `.`-vs-`->` selection via type
   inference (including inherited fields); anonymous-struct-to-temporary expansion (typed, untyped,
-  nested); array / map / object literals; `Array`→`std::vector`, `Map`→`std::map`; container ops
-  (`push`/`insert`/`pop`/`get`/`exists`/`length`); array & map comprehensions; closures /
-  `Array.map` lowered to free functions; string interpolation (`sprintf`); `??`, NULL-guarded `?.`;
-  `switch`/enum constants; and the `Math` / `Std` / `Sys` intrinsics.
+  nested); array / map / object literals; `Array`→`std::vector` and `Map`→`std::map` with their
+  container ops — Array `push`/`insert`/`pop`/`length`/`indexOf`/`contains`/`remove`/`reverse`/
+  `copy`/`join` and Map `get`/`exists`/`set`/`remove`/`keys` (each an inline loop/expression, no
+  `<algorithm>` dependency); `for` over a range, an array, an anonymous array literal
+  (`for (i in [1,2,3])`), or a map (`for (v in m)` over values, `for (k => v in m)` over key/value
+  pairs, via a `std::map` iterator); array & map comprehensions; closures / `Array.map` lowered to
+  free functions; `String` methods (`charAt`/`charCodeAt`/`indexOf`/`lastIndexOf`/`toUpperCase`/
+  `toLowerCase`/`split`) and `String.fromCharCode`, mapped to `std::string` expressions; string
+  interpolation (`sprintf`, including the `$ident` shorthand); the `??` null-coalesce and
+  NULL-guarded `?.`; `cast` (C-style cast for `cast(expr, T)`, passthrough for `cast expr`); the
+  `(expr : Type)` type ascription (a compile-time hint that drives inference, e.g. `([] : Array<Int>)`);
+  `switch`/enum constants; `trace(...)` (with `--no-traces` to strip it); and the `Math` / `Std` /
+  `Sys` intrinsics (`Std.int`/`Std.string`/`Std.parseInt`/`Std.parseFloat` → inline
+  `(int)`/`sprintf`/`strtol`/`atof`).
+- **Conditional compilation & escape hatches** — Haxe `#if FLAG` / `#else` / `#end` map to the C++
+  preprocessor (`#ifdef`/`#else`/`#endif`); `untyped <expr>` passes an expression through to C++
+  verbatim; a statement-level `@:include("…")` emits an `#include` at that point; and
+  `@:cppFileCode('…')` injects verbatim C++ in a body.
 - **Types & nullability** — `Null<T>` and optional value-structs lower uniformly to `T*` (with
   matching heap-allocation at call sites); `Map.get(k)` lowers to an iterator with an existence
   check; `final` constants lower to namespace-scoped `static const` (no `#define`), namespace-
@@ -111,9 +122,9 @@ from its `package` declaration (the file's directory minus its package path).
 | `--stdafx <NAME>` | Stem of the prelude source/header (default `StdAfx` → `StdAfx.h`; e.g. `MyGame` → `MyGame.h`) |
 | `--export-macro <PREFIX>` | Prefix for the portable DLL-export macros wrapped around `extern inline` functions (default `HATCHET` → `HATCHET_EXPORT`/`HATCHET_CALL`/`HATCHET_CLASS`; e.g. `MUCUS`) |
 | `--depth <N>` | Max expression-nesting depth at which a buried `Null<T>` call is auto-extracted into a freed local instead of warned about (default `1`; e.g. `2` auto-extracts `if (GetEdge(e) == null)`) |
+| `--no-traces` | Strip all `trace(...)` calls from the generated C++ (lowered to no-ops, arguments not evaluated), mirroring hxcpp's `-D no-traces` |
 
-Per the rules in `SKILL.md`, `Main.hx` is never transpiled (it is the hxcpp entry point), and
-`StdAfx.hx` produces only a `StdAfx.h` (from its `@:headerCode` metadata).
+A `Main.hx` is never transpiled, it is treated as the hxcpp entry point only
 
 ## Architecture
 
@@ -155,7 +166,13 @@ hatchet: 1 error(s); 1 module(s) were not generated
 The same discipline applies to **unsupported Haxe idioms**: valid Haxe that Hatchet does not yet
 transpile fails with an invitation to contribute upstream (the repository URL is in `src/diag.rs`).
 This distinguishes "your input is wrong" (fix the Haxe) from "Hatchet doesn't do this yet" (raise a
-PR).
+PR). Currently flagged as unsupported: a **lambda** used outside a top-level `final` binding or an
+`Array.map(...)` argument; **Haxe macros** (a `macro` function, or the macro AST type `Expr`);
+**regular expressions** (both the `~/pattern/flags` literal and the `EReg` type); **`using` static
+extensions**; and **parameterized enum variants** (a variant with constructor parameters, e.g.
+`Move(dx:Int, dy:Int)`, which would need a tagged-union lowering). Relatedly, a `for` loop over
+anything other than a range, an `Array`, or a `Map` (a custom `Iterator`/`Iterable`) is a hard
+error rather than a guess.
 
 ## Standalone projects and the prelude
 
@@ -194,8 +211,7 @@ cargo test
 The whole-corpus **compile gate** (`tests/compile_gate.rs`) transpiles both Haxe repos into a
 temporary mirror and compiles every generated `.cpp` with `g++ -std=c++98 -fsyntax-only`; it locates
 a compiler via `HATCHET_GXX`, else `g++` on `PATH`, else a default MSYS2 install, and skips if none
-is found. When the goldens and `SKILL.md` disagree, the **goldens win** and `SKILL.md` is updated to
-match (it is the compiled, ground-truth output).
+is found.
 
 ### The native boundary contract
 

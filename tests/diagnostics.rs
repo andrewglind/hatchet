@@ -136,6 +136,158 @@ fn lambda_in_map_or_top_level_final_is_supported() {
 }
 
 #[test]
+fn macro_function_is_unsupported() {
+    // A `macro` function is compile-time metaprogramming with no C++ lowering; it
+    // must raise an `Unsupported` diagnostic (which carries the PR invite).
+    let (prog, idx) = program_from(
+        "Builder",
+        "@:expose\nclass Builder {\n  public function new() {}\n  macro function build():Void {}\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("macro")
+            && d.message.contains("build")),
+        "expected an Unsupported macro diagnostic, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn macro_function_with_reification_body_is_unsupported_not_a_parse_error() {
+    // A real macro body contains reification syntax (`macro`, `$x`) that the
+    // expression parser cannot handle. Hatchet must skip the body and still
+    // report the function as `Unsupported` — not crash with a lex/parse error.
+    let (prog, idx) = program_from(
+        "Sq",
+        "@:expose\nclass Sq {\n  public function new() {}\n  \
+         macro static function Square(x:Expr) { return macro $x * $x; }\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("macro")
+            && d.message.contains("Square")),
+        "expected an Unsupported macro diagnostic for Square, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn expr_macro_type_is_unsupported_not_unresolved() {
+    // The macro AST type `Expr` is unsupported — and reported as `Unsupported`
+    // (with the PR invite), NOT as a plain "unresolved type" error.
+    let (prog, idx) = program_from(
+        "Reify",
+        "@:expose\nclass Reify {\n  var node:Expr;\n  public function new() {}\n}\n",
+    );
+    let unsup = unsupported_construct_errors(&prog, idx);
+    assert!(
+        unsup.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("Expr")
+            && d.message.contains("field `node`")
+            && d.line == 3),
+        "expected an Unsupported Expr diagnostic on line 3, got: {:?}",
+        unsup.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+    // It must NOT also surface as an unresolved-type error.
+    let unresolved = unresolved_type_errors(&prog, idx);
+    assert!(
+        !unresolved.iter().any(|d| d.message.contains("Expr")),
+        "Expr should not be double-reported as unresolved, got: {:?}",
+        unresolved.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn using_static_extension_is_unsupported() {
+    // `using` rewrites call sites by type — Hatchet has no such lowering, so a
+    // `using` must be flagged (it would otherwise be silently ignored). The
+    // declaration is on line 2.
+    let (prog, idx) = program_from(
+        "Ext",
+        "package p;\nusing StringTools;\n@:expose\nclass Ext {\n  public function new() {}\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("using")
+            && d.message.contains("StringTools")
+            && d.line == 2),
+        "expected an Unsupported `using` diagnostic on line 2, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn parameterized_enum_variant_is_unsupported() {
+    // A variant with constructor parameters needs a tagged union; Hatchet emits a
+    // plain C++ enum, so the payload would be lost. The parameterized variant
+    // `Move` is on line 3; the bare variant `Stop` must NOT be flagged.
+    let (prog, idx) = program_from(
+        "Cmd",
+        "package p;\nenum Cmd {\n  Move(dx:Int, dy:Int);\n  Stop;\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("parameterized enum variant")
+            && d.message.contains("Move")
+            && d.line == 3),
+        "expected an Unsupported parameterized-variant diagnostic for Move on line 3, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+    assert!(
+        !errs.iter().any(|d| d.message.contains("Stop")),
+        "the bare variant Stop must not be flagged, got: {:?}",
+        errs.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn regex_literal_is_unsupported() {
+    // The `~/pattern/flags` regex literal is not transpiled; it must raise an
+    // `Unsupported` diagnostic (which carries the PR invite) on its statement line.
+    let (prog, idx) = program_from(
+        "Matcher",
+        "@:expose\nclass Matcher {\n  public function new() {}\n  public function check():Void {\n    var r = ~/haxe/i;\n  }\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("regular-expression literal")
+            && d.line == 5),
+        "expected an Unsupported regex-literal diagnostic on line 5, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn ereg_type_is_unsupported_not_unresolved() {
+    // `EReg` (the std regex type) is unsupported — reported as `Unsupported` (with
+    // the PR invite), not as a plain "unresolved type".
+    let (prog, idx) = program_from(
+        "Rx",
+        "@:expose\nclass Rx {\n  public function new() {}\n  public function go():Void {\n    var r = new EReg(\"haxe\", \"i\");\n  }\n}\n",
+    );
+    let unsup = unsupported_construct_errors(&prog, idx);
+    assert!(
+        unsup.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("regular-expression type")
+            && d.message.contains("EReg")
+            && d.line == 5),
+        "expected an Unsupported EReg diagnostic on line 5, got: {:?}",
+        unsup.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+    let unresolved = unresolved_type_errors(&prog, idx);
+    assert!(
+        !unresolved.iter().any(|d| d.message.contains("EReg")),
+        "EReg should not be double-reported as unresolved, got: {:?}",
+        unresolved.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn primitives_containers_and_declared_types_are_not_flagged() {
     // Int/String/Array/Map/Null and a locally-declared struct all resolve.
     let (prog, idx) = program_from(

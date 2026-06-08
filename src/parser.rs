@@ -8,7 +8,7 @@
 use std::fmt;
 
 use crate::ast::*;
-use crate::lexer::{lex, Kw, Sym, TokKind, Token};
+use crate::lexer::{lex, Kw, PpKind, Sym, TokKind, Token};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
@@ -143,6 +143,65 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Validate that a `#if` condition is a single bare flag (an identifier).
+    /// Boolean conditions (`!X`, `A && B`, parentheses) are rejected: they map
+    /// to `#ifdef`, which only takes one macro name.
+    fn bare_flag(&self, cond: &str) -> PResult<String> {
+        let ok = !cond.is_empty()
+            && cond.bytes().enumerate().all(|(i, b)| {
+                if i == 0 {
+                    b == b'_' || b.is_ascii_alphabetic()
+                } else {
+                    b == b'_' || b.is_ascii_alphanumeric()
+                }
+            });
+        if ok {
+            Ok(cond.to_string())
+        } else {
+            Err(self.err(&format!(
+                "only a bare conditional-compilation flag is supported \
+                 (e.g. `#if DREAMCAST`); `{cond}` is not a single flag"
+            )))
+        }
+    }
+
+    /// Capture the raw source of an `untyped` operand: everything up to the end
+    /// of the current statement — the next top-level `;`, `,`, or an unmatched
+    /// closing `)`/`]`/`}`. The text is returned exactly as written (no
+    /// transpilation), so it must already be valid C++.
+    fn capture_verbatim_operand(&mut self) -> PResult<String> {
+        if self.at_eof() {
+            return Err(self.err("`untyped` must be followed by an expression"));
+        }
+        let from = self.toks[self.pos].start;
+        let mut last_end = from;
+        let mut depth = 0i32;
+        loop {
+            match self.peek() {
+                TokKind::Eof => break,
+                TokKind::Sym(Sym::Semi) if depth == 0 => break,
+                TokKind::Sym(Sym::Comma) if depth == 0 => break,
+                TokKind::Sym(Sym::LParen | Sym::LBracket | Sym::LBrace) => depth += 1,
+                TokKind::Sym(Sym::RParen | Sym::RBracket | Sym::RBrace) => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+            last_end = self.toks[self.pos].end;
+            self.bump();
+        }
+        let raw = String::from_utf8_lossy(&self.src[from..last_end])
+            .trim()
+            .to_string();
+        if raw.is_empty() {
+            return Err(self.err("`untyped` must be followed by an expression"));
+        }
+        Ok(raw)
+    }
+
     // ---- metadata -------------------------------------------------------
 
     fn parse_meta_list(&mut self) -> PResult<Vec<Meta>> {
@@ -183,6 +242,30 @@ impl<'a> Parser<'a> {
     }
 
     /// Advance over one argument, stopping before a top-level `,` or `)`.
+    /// Consume a balanced `{ ... }` block without parsing its contents. Used to
+    /// skip the body of constructs Hatchet does not transpile (e.g. `macro`
+    /// functions), which may contain syntax the expression parser rejects.
+    fn skip_braced_block(&mut self) -> PResult<()> {
+        self.expect_sym(Sym::LBrace)?;
+        let mut depth = 1i32;
+        loop {
+            match self.peek() {
+                TokKind::Eof => return Err(self.err("unterminated block")),
+                TokKind::Sym(Sym::LBrace) => depth += 1,
+                TokKind::Sym(Sym::RBrace) => {
+                    depth -= 1;
+                    self.bump();
+                    if depth == 0 {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            self.bump();
+        }
+    }
+
     fn skip_balanced_until_arg_end(&mut self) -> PResult<()> {
         let mut depth = 0i32;
         loop {
@@ -228,7 +311,12 @@ impl<'a> Parser<'a> {
         };
 
         if self.eat_kw(Kw::Package) {
-            file.package = self.parse_dotted()?;
+            // `package;` (empty package) is valid Haxe and means the root
+            // package — identical to omitting the declaration. Only parse a
+            // dotted path when a name actually follows the keyword.
+            if !self.at_sym(Sym::Semi) {
+                file.package = self.parse_dotted()?;
+            }
             self.expect_sym(Sym::Semi)?;
         }
 
@@ -239,10 +327,11 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.at_kw(Kw::Using) {
+                let line = self.line();
                 self.bump();
                 let path = self.parse_dotted()?;
                 self.expect_sym(Sym::Semi)?;
-                file.usings.push(path);
+                file.usings.push(Using { path, line });
                 continue;
             }
             if self.at_eof() {
@@ -662,7 +751,16 @@ impl<'a> Parser<'a> {
             None
         };
         let body = if self.at_sym(Sym::LBrace) {
-            Some(self.parse_block()?)
+            if modifiers.is_macro {
+                // A `macro` function's body is Haxe macro-reification syntax
+                // (`macro`, `$x`, ...) that Hatchet does not transpile. Skip it
+                // verbatim so the reification doesn't trip up the expression
+                // parser; sema reports the function itself as unsupported.
+                self.skip_braced_block()?;
+                None
+            } else {
+                Some(self.parse_block()?)
+            }
         } else {
             self.eat_sym(Sym::Semi);
             None
@@ -957,6 +1055,44 @@ impl<'a> Parser<'a> {
                 self.eat_sym(Sym::Semi);
                 Ok(Stmt::Verbatim { code, line })
             }
+            // Statement-level `@:include("X")` emits an `#include` directive at
+            // this point (so it can sit inside a `#if`/`#end` block). Angle-form
+            // (`<...>`) is emitted unquoted; everything else is quoted, matching
+            // the header include convention.
+            TokKind::Meta(name) if name == "include" => {
+                self.bump();
+                let args = if self.at_sym(Sym::LParen) {
+                    self.parse_meta_args()?
+                } else {
+                    Vec::new()
+                };
+                let path = args.into_iter().next().unwrap_or_default();
+                self.eat_sym(Sym::Semi);
+                let code = if path.starts_with('<') {
+                    format!("#include {path}")
+                } else {
+                    format!("#include \"{path}\"")
+                };
+                Ok(Stmt::Verbatim { code, line })
+            }
+            // Conditional-compilation directives, repurposed as a front end for
+            // the C++ preprocessor. Only a bare flag is supported (`#if FLAG` →
+            // `#ifdef FLAG`); negation / boolean conditions / `#elseif` raise an
+            // error, exactly as the project's "raise, do not guess" rule requires.
+            TokKind::Pp(kind, cond) => {
+                self.bump();
+                let code = match kind {
+                    PpKind::If => format!("#ifdef {}", self.bare_flag(&cond)?),
+                    PpKind::Else => "#else".to_string(),
+                    PpKind::End => "#endif".to_string(),
+                    PpKind::ElseIf => {
+                        return Err(self.err(
+                            "`#elseif` is not supported; use nested `#if`/`#else`/`#end`",
+                        ))
+                    }
+                };
+                Ok(Stmt::Verbatim { code, line })
+            }
             _ => {
                 let e = self.parse_expr()?;
                 self.eat_sym(Sym::Semi);
@@ -986,11 +1122,17 @@ impl<'a> Parser<'a> {
         self.expect_sym_kw(Kw::For)?;
         self.expect_sym(Sym::LParen)?;
         let var = self.expect_ident()?;
+        // `for (key => value in map)` — the optional value binding.
+        let value_var = if self.eat_sym(Sym::FatArrow) {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
         self.expect_sym_kw(Kw::In)?;
         let iter = self.parse_iterable()?;
         self.expect_sym(Sym::RParen)?;
         let body = Box::new(self.parse_stmt()?);
-        Ok(Stmt::For { var, iter, body, line })
+        Ok(Stmt::For { var, value_var, iter, body, line })
     }
 
     fn parse_iterable(&mut self) -> PResult<Iterable> {
@@ -1178,6 +1320,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
+        if self.eat_kw(Kw::Untyped) {
+            // `untyped <rest of statement>` — capture the operand as raw source
+            // and pass it straight through to C++ (no transpilation).
+            let code = self.capture_verbatim_operand()?;
+            return Ok(Expr::Verbatim(code));
+        }
         if self.eat_kw(Kw::Cast) {
             // cast(expr, Type) | cast expr
             if self.at_sym(Sym::LParen) {
@@ -1313,6 +1461,10 @@ impl<'a> Parser<'a> {
             TokKind::Str { raw, interpolated } => {
                 self.bump();
                 Ok(Expr::Str { raw, interpolated })
+            }
+            TokKind::Regex { pattern, flags } => {
+                self.bump();
+                Ok(Expr::Regex { pattern, flags })
             }
             TokKind::Kw(Kw::True) => {
                 self.bump();
@@ -1617,6 +1769,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_empty_package_as_root() {
+        // `package;` is valid Haxe and equivalent to omitting the declaration:
+        // the file lives in the root package.
+        let f = file("package;\nclass X {}");
+        assert!(f.package.is_empty(), "empty package should be the root");
+        assert_eq!(f.decls.len(), 1);
+    }
+
+    #[test]
     fn parses_class_less_file_with_file_level_metadata() {
         // A `StdAfx.hx` style file: package + `@:headerCode`, no declaration.
         let f = file("package modules;\n@:headerCode('#include <vector>')");
@@ -1646,6 +1807,55 @@ mod tests {
             Stmt::Verbatim { code, .. } => assert_eq!(code, "#ifdef DREAMCAST"),
             other => panic!("expected verbatim statement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_conditional_compilation_into_verbatim_statements() {
+        // `#if FLAG`/`#else`/`#end` and a statement-level `@:include` lower to
+        // `Stmt::Verbatim` carrying the C++ preprocessor lines; `untyped` captures
+        // its operand verbatim to the end of the statement.
+        let f = file(
+            "package p;\nclass X {\n\
+               function f(d:Float):Float {\n\
+             #if DREAMCAST\n\
+                 @:include('<dc/fmath.h>');\n\
+                 return untyped fsqrtf(d * d);\n\
+             #else\n\
+                 return d;\n\
+             #end\n\
+               }\n\
+             }",
+        );
+        let cls = match &f.decls[0] {
+            Decl::Class(c) => c,
+            _ => panic!("expected class"),
+        };
+        let body = cls.methods[0].body.as_ref().expect("body");
+        let verbatims: Vec<&str> = body
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Verbatim { code, .. } => Some(code.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            verbatims,
+            vec!["#ifdef DREAMCAST", "#include <dc/fmath.h>", "#else", "#endif"]
+        );
+        // The DREAMCAST `return` carries the verbatim `untyped` operand.
+        match &body[2] {
+            Stmt::Return(Some(Expr::Verbatim(code)), _) => assert_eq!(code, "fsqrtf(d * d)"),
+            other => panic!("expected verbatim return, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_non_bare_conditional_compilation_flags() {
+        // `#ifdef` only takes a single macro name, so boolean conditions error.
+        assert!(parse("package p;\nclass X {\n function f():Void {\n#if !DEBUG\n#end\n }\n}").is_err());
+        assert!(parse("package p;\nclass X {\n function f():Void {\n#if (A && B)\n#end\n }\n}").is_err());
+        // `#elseif` is rejected too (use nested `#if`/`#else`).
+        assert!(parse("package p;\nclass X {\n function f():Void {\n#if A\n#elseif B\n#end\n }\n}").is_err());
     }
 
     #[test]

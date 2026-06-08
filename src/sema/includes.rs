@@ -5,7 +5,7 @@
 //! between two source directories is equally valid between the two generated
 //! files, regardless of the output root.
 //!
-//! The two-step rule (see `SKILL.md`):
+//! The two-step rule:
 //!   1. treat the `@:include` string as relative to the directory of the file
 //!      that *declares* it, producing a path relative to the source root;
 //!   2. re-express that path as relative to the directory of the file being
@@ -51,7 +51,7 @@ fn relative(from: &[String], to: &[String]) -> String {
         .take_while(|(a, b)| a == b)
         .count();
     let ups = from.len() - common;
-    let mut parts: Vec<String> = std::iter::repeat("..".to_string()).take(ups).collect();
+    let mut parts: Vec<String> = std::iter::repeat_n("..".to_string(), ups).collect();
     parts.extend(to[common..].iter().cloned());
     parts.join("/")
 }
