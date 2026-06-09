@@ -211,6 +211,10 @@ pub enum Stmt {
         ty: Option<Type>,
         init: Option<Expr>,
         is_final: bool,
+        /// `@delete var x = …`: the developer's explicit request to free `x` at the
+        /// end of this scope (the local-scope counterpart to `@owned` on a field).
+        /// Overrides the ownership analysis for this local.
+        delete: bool,
         /// Source line (1-based) of the `var`/`final`, for diagnostics.
         line: usize,
     },

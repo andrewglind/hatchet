@@ -140,8 +140,8 @@ impl<'a> HeaderGen<'a> {
             out.push('\n');
             out.push_str(&ns_body);
             out.push('\n');
-            for part in self.ns.iter().rev() {
-                let _ = writeln!(out, "}} // namespace {part}");
+            for _ in self.ns.iter().rev() {
+                let _ = writeln!(out, "}}");
             }
             out.push('\n');
         }
@@ -358,15 +358,6 @@ impl<'a> HeaderGen<'a> {
         // Emit the XHolder struct (members + ctor declaration) ahead of the class.
         if let Some(h) = &holder {
             if let Some(ctor) = &c.ctor {
-                let base_name = c
-                    .extends
-                    .as_ref()
-                    .map(|b| self.prog.map_type_base(b, self.mi, &self.ns))
-                    .unwrap_or_default();
-                let _ = writeln!(
-                    s,
-                    "{t}// base-from-member: computes pre-super values before {base_name} is constructed"
-                );
                 let _ = writeln!(s, "{t}struct {} {{", h.name);
                 for decl in &h.member_decls {
                     let _ = writeln!(s, "{t}\t{decl}");

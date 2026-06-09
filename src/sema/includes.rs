@@ -84,6 +84,92 @@ pub fn relative_header(header: &[String], target_dir: &[String]) -> String {
     relative(target_dir, header)
 }
 
+/// Re-base an already-resolved `#include` path when the generated tree is written
+/// somewhere other than in-place (the source root).
+///
+/// In-tree paths (between two generated files) and `<system>` headers are
+/// output-location-independent and returned unchanged. A path that **escapes** the
+/// generated tree (a leading `..` — an external engine or sibling-project header
+/// Hatchet does not generate) is only re-pointed when it has to be: if the
+/// source-relative path still resolves to a real file *from the output location*
+/// (the whole tree was relocated together, deps and all — e.g. the compile gate's
+/// junctioned mirror, or a same-level `--out`), it is left untouched. It is
+/// re-based onto the dependency's real location only when the source-relative path
+/// would dangle from the output and the real source location does exist — the
+/// "files moved, deps stayed" case (e.g. `--out` nested inside the project).
+///
+/// * `include` — the source-relative include string (relative to `target_dir`).
+/// * `target_dir` — source-root-relative directory of the file being generated.
+/// * `src_root` / `out_dir` — absolute source root and absolute output directory.
+pub fn rebase_if_escaping(
+    include: &str,
+    target_dir: &[String],
+    src_root: &std::path::Path,
+    out_dir: &std::path::Path,
+) -> String {
+    if include.trim_start().starts_with('<') {
+        return include.to_string(); // system header — never path-resolved
+    }
+    // Reconstruct the source-root-relative path of the included header from the
+    // generated file's directory plus the (target-relative) include string.
+    let mut abs = target_dir.to_vec();
+    abs.extend(split_path(include));
+    let abs = normalize(abs);
+    // In-tree (no leading `..`) → mirrors into the output tree unchanged.
+    if abs.first().map(|c| c != "..").unwrap_or(true) {
+        return include.to_string();
+    }
+    // The dep was relocated alongside the output (its mirrored copy exists where
+    // the source-relative path points from the output tree) → keep it as written.
+    if resolve_lexical(out_dir, &abs).exists() {
+        return include.to_string();
+    }
+    // Otherwise re-point at the dep's real source location, if it exists there.
+    let real = resolve_lexical(src_root, &abs);
+    if real.exists() {
+        return relative_fs(&push_all(out_dir.to_path_buf(), target_dir), &real);
+    }
+    // Can't locate it either way — leave the source-relative form unchanged.
+    include.to_string()
+}
+
+/// Resolve a source-root-relative component list (possibly leading with `..`)
+/// against an absolute base, lexically (no filesystem access).
+fn resolve_lexical(base: &std::path::Path, rel: &[String]) -> std::path::PathBuf {
+    let mut p = base.to_path_buf();
+    for c in rel {
+        if c == ".." {
+            p.pop();
+        } else {
+            p.push(c);
+        }
+    }
+    p
+}
+
+fn push_all(mut base: std::path::PathBuf, parts: &[String]) -> std::path::PathBuf {
+    for p in parts {
+        base.push(p);
+    }
+    base
+}
+
+/// A forward-slashed relative path from directory `from` to file `to`, both
+/// absolute. Falls back to the absolute `to` when they share no common prefix
+/// (e.g. different Windows drives), which is still a valid `#include` target.
+fn relative_fs(from: &std::path::Path, to: &std::path::Path) -> String {
+    let f: Vec<_> = from.components().collect();
+    let t: Vec<_> = to.components().collect();
+    let common = f.iter().zip(&t).take_while(|(a, b)| a == b).count();
+    if common == 0 {
+        return to.to_string_lossy().replace('\\', "/");
+    }
+    let ups = f.len() - common;
+    let mut parts: Vec<String> = std::iter::repeat_n("..".to_string(), ups).collect();
+    parts.extend(t[common..].iter().map(|c| c.as_os_str().to_string_lossy().into_owned()));
+    parts.join("/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +213,56 @@ mod tests {
         // directories, and surrounding whitespace is trimmed.
         assert_eq!(resolve_include("<string>", &parts("modules"), &parts("game")), "<string>");
         assert_eq!(resolve_include("  <vector>  ", &parts("a/b"), &parts("a/b")), "<vector>");
+    }
+
+    #[test]
+    fn rebase_leaves_in_tree_and_system_includes_alone() {
+        // In-tree and system includes are output-independent — never touched, and
+        // the filesystem is never consulted (these paths need not exist).
+        let src = std::path::Path::new("/proj/Modules");
+        let out = std::path::Path::new("/proj/Modules/out");
+        assert_eq!(rebase_if_escaping("Module.h", &parts("modules"), src, out), "Module.h");
+        assert_eq!(rebase_if_escaping("<string>", &parts("modules"), src, out), "<string>");
+        assert_eq!(rebase_if_escaping("../game/Scene.h", &parts("modules"), src, out), "../game/Scene.h");
+    }
+
+    #[test]
+    fn rebase_repoints_an_escaping_include_when_the_dep_stayed_put() {
+        // Layout: <t>/Modules is the source root, engine at <t>/MucusEngine. Output
+        // is nested at <t>/Modules/out, and the engine is NOT mirrored there, so the
+        // escaping include must gain one `..` to keep resolving to <t>/MucusEngine.
+        let t = std::env::temp_dir().join(format!("hatchet_rebase_a_{}", std::process::id()));
+        let engine = t.join("MucusEngine/src");
+        std::fs::create_dir_all(&engine).unwrap();
+        std::fs::write(engine.join("Mucus.h"), "").unwrap();
+        let src = t.join("Modules");
+        let out = t.join("Modules/out");
+        std::fs::create_dir_all(out.join("modules")).unwrap();
+
+        let got = rebase_if_escaping("../../MucusEngine/src/Mucus.h", &parts("modules"), &src, &out);
+        let _ = std::fs::remove_dir_all(&t);
+        assert_eq!(got, "../../../MucusEngine/src/Mucus.h");
+    }
+
+    #[test]
+    fn rebase_keeps_source_relative_when_the_dep_moved_alongside() {
+        // The whole tree was relocated together (the compile-gate case): the dep is
+        // mirrored under the output's parent, so the source-relative path still
+        // resolves from the output and must be left untouched.
+        let t = std::env::temp_dir().join(format!("hatchet_rebase_b_{}", std::process::id()));
+        let mirrored = t.join("gate/MucusEngine/src");
+        std::fs::create_dir_all(&mirrored).unwrap();
+        std::fs::write(mirrored.join("Mucus.h"), "").unwrap();
+        // src_root is the *real* corpus, which also exists, but the alongside copy
+        // wins because the source-relative path resolves from the output.
+        let src = t.join("real/Modules");
+        std::fs::create_dir_all(src.join("../MucusEngine/src")).unwrap();
+        std::fs::write(t.join("real/MucusEngine/src/Mucus.h"), "").unwrap();
+        let out = t.join("gate/Modules");
+        std::fs::create_dir_all(out.join("modules")).unwrap();
+
+        let got = rebase_if_escaping("../../MucusEngine/src/Mucus.h", &parts("modules"), &src, &out);
+        let _ = std::fs::remove_dir_all(&t);
+        assert_eq!(got, "../../MucusEngine/src/Mucus.h");
     }
 }

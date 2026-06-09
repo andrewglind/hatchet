@@ -959,31 +959,39 @@ impl<'a> Parser<'a> {
         Ok(stmts)
     }
 
+    /// Parse a `var`/`final` local declaration (the keyword is current). `delete`
+    /// carries an `@delete` marker requesting a scope-close free.
+    fn parse_var_stmt(&mut self, line: usize, delete: bool) -> PResult<Stmt> {
+        let is_final = self.at_kw(Kw::Final);
+        self.bump();
+        let name = self.expect_ident()?;
+        let ty = if self.eat_sym(Sym::Colon) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        let init = if self.eat_sym(Sym::Assign) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        self.eat_sym(Sym::Semi);
+        Ok(Stmt::Var { name, ty, init, is_final, delete, line })
+    }
+
     fn parse_stmt(&mut self) -> PResult<Stmt> {
         let line = self.line();
         match self.peek().clone() {
-            TokKind::Kw(Kw::Var) | TokKind::Kw(Kw::Final) => {
-                let is_final = self.at_kw(Kw::Final);
+            TokKind::Kw(Kw::Var) | TokKind::Kw(Kw::Final) => self.parse_var_stmt(line, false),
+            // `@delete var x = …` — the developer asks for `x` to be freed at the
+            // end of this scope (the local-scope counterpart to `@owned`). It must
+            // sit immediately before a local `var`/`final`.
+            TokKind::Meta(name) if name == "delete" => {
                 self.bump();
-                let name = self.expect_ident()?;
-                let ty = if self.eat_sym(Sym::Colon) {
-                    Some(self.parse_type()?)
-                } else {
-                    None
-                };
-                let init = if self.eat_sym(Sym::Assign) {
-                    Some(self.parse_expr()?)
-                } else {
-                    None
-                };
-                self.eat_sym(Sym::Semi);
-                Ok(Stmt::Var {
-                    name,
-                    ty,
-                    init,
-                    is_final,
-                    line,
-                })
+                if !(self.at_kw(Kw::Var) || self.at_kw(Kw::Final)) {
+                    return Err(self.err("@delete must immediately precede a local `var` declaration"));
+                }
+                self.parse_var_stmt(line, true)
             }
             TokKind::Kw(Kw::If) => self.parse_if(),
             TokKind::Kw(Kw::For) => self.parse_for(),

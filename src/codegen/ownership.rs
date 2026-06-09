@@ -19,14 +19,19 @@ use crate::sema::Program;
 /// nothing). Returned as ready-to-emit C++ lines.
 pub(crate) fn owned_deletes(prog: &Program, mi: usize, ns: &[String], c: &Class) -> Vec<String> {
     let mut deletes = Vec::new();
+    // Fields already deleted, so the explicit `@owned` pass never double-emits a
+    // delete the automatic rules already produced.
+    let mut emitted = std::collections::HashSet::new();
+    let field_names = own_field_names(c);
 
-    // (1) Fields this class allocated with `new`, emitted in declaration order.
+    // (1) Fields this class allocated with `new`, emitted in declaration order. A
+    //     bare `field = new X()` counts the same as `this.field = new X()`.
     let mut allocated = std::collections::HashSet::new();
     for f in c.ctor.iter().chain(c.methods.iter()).filter_map(|f| f.body.as_ref()) {
-        collect_new_assigns(f, &mut allocated);
+        collect_new_assigns(f, &field_names, &mut allocated);
     }
     for f in &c.fields {
-        if allocated.contains(&f.name) {
+        if allocated.contains(&f.name) && emitted.insert(f.name.clone()) {
             deletes.push(format!("delete this->{};", f.name));
         }
     }
@@ -40,10 +45,61 @@ pub(crate) fn owned_deletes(prog: &Program, mi: usize, ns: &[String], c: &Class)
     // (3) Container fields holding pointers this class `new`ed into them
     //     (`tileset.push(new Tile(...)); this.tilesets.push(tileset);`).
     for (field, depth) in owned_container_fields(prog, mi, ns, c) {
-        emit_container_delete(&field, depth, &mut deletes);
+        if emitted.insert(field.clone()) {
+            emit_container_delete(&field, depth, &mut deletes);
+        }
+    }
+
+    // (4) Fields the developer explicitly marked `@owned`: the tie-breaker for
+    //     injected pointers (a ctor parameter stored into a field) that the
+    //     automatic rules above cannot tell apart from a borrow. Purely additive
+    //     — a field already deleted above is skipped. A container is freed
+    //     element-wise; a scalar pointer with a plain `delete`.
+    for f in &c.fields {
+        if !f.meta.iter().any(|m| m.name == "owned") {
+            continue;
+        }
+        let Some(ty) = &f.ty else { continue };
+        if let Some(depth) = container_depth_if_pointer_leaf(prog, mi, ns, ty) {
+            if emitted.insert(f.name.clone()) {
+                emit_container_delete(&f.name, depth, &mut deletes);
+            }
+        } else if prog.map_type_use(ty, mi, ns).ends_with('*') && emitted.insert(f.name.clone()) {
+            deletes.push(format!("delete this->{};", f.name));
+        }
     }
 
     deletes
+}
+
+/// The bare names of a class's own fields (so a bare `field = …` can be matched
+/// against the same key as `this.field = …`).
+fn own_field_names(c: &Class) -> std::collections::HashSet<String> {
+    c.fields.iter().map(|f| f.name.clone()).collect()
+}
+
+/// The set of fields the **current heuristics** have the destructor free: those
+/// allocated here with `new`, the `@owned`-marked ones, and the owned containers.
+/// Exposed so the new escape analysis (`sema::escape`) can be diffed against it
+/// during the M2→M5 transition. (Excludes the base-`void*` forward, which is not an
+/// own field.)
+// Used by the `sema::escape` diff tests now; becomes a real consumer at the M5
+// cutover, so it is intentionally retained ahead of that.
+#[allow(dead_code)]
+pub(crate) fn owned_field_set(
+    prog: &Program,
+    mi: usize,
+    ns: &[String],
+    c: &Class,
+) -> std::collections::HashSet<String> {
+    let mut s = owned_pointer_fields(c);
+    s.extend(owned_container_field_names(prog, mi, ns, c));
+    for f in &c.fields {
+        if f.meta.iter().any(|m| m.name == "owned") {
+            s.insert(f.name.clone());
+        }
+    }
+    s
 }
 
 /// Emit the nested `for` loops that `delete` every leaf pointer in an owned
@@ -265,49 +321,103 @@ fn receiver_key(recv: &Expr, fields: &std::collections::HashSet<String>) -> Opti
 /// The set of pointer fields this class allocates with `new` (so it owns them):
 /// used both for destructor deletes and for delete-before-overwrite on reassignment.
 pub(crate) fn owned_pointer_fields(c: &Class) -> std::collections::HashSet<String> {
+    let fields = own_field_names(c);
     let mut allocated = std::collections::HashSet::new();
     for f in c.ctor.iter().chain(c.methods.iter()).filter_map(|f| f.body.as_ref()) {
-        collect_new_assigns(f, &mut allocated);
+        collect_new_assigns(f, &fields, &mut allocated);
     }
     allocated
 }
 
-/// Walk statements collecting field names assigned a `new` expression
-/// (`this.field = new X(...)`).
-fn collect_new_assigns(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+/// Constructor parameter names whose value the class takes ownership of: the
+/// parameter is stored straight into a field the destructor frees (an `@owned`
+/// field, a `new`-allocated field, or an owned container). A `new` passed to such
+/// a parameter is owned by the constructed object — not the caller's scope — so it
+/// must be emitted inline, never hoisted into a scope-owned local (which would
+/// double-free once the object's own destructor runs).
+pub(crate) fn owned_ctor_params(
+    prog: &Program,
+    mi: usize,
+    ns: &[String],
+    c: &Class,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Some(ctor) = c.ctor.as_ref() else { return out };
+    // Every field the destructor frees.
+    let mut owned = owned_pointer_fields(c);
+    owned.extend(owned_container_field_names(prog, mi, ns, c));
+    for f in &c.fields {
+        if f.meta.iter().any(|m| m.name == "owned") {
+            owned.insert(f.name.clone());
+        }
+    }
+    // Parameters assigned straight into one of those fields (`this.field = param`).
+    for p in &ctor.params {
+        if let Some(field) = base_ctor_field_for(ctor, &p.name) {
+            if owned.contains(&field) {
+                out.insert(p.name.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Walk statements collecting field names assigned a `new` expression — both the
+/// qualified `this.field = new X(...)` and the bare `field = new X(...)` (Haxe
+/// lets you omit `this.`; `fields` is the class's own field names).
+fn collect_new_assigns(
+    stmts: &[Stmt],
+    fields: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
     for st in stmts {
-        walk_stmt(st, out);
+        walk_stmt(st, fields, out);
     }
 }
 
-fn walk_stmt(st: &Stmt, out: &mut std::collections::HashSet<String>) {
+fn walk_stmt(
+    st: &Stmt,
+    fields: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
     match st {
         Stmt::Expr(Expr::Assign { op: None, target, value }, _) => {
-            if let (Expr::Field(recv, field), Expr::New(ty, _)) = (&**target, &**value) {
+            if let Expr::New(ty, _) = &**value {
                 // `new Array<T>()` / `new Map<K,V>()` lower to *value* containers,
                 // not heap pointers, so they are not owned allocations.
-                if matches!(**recv, Expr::This) && !is_container_type(ty) {
-                    out.insert(field.clone());
+                if let (Some(field), false) = (assigned_field(target, fields), is_container_type(ty)) {
+                    out.insert(field);
                 }
             }
         }
         Stmt::If { then, els, .. } => {
-            walk_stmt(then, out);
+            walk_stmt(then, fields, out);
             if let Some(e) = els {
-                walk_stmt(e, out);
+                walk_stmt(e, fields, out);
             }
         }
-        Stmt::For { body, .. } | Stmt::While { body, .. } => walk_stmt(body, out),
-        Stmt::Block(stmts) => collect_new_assigns(stmts, out),
+        Stmt::For { body, .. } | Stmt::While { body, .. } => walk_stmt(body, fields, out),
+        Stmt::Block(stmts) => collect_new_assigns(stmts, fields, out),
         Stmt::Switch { cases, default, .. } => {
             for case in cases {
-                collect_new_assigns(&case.body, out);
+                collect_new_assigns(&case.body, fields, out);
             }
             if let Some(d) = default {
-                collect_new_assigns(d, out);
+                collect_new_assigns(d, fields, out);
             }
         }
         _ => {}
+    }
+}
+
+/// The class field an assignment target stores into, written either `this.field`
+/// or bare `field` (an unqualified own-field name). `obj.field` on another object
+/// is not an own-field store and yields `None`.
+fn assigned_field(target: &Expr, fields: &std::collections::HashSet<String>) -> Option<String> {
+    match target {
+        Expr::Field(recv, field) if matches!(**recv, Expr::This) => Some(field.clone()),
+        Expr::Ident(name) if fields.contains(name) => Some(name.clone()),
+        _ => None,
     }
 }
 

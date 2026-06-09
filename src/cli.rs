@@ -154,6 +154,16 @@ fn run(args: Args) -> Result<(), String> {
 
     let mut prog = Program::build_with(&cfg.root_dir, units, &cfg.stdafx_stem);
     prog.export_macro = cfg.export_macro.clone();
+    // When writing files somewhere other than in-place, re-base includes that
+    // escape the generated tree (the external engine / sibling projects) onto the
+    // real output location, so `--out <anywhere>` resolves rather than only an
+    // output dir that sits where the source tree does. In-place stays byte-for-byte.
+    if cfg.mode == OutputMode::Files {
+        let root_abs = canonical(&cfg.root_dir)?;
+        if root_abs != cfg.out_dir {
+            prog.include_rebase = Some((root_abs, cfg.out_dir.clone()));
+        }
+    }
 
     // Hatchet generates a `StdAfx.h` for every output directory (the StdAfx pass
     // below), so a developer-provided `StdAfx.hx` is optional. Map each directory

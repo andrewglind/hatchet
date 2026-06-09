@@ -5,6 +5,7 @@
 //! then imported modules) and mapped to their C++ spelling with the correct
 //! namespace. It also computes the set of `#include`s each generated header needs.
 
+pub mod escape;
 pub mod includes;
 pub mod types;
 pub mod validate;
@@ -96,6 +97,12 @@ pub struct Program {
     /// `extern inline` functions (default `HATCHET` → `HATCHET_EXPORT`/`HATCHET_CALL`;
     /// configurable via `--export-macro`).
     pub export_macro: String,
+    /// When generated files are written somewhere other than in-place, the
+    /// `(source_root_abs, out_dir_abs)` pair used to re-base `#include`s that
+    /// escape the generated tree (external engine / sibling-project headers) onto
+    /// the real output location. `None` (the default, and what tests use) keeps
+    /// every include purely source-relative — correct for in-place generation.
+    pub include_rebase: Option<(PathBuf, PathBuf)>,
 }
 
 impl Program {
@@ -145,6 +152,7 @@ impl Program {
             types: Vec::new(),
             stdafx_stem: stdafx_stem.to_string(),
             export_macro: "HATCHET".to_string(),
+            include_rebase: None,
         };
         prog.index_types();
         prog.resolve_imports();
@@ -466,7 +474,7 @@ impl Program {
 
         // This module's own @:include directives (resolved against itself).
         for raw in module_includes_raw(&m.file) {
-            push(includes::resolve_include(&raw, &m.dir, target_dir), &mut out);
+            push(self.finalize_include(includes::resolve_include(&raw, &m.dir, target_dir), target_dir), &mut out);
         }
 
         // Helper: pull in a module's header (or, for native-interop modules that
@@ -476,10 +484,10 @@ impl Program {
                 let mut header = im.dir.clone();
                 let stem = im.path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 header.push(format!("{stem}.h"));
-                push(includes::relative_header(&header, target_dir), out);
+                push(self.finalize_include(includes::relative_header(&header, target_dir), target_dir), out);
             } else {
                 for raw in module_includes_raw(&im.file) {
-                    push(includes::resolve_include(&raw, &im.dir, target_dir), out);
+                    push(self.finalize_include(includes::resolve_include(&raw, &im.dir, target_dir), target_dir), out);
                 }
             }
         };
@@ -496,6 +504,16 @@ impl Program {
             pull_module(&self.modules[dep], &mut out, &mut push);
         }
         out
+    }
+
+    /// Apply include re-basing when generating out-of-place (see `include_rebase`).
+    /// A no-op for in-place generation (the default), so source-relative includes
+    /// — and the goldens — are untouched.
+    fn finalize_include(&self, inc: String, target_dir: &[String]) -> String {
+        match &self.include_rebase {
+            Some((root, out)) => includes::rebase_if_escaping(&inc, target_dir, root, out),
+            None => inc,
+        }
     }
 }
 

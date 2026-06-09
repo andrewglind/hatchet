@@ -167,8 +167,8 @@ pub fn generate_source_diagnostics(
     }
 
     if has_ns_body {
-        for part in m.package.iter().rev() {
-            let _ = writeln!(out, "}} // namespace {part}");
+        for _ in m.package.iter().rev() {
+            let _ = writeln!(out, "}}");
         }
     }
 
@@ -381,7 +381,9 @@ impl<'a> BodyGen<'a> {
     /// Start a function body: reset the escape set for its statements.
     fn begin_fn_body(&mut self, body: &[Stmt]) {
         self.escaping.clear();
-        collect_escaping(body, &mut self.escaping);
+        let fields: std::collections::HashSet<String> =
+            self.class.fields.iter().map(|f| f.name.clone()).collect();
+        collect_escaping(body, &fields, &mut self.escaping);
     }
 
     fn warn(&mut self, msg: String) {
@@ -612,8 +614,9 @@ impl<'a> BodyGen<'a> {
     /// keeps any ` = default` suffixes (for the declaration only).
     fn free_fn_signature(&mut self, g: &GlobalVar, with_defaults: bool) -> Option<String> {
         let (params, ret, body) = lambda_parts(g)?;
+        let params = effective_lambda_params(params, g.ty.as_ref());
         self.push_scope();
-        self.bind_params(params);
+        self.bind_params(&params);
         let ret_ty = self.resolve_lambda_ret(ret, body, g.ty.as_ref());
         let ret_cpp = self.decl_spelling(&ret_ty);
         let plist = if with_defaults {
@@ -623,7 +626,7 @@ impl<'a> BodyGen<'a> {
                 .collect::<Vec<_>>()
                 .join(", ")
         } else {
-            self.header_params(params)
+            self.header_params(&params)
         };
         self.pop_scope();
         Some(format!("{ret_cpp} {}({plist})", g.name))
@@ -632,13 +635,14 @@ impl<'a> BodyGen<'a> {
     /// Full definition of a top-level free function (`static` when file-local).
     fn free_fn_def(&mut self, g: &GlobalVar) -> String {
         let Some((params, ret, body)) = lambda_parts(g) else { return String::new() };
+        let params = effective_lambda_params(params, g.ty.as_ref());
         self.current_fn = g.name.clone();
         self.push_scope();
-        self.bind_params(params);
+        self.bind_params(&params);
         let ret_ty = self.resolve_lambda_ret(ret, body, g.ty.as_ref());
         self.current_ret = ret_ty.clone();
         let ret_cpp = self.decl_spelling(&ret_ty);
-        let plist = self.header_params(params);
+        let plist = self.header_params(&params);
         let prefix = if g.access == Access::Private { "static " } else { "" };
 
         let mut body_buf = String::new();
@@ -781,7 +785,7 @@ impl<'a> BodyGen<'a> {
         // escapes (then the receiver owns the arguments).
         self.new_args_escape = false;
         match st {
-            Stmt::Var { name, ty, init, is_final: _, line } => {
+            Stmt::Var { name, ty, init, is_final: _, delete, line } => {
                 self.current_line = *line;
                 // A local that escapes (assigned to a field / returned later) is
                 // owned elsewhere, so its `new` arguments are too.
@@ -863,11 +867,17 @@ impl<'a> BodyGen<'a> {
                     Some(code) => { let _ = writeln!(out, "{t}{cpp} {emit} = {code};"); }
                     None => { let _ = writeln!(out, "{t}{cpp} {emit};"); }
                 }
+                let is_ptr = var_ty.is_ptr;
                 self.define_local(name, var_ty);
                 // A non-escaping local holding a fresh `new` / nullable heap result
-                // is owned by this scope and deleted when it closes.
+                // is owned by this scope and deleted when it closes. `@delete` is the
+                // developer's explicit override: free this pointer at scope close
+                // regardless of what the analysis would infer (e.g. a returned
+                // pointer the scope would otherwise leak). Pointer-only — `delete`ing
+                // a value local is meaningless.
                 let owns_heap = is_heap_new_init(init) || nullable_init;
-                if owns_heap && !self.escaping.contains(name) {
+                let forced = *delete && is_ptr;
+                if forced || (owns_heap && !self.escaping.contains(name)) {
                     self.register_owned(&emit);
                 }
             }
@@ -881,17 +891,22 @@ impl<'a> BodyGen<'a> {
                     self.new_args_escape = true;
                 }
                 // Assigning into a field stores the value long-term, so its `new`
-                // arguments are owned by the receiver, not this scope.
+                // arguments are owned by the receiver, not this scope. This holds
+                // whether the field is written `this.field` or bare `field` (Haxe
+                // lets you omit `this.`) — the bare form must not be treated as a
+                // scope-local, or its `new` args would be wrongly freed at scope
+                // close, leaving the field dangling.
                 if let Expr::Assign { op: None, target, .. } = e {
-                    if matches!(&**target, Expr::Field(..)) {
+                    let own_field = self.assigned_own_field(target);
+                    if matches!(&**target, Expr::Field(..)) || own_field.is_some() {
                         self.new_args_escape = true;
                     }
                     // Delete-before-overwrite: reassigning an owned pointer field
                     // (outside the constructor, where it is NULL-initialised) frees
                     // the prior value first.
                     if self.current_fn != "new" {
-                        if let Expr::Field(recv, field) = &**target {
-                            if matches!(**recv, Expr::This) && self.owned_fields.contains(field) {
+                        if let Some(field) = &own_field {
+                            if self.owned_fields.contains(field) {
                                 let _ = writeln!(out, "{t}delete this->{field};");
                             }
                         }
@@ -1358,8 +1373,62 @@ impl<'a> BodyGen<'a> {
 
     /// Generate a statement-level expression, handling assignment to property
     /// accessors (`a.x = v` → `a->SetX(v)`).
+    /// `arr[i] = v` where `arr` lowers to a `std::vector`. Haxe array writes
+    /// auto-extend the array — a write past the end grows it, default-filling the
+    /// gap — whereas C++ `operator[]` is out-of-bounds UB there. Emit a grow-guard
+    /// that resizes first, evaluating the index exactly once. Returns `None` for a
+    /// non-vector receiver (a map inserts on write; anything else uses the normal
+    /// assignment path), having pushed nothing.
+    fn try_array_index_assign(
+        &mut self,
+        recv: &Expr,
+        idx: &Expr,
+        value: &Expr,
+    ) -> Option<(String, Ty)> {
+        let (rcode, rty) = self.gen_expr(recv);
+        if !rty.base.starts_with("std::vector") {
+            return None;
+        }
+        let access = if rty.is_ptr && is_container_ty(&rty) {
+            format!("(*{rcode})")
+        } else {
+            rcode
+        };
+        let (icode, _) = self.gen_expr(idx);
+        let ix = self.fresh("ix");
+        let t = "\t".repeat(self.prelude_ind);
+        self.prelude.push_str(&format!("{t}size_t {ix} = (size_t)({icode});\n"));
+        self.prelude
+            .push_str(&format!("{t}if ({ix} >= {access}.size()) {access}.resize({ix} + 1);\n"));
+        let ety = self.element_ty(&rty);
+        // `arr[i] = []` clears the (now-present) element container.
+        if matches!(value, Expr::ArrayLit(v) if v.is_empty()) {
+            return Some((format!("{access}[{ix}].clear()"), Ty::default()));
+        }
+        // `arr[i] = { ... }` builds the struct into a temp, then assigns it.
+        if let Expr::ObjectLit(fields) = value {
+            if ety.info.is_some() && !ety.base.is_empty() {
+                let tmp = self.hoist_object(fields, ety.clone());
+                return Some((format!("{access}[{ix}] = {tmp}"), ety));
+            }
+        }
+        self.expected = Some(ety.clone());
+        let (vcode, _) = self.gen_expr(value);
+        self.expected = None;
+        Some((format!("{access}[{ix}] = {vcode}"), ety))
+    }
+
     fn gen_assign_or_expr(&mut self, e: &Expr) -> (String, Ty) {
         if let Expr::Assign { op: None, target, value } = e {
+            // `arr[i] = v` into an Array (→ std::vector): Haxe auto-extends the
+            // array on an out-of-range write, so emit a grow-guard first (C++
+            // `operator[]` past the end is undefined behaviour). Maps and other
+            // receivers fall through to the normal assignment path.
+            if let Expr::Index(recv, idx) = &**target {
+                if let Some(result) = self.try_array_index_assign(recv, idx, value) {
+                    return result;
+                }
+            }
             // x = []  → x.clear()
             if matches!(&**value, Expr::ArrayLit(v) if v.is_empty()) {
                 let (t, _) = self.gen_expr(target);
@@ -1517,7 +1586,8 @@ impl<'a> BodyGen<'a> {
                     return (format!("std::string({a})"), Ty { base, ..Default::default() });
                 }
                 let param_tys = self.ctor_param_types(ty);
-                let a = self.gen_args_typed(args, &param_tys, false);
+                let owned = self.ctor_owned_params(ty);
+                let a = self.gen_args_owned(args, &param_tys, &owned, false);
                 (
                     format!("new {base}({a})"),
                     Ty {
@@ -1816,7 +1886,8 @@ impl<'a> BodyGen<'a> {
     fn hoist_new_receiver(&mut self, ty: &Type, args: &[Expr]) -> (String, Ty) {
         let base = self.prog.map_type_base(ty, self.mi, &self.ns);
         let param_tys = self.ctor_param_types(ty);
-        let a = self.gen_args_typed(args, &param_tys, false);
+        let owned = self.ctor_owned_params(ty);
+        let a = self.gen_args_owned(args, &param_tys, &owned, false);
         let rty = Ty {
             base: base.clone(),
             is_ptr: true,
@@ -1972,6 +2043,20 @@ impl<'a> BodyGen<'a> {
     /// Generate call arguments, hoisting anonymous struct literals to temporaries
     /// typed by the callee's parameter (per SKILL: anon struct arg → temp var).
     fn gen_args_typed(&mut self, args: &[Expr], param_tys: &[Option<Ty>], coerce_str: bool) -> String {
+        self.gen_args_owned(args, param_tys, &[], coerce_str)
+    }
+
+    /// As [`gen_args_typed`], plus `owned`: per-position flags marking parameters
+    /// the callee takes ownership of (constructor args stored into freed fields). A
+    /// `new` at an owned position is emitted inline (the callee frees it) instead of
+    /// being hoisted into a scope-owned local that would double-free it.
+    fn gen_args_owned(
+        &mut self,
+        args: &[Expr],
+        param_tys: &[Option<Ty>],
+        owned: &[bool],
+        coerce_str: bool,
+    ) -> String {
         args.iter()
             .enumerate()
             .map(|(i, a)| {
@@ -2003,10 +2088,17 @@ impl<'a> BodyGen<'a> {
                         tmp
                     }
                     // A `new X(...)` argument is hoisted to an owned local (the
-                    // caller frees it) unless the receiver escapes.
+                    // caller frees it) unless the receiver escapes — or the callee
+                    // takes ownership of this parameter (an `@owned`/allocated field),
+                    // in which case the constructed object frees it, so it is emitted
+                    // inline to avoid a double-free.
                     Expr::New(nty, _) if !is_value_new(nty) => {
                         let (code, vty) = self.gen_expr(a);
-                        self.place_new_arg(code, vty)
+                        if owned.get(i).copied().unwrap_or(false) {
+                            code
+                        } else {
+                            self.place_new_arg(code, vty)
+                        }
                     }
                     _ => {
                         let (code, vty) = self.gen_expr(a);
@@ -2714,7 +2806,7 @@ impl<'a> BodyGen<'a> {
     /// `const` vector object initialised from it (C++98 cannot brace-initialise a
     /// `std::vector`). Keeps the symbol a `std::vector`, so call sites are unchanged.
     fn render_const_vector(&mut self, name: &str, vec_ty: &Ty, elems: &[Expr]) -> String {
-        let builder = format!("_hatchet_init_{name}");
+        let builder = format!("_init_{name}");
         let spell = self.decl_spelling(vec_ty);
         let elem = self.elem_member_ty(vec_ty);
         let mut body = String::new();
@@ -2826,6 +2918,21 @@ impl<'a> BodyGen<'a> {
         let Some(Decl::Class(c)) = self.prog.type_decl(&info) else { return Vec::new() };
         match &c.ctor {
             Some(ctor) => ctor.params.iter().map(|p| self.param_ty_in(p, cmi)).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Per-position flags marking which constructor parameters of `ty`'s class take
+    /// ownership of their argument (it is stored into a field the destructor frees).
+    /// A `new` at such a position is freed by the constructed object, so it must be
+    /// emitted inline rather than hoisted into a scope-owned local.
+    fn ctor_owned_params(&self, ty: &Type) -> Vec<bool> {
+        let Some(info) = ty_named_info(self.prog, self.mi, ty) else { return Vec::new() };
+        let Some(Decl::Class(c)) = self.prog.type_decl(&info) else { return Vec::new() };
+        let owned =
+            crate::codegen::ownership::owned_ctor_params(self.prog, info.module_index, &self.ns, c);
+        match &c.ctor {
+            Some(ctor) => ctor.params.iter().map(|p| owned.contains(&p.name)).collect(),
             None => Vec::new(),
         }
     }
@@ -3069,6 +3176,21 @@ impl<'a> BodyGen<'a> {
         self.find_field(self.class, name)
     }
 
+    /// The class-field name an assignment target stores into when it is an
+    /// **own-field** store: `this.field`, or a bare `field` that resolves to a
+    /// class field rather than a local. `obj.field` on another object is not an
+    /// own-field store and yields `None`. This is what lets `field = new X()`
+    /// behave identically to `this.field = new X()` for ownership/escape.
+    fn assigned_own_field(&self, target: &Expr) -> Option<String> {
+        match target {
+            Expr::Field(recv, field) if matches!(**recv, Expr::This) => Some(field.clone()),
+            Expr::Ident(name) if self.lookup_local(name).is_none() && self.class_field(name).is_some() => {
+                Some(name.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// Find a field in `class` or any of its base classes.
     fn find_field(&self, class: &'a Class, name: &str) -> Option<&'a Field> {
         if let Some(f) = class.fields.iter().find(|f| f.name == name) {
@@ -3300,12 +3422,23 @@ fn has_accessor(f: &Field) -> bool {
 /// Collect local names that escape a function body — assigned to a field
 /// (`this.f = x`) or returned (`return x`) — so their heap value is owned
 /// elsewhere and must not be freed at scope close.
-fn collect_escaping(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+fn collect_escaping(
+    stmts: &[Stmt],
+    fields: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
     for st in stmts {
         match st {
             Stmt::Expr(Expr::Assign { op: None, target, value }, _) => {
-                if let (Expr::Field(recv, _), Expr::Ident(name)) = (&**target, &**value) {
-                    if matches!(**recv, Expr::This) {
+                // A local stored into a field — `this.field = local` or the bare
+                // `field = local` — escapes this scope (the field now owns it).
+                let into_field = match &**target {
+                    Expr::Field(recv, _) => matches!(**recv, Expr::This),
+                    Expr::Ident(name) => fields.contains(name),
+                    _ => false,
+                };
+                if into_field {
+                    if let Expr::Ident(name) = &**value {
                         out.insert(name.clone());
                     }
                 }
@@ -3314,21 +3447,21 @@ fn collect_escaping(stmts: &[Stmt], out: &mut std::collections::HashSet<String>)
                 out.insert(name.clone());
             }
             Stmt::If { then, els, .. } => {
-                collect_escaping(std::slice::from_ref(then), out);
+                collect_escaping(std::slice::from_ref(then), fields, out);
                 if let Some(e) = els {
-                    collect_escaping(std::slice::from_ref(e), out);
+                    collect_escaping(std::slice::from_ref(e), fields, out);
                 }
             }
             Stmt::For { body, .. } | Stmt::While { body, .. } => {
-                collect_escaping(std::slice::from_ref(body), out);
+                collect_escaping(std::slice::from_ref(body), fields, out);
             }
-            Stmt::Block(stmts) => collect_escaping(stmts, out),
+            Stmt::Block(stmts) => collect_escaping(stmts, fields, out),
             Stmt::Switch { cases, default, .. } => {
                 for c in cases {
-                    collect_escaping(&c.body, out);
+                    collect_escaping(&c.body, fields, out);
                 }
                 if let Some(d) = default {
-                    collect_escaping(d, out);
+                    collect_escaping(d, fields, out);
                 }
             }
             _ => {}
@@ -3382,6 +3515,26 @@ fn is_null_type(ty: &Option<Type>) -> bool {
 }
 
 /// A top-level `final NAME = function/lambda` — the source of a free function.
+/// Lambda params with any missing type filled from a function-type binding
+/// annotation: `Cross:(Vector, Vector) -> Float = (a, b) -> a.x * b.y` leaves
+/// `a`/`b` unannotated on the arrow, but the binding's `(Vector, Vector)` types
+/// them — without this they would default to `int` and `a.x` would be invalid.
+/// An arrow param that *is* annotated wins over the binding's type.
+fn effective_lambda_params(params: &[Param], decl_ty: Option<&Type>) -> Vec<Param> {
+    let func_params = match decl_ty {
+        Some(Type::Func { params, .. }) => Some(params),
+        _ => None,
+    };
+    params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| match (&p.ty, func_params.and_then(|fps| fps.get(i))) {
+            (None, Some(fp)) => Param { ty: Some(fp.clone()), ..p.clone() },
+            _ => p.clone(),
+        })
+        .collect()
+}
+
 fn lambda_parts(g: &GlobalVar) -> Option<(&Vec<Param>, &Option<Type>, &LambdaBody)> {
     if !g.is_final {
         return None;

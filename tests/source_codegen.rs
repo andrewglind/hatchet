@@ -183,13 +183,20 @@ fn statement_and_expression_forms() {
         "value arg to Null<T> param → heap-allocated"
     );
 
-    // Method-scope ownership: fresh `new`s bound to non-escaping locals (including
-    // hoisted `new` arguments and a nullable result) are freed at scope close.
+    // Method-scope ownership: a scope-local `new` (`line`) is freed at scope close,
+    // and a `new` argument the constructed object owns (Line `@owned`s its vertices)
+    // stays inline — freed transitively by `delete line`, never hoisted into a
+    // separate scope-owned local that would double-free it. A nullable result
+    // (`path`) is still freed.
     let actor = source(&prog, "Actor");
-    assert!(actor.contains("Vertex* _v"), "new arguments hoisted to owned locals");
     assert!(
-        actor.contains("delete line;") && actor.contains("delete _v"),
-        "scope-owned locals freed at the end of the loop"
+        actor.contains("new Line(this->engine, new Vertex("),
+        "vertices into Line's @owned params stay inline:\n{actor}"
+    );
+    assert!(actor.contains("delete line;"), "the scope-local Line is freed at scope close");
+    assert!(
+        !actor.contains("delete _v"),
+        "owned vertices must not be separately scope-deleted (double-free):\n{actor}"
     );
     assert!(actor.contains("delete path;"), "nullable result freed at scope close");
 
@@ -480,11 +487,11 @@ class Atlas {
     assert!(out.contains("static const Coord ORIGIN = { 0.0f, 0.0f };"), "struct final → aggregate const:\n{out}");
     assert!(out.contains("static const Coord CORNER = { 16.0f, 32.0f };"), "struct final aggregate in field order:\n{out}");
     // Array final → builder helper + const vector object (stays a vector).
-    assert!(out.contains("_hatchet_init_TABLE() {"), "array final → builder helper:\n{out}");
+    assert!(out.contains("_init_TABLE() {"), "array final → builder helper:\n{out}");
     assert!(out.contains("v;") && out.contains("v.push_back(ORIGIN);") && out.contains("v.push_back(CORNER);"), "builder declares v and push_backs elements:\n{out}");
     assert!(out.contains("return v;"), "builder returns the vector:\n{out}");
     assert!(
-        out.contains("TABLE = _hatchet_init_TABLE();") && out.contains("static const std::vector<Coord"),
+        out.contains("TABLE = _init_TABLE();") && out.contains("static const std::vector<Coord"),
         "array final → const vector object:\n{out}"
     );
     // Call site is unchanged — it indexes the vector object directly.
@@ -884,6 +891,288 @@ class Grid {
     // The destructor frees both containers (the owner of the heap objects).
     assert!(header.contains("delete this->tiles[") , "dtor should free the tiles vector:\n{header}");
     assert!(header.contains("delete this->rows["), "dtor should free the rows vector:\n{header}");
+}
+
+#[test]
+fn bare_field_assigned_new_behaves_like_qualified() {
+    // `field = new X(new Y())` with `this.` omitted must be treated the same as
+    // `this.field = new X(...)`: the field owns the allocation, so the nested
+    // `new` is emitted inline (NOT hoisted into a scope-owned local that the
+    // constructor frees, which would leave `field` dangling), the field is
+    // NULL-initialised, and the destructor deletes it.
+    let src = "\
+@:expose
+class Leaf {
+  public function new(n:Int) {}
+}
+
+@:expose
+class Holder {
+  public function new(a:Leaf) {}
+}
+
+@:expose
+class Owner {
+  var h:Holder;
+  public function new() {
+    h = new Holder(new Leaf(1));
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_barefield_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("O.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("O"))
+        .unwrap();
+    let body = generate_source(&prog, idx).unwrap();
+    let header = hatchet::codegen::generate_header(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        body.contains("this->h = new Holder(new Leaf(1));"),
+        "bare field assign must qualify and keep the nested new inline:\n{body}"
+    );
+    assert!(
+        body.contains(": h(NULL)") || body.contains(", h(NULL)") || body.contains("h(NULL)"),
+        "the owned field must be NULL-initialised:\n{body}"
+    );
+    assert!(
+        !body.contains("delete "),
+        "the constructor must not free the escaped nested new:\n{body}"
+    );
+    assert!(header.contains("delete this->h;"), "destructor must free the owned field:\n{header}");
+}
+
+#[test]
+fn untyped_lambda_params_typed_from_function_annotation() {
+    // `Cross:(Vec, Vec) -> Float = (a, b) -> …` — the arrow params are
+    // unannotated; their types come from the binding's function-type annotation.
+    // Without propagating them they default to `int` and `a.x` is invalid C++.
+    let src = "\
+typedef Vec = {
+  var x:Float;
+  var y:Float;
+}
+
+final Cross:(Vec, Vec) -> Float = (a, b) -> a.x * b.y - a.y * b.x;
+
+@:expose
+class M {}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_lambdaty_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("M.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("M"))
+        .unwrap();
+    let body = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        body.contains("float Cross(const Vec& a, const Vec& b)"),
+        "untyped arrow params take their type from the function annotation:\n{body}"
+    );
+    assert!(!body.contains("int a"), "params must not default to int:\n{body}");
+    assert!(body.contains("return a.x * b.y - a.y * b.x;"), "body uses the typed params:\n{body}");
+}
+
+#[test]
+fn new_passed_to_an_owning_ctor_param_is_inline_not_double_freed() {
+    // `var o = new Owner(new Child())` where Owner `@owned`s the child: the child
+    // is freed by `~Owner`, so it must be emitted inline — NOT hoisted into a
+    // scope-owned local that the scope also deletes (a double-free once `o`'s
+    // destructor runs). A *borrowing* ctor param keeps the hoist (the scope must
+    // free the fresh `new`, since the borrower never will).
+    let src = "\
+@:expose
+class Child {
+  public function new() {}
+}
+
+@:expose
+class Owner {
+  @owned var c:Child;
+  public function new(c:Child) { this.c = c; }
+}
+
+@:expose
+class Borrower {
+  var c:Child;
+  public function new(c:Child) { this.c = c; }
+}
+
+@:expose
+class User {
+  public function new() {}
+  public function owns():Void {
+    var o:Owner = new Owner(new Child());
+  }
+  public function borrows():Void {
+    var b:Borrower = new Borrower(new Child());
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_ownarg_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("U.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("U"))
+        .unwrap();
+    let body = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Owned param: the child is inline, and the only delete is `delete o`.
+    assert!(
+        body.contains("new Owner(new Child())"),
+        "a `new` into an @owned ctor param must be inline:\n{body}"
+    );
+    let owns = &body[body.find("User::owns").unwrap()..body.find("User::borrows").unwrap()];
+    assert!(owns.contains("delete o;"), "the scope frees the owner:\n{owns}");
+    assert!(
+        !owns.contains("delete _v"),
+        "the owned child must not be separately scope-deleted (double-free):\n{owns}"
+    );
+    // Borrowed param: the fresh `new` is hoisted and freed by the scope.
+    let borrows = &body[body.find("User::borrows").unwrap()..];
+    assert!(
+        borrows.contains("delete _v") || borrows.contains("Child* _v"),
+        "a `new` into a borrowing param is hoisted to a scope-owned local:\n{borrows}"
+    );
+}
+
+#[test]
+fn delete_tag_forces_a_scope_free() {
+    // `@delete var t = make()` frees `t` at scope close even though the analysis
+    // would leak a returned pointer. `@delete` is the local-scope override.
+    let src = "\
+@:expose
+class Thing {
+  public function new() {}
+}
+
+@:expose
+class C {
+  public function new() {}
+  public function make():Thing { return new Thing(); }
+  public function run():Void {
+    @delete var t:Thing = make();
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_deltag_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("D.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("D"))
+        .unwrap();
+    let body = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(body.contains("delete t;"), "@delete forces a scope-close free of the local:\n{body}");
+}
+
+#[test]
+fn array_index_write_grows_the_vector() {
+    // Haxe auto-extends an array on an out-of-range write (`a[i] = v` past the end
+    // grows it); C++ `std::vector::operator[]` would be out-of-bounds UB. The write
+    // must be preceded by a grow-guard. A map write (`std::map::operator[]` inserts)
+    // must NOT be guarded.
+    let src = "\
+@:expose
+class G {
+  public function new() {}
+  public function fill(n:Int):Array<Int> {
+    var a:Array<Int> = [];
+    for (i in 0...n) {
+      a[i] = -1;
+    }
+    return a;
+  }
+  public function put(m:Map<String,Int>):Void {
+    m[\"x\"] = 1;
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_arrgrow_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("G.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("G"))
+        .unwrap();
+    let body = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(body.contains(".resize("), "array index write must grow the vector first:\n{body}");
+    assert!(
+        body.contains(">= a.size()) a.resize("),
+        "the grow-guard resizes when the index is past the end:\n{body}"
+    );
+    // The map write inserts on its own — it must not be wrapped in a resize-guard.
+    assert!(
+        body.contains("m[\"x\"] = 1") && !body.contains("m.resize("),
+        "map index writes are not guarded:\n{body}"
+    );
+}
+
+#[test]
+fn owned_marker_deletes_injected_pointers() {
+    // `@owned` is the tie-breaker for injected pointers the automatic rules can't
+    // tell from a borrow: a ctor parameter stored into a field. A scalar pointer
+    // field gets a plain `delete`; a container field is freed element-wise (never
+    // a flat `delete` on the std::vector).
+    let src = "\
+@:expose
+class Dep {
+  public function new() {}
+}
+
+@:expose
+class Widget {
+  @owned var dep:Dep;
+  @owned var kids:Array<Dep>;
+  public function new(dep:Dep, kids:Array<Dep>) {
+    this.dep = dep;
+    this.kids = kids;
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_owned_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("W.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("W"))
+        .unwrap();
+    let header = hatchet::codegen::generate_header(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(header.contains("delete this->dep;"), "@owned scalar pointer → plain delete:\n{header}");
+    assert!(
+        header.contains("delete this->kids[_i0];"),
+        "@owned container → element-wise delete loop:\n{header}"
+    );
+    assert!(
+        !header.contains("delete this->kids;"),
+        "@owned container must not flat-delete the std::vector:\n{header}"
+    );
 }
 
 #[test]

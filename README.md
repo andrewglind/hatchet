@@ -41,10 +41,14 @@ Supported today, end to end:
   nested); array / map / object literals; `Array`→`std::vector` and `Map`→`std::map` with their
   container ops — Array `push`/`insert`/`pop`/`length`/`indexOf`/`contains`/`remove`/`reverse`/
   `copy`/`join` and Map `get`/`exists`/`set`/`remove`/`keys` (each an inline loop/expression, no
-  `<algorithm>` dependency); `for` over a range, an array, an anonymous array literal
+  `<algorithm>` dependency); Haxe's **auto-extending array writes** — `a[i] = v` past the end grows
+  the vector first (an inline `resize`), matching Haxe rather than letting C++ `operator[]` run off
+  the end; `for` over a range, an array, an anonymous array literal
   (`for (i in [1,2,3])`), or a map (`for (v in m)` over values, `for (k => v in m)` over key/value
   pairs, via a `std::map` iterator); array & map comprehensions; closures / `Array.map` lowered to
-  free functions; `String` methods (`charAt`/`charCodeAt`/`indexOf`/`lastIndexOf`/`toUpperCase`/
+  free functions (an arrow param's type may be left off and taken from the binding's function-type
+  annotation — `Cross:(Vec, Vec) -> Float = (a, b) -> …` types `a`/`b` as `Vec`); `String` methods
+  (`charAt`/`charCodeAt`/`indexOf`/`lastIndexOf`/`toUpperCase`/
   `toLowerCase`/`split`) and `String.fromCharCode`, mapped to `std::string` expressions; string
   interpolation (`sprintf`, including the `$ident` shorthand); the `??` null-coalesce and
   NULL-guarded `?.`; `cast` (C-style cast for `cast(expr, T)`, passthrough for `cast expr`); the
@@ -64,7 +68,14 @@ Supported today, end to end:
   base's `void*` field); short-lived heap locals are freed at scope close, and **before every early
   `return`**; owned pointer fields are NULL-initialized, freed before reassignment, and freed in the
   destructor; owned containers are walked and freed element-by-element. Borrowed dependencies, value
-  containers, and objects owned by a receiver are left alone.
+  containers, and objects owned by a receiver are left alone. A field reference is recognized whether
+  written `this.field` or bare `field` (Haxe lets you omit `this.`), so ownership does not hinge on
+  the qualifier. For an **injected** pointer the class stores but did not `new` — where own-vs-borrow
+  is not locally decidable — mark the field **`@owned`** to have the destructor free it (a scalar
+  with `delete`, a container element-by-element); unmarked injected pointers stay borrowed. (Inferring
+  this automatically via whole-program escape analysis is a future improvement.) A `new` passed to a
+  constructor parameter the class owns (an `@owned`/allocated field) is emitted **inline** — the
+  constructed object frees it — rather than hoisted into a scope-owned local that would double-free it.
 
 Hatchet **fails loudly rather than guessing** — an unresolvable type or an unsupported idiom is a
 hard error that skips that module and fails the run (see *Diagnostics*) — and it **always generates
@@ -115,7 +126,7 @@ from its `package` declaration (the file's directory minus its package path).
 | Flag | Description |
 |------|-------------|
 | `--src, -s <FILE>...` | Haxe `.hx` file(s) to transpile — one or many, e.g. a shell glob (prompted if omitted). Not a directory. Also the full resolution scope |
-| `--out, -o <DIR>` | Output directory (defaults to the inferred project root; ignored with `--dry-run`/`--stdout`) |
+| `--out, -o <DIR>` | Output directory (defaults to the inferred project root; ignored with `--dry-run`/`--stdout`). Generated files mirror the source package layout; includes that point at external dependencies (a native engine, a sibling project) are re-pointed at the dependency's real location when needed, so `--out` resolves from any directory |
 | `--force` | Overwrite existing generated files (ignored with `--dry-run`) |
 | `--dry-run` | Transpile and report info/warnings/errors only — write nothing. Takes precedence over `--stdout`/`-o`/`--force` |
 | `--stdout` | Write generated C++ to stdout instead of files (status goes to stderr) |

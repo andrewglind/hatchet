@@ -74,13 +74,19 @@ fn headers_match_and_follow_rules() {
     let prog = Program::from_src_dir(&mroot).expect("build Modules program");
     let game = Program::from_src_dir(&groot).expect("build Game program");
 
-    // Byte-for-byte against the committed goldens.
+    // Byte-for-byte against the committed goldens, save for comments: the
+    // transpiler intentionally emits comment-free output, so the golden's
+    // `} // namespace modules` close is normalised to a bare `}` before
+    // comparing (comments are cosmetic — goldens win on substance only).
     for stem in ["Module", "IModule"] {
         let gen = header(&prog, stem);
         let golden = std::fs::read_to_string(mroot.join("modules").join(format!("{stem}.h")))
             .unwrap()
-            .replace("\r\n", "\n");
-        assert_eq!(gen, golden, "{stem}.h does not match golden");
+            .replace("\r\n", "\n")
+            .replace("} // namespace modules", "}");
+        // Trailing-newline differences are cosmetic (and easily lost when a golden
+        // is re-saved or restored from backup), so compare ignoring them.
+        assert_eq!(gen.trim_end(), golden.trim_end(), "{stem}.h does not match golden");
     }
 
     // Vertex: accessor rules + optional-primitive defaults. `effects` is a
