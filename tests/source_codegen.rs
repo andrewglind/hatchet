@@ -38,6 +38,22 @@ fn source(prog: &Program, stem: &str) -> String {
     generate_source(prog, idx).unwrap_or_else(|| panic!("no source for {stem}"))
 }
 
+/// Transpile a single synthetic `.hx` source and return class `stem`'s generated `.cpp`.
+fn gen_one(src: &str, stem: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("hatchet_t_{stem}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{stem}.hx")), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some(stem))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
 #[test]
 fn body_transpilation_core() {
     let Some(root) = modules_root() else {
@@ -500,6 +516,63 @@ class Atlas {
 }
 
 #[test]
+fn array_pop_removes_and_returns_the_last_element() {
+    // `Array.pop()` must both read the last element AND shrink the vector — a bare
+    // `back()` (the prior lowering) never removed it.
+    let out = gen_one(
+        "@:expose\nclass Q {\n  public var items(default, null):Array<Int>;\n  public function new() { this.items = []; }\n  public function take():Int { return this.items.pop(); }\n}\n",
+        "Q",
+    );
+    assert!(out.contains(".back()"), "reads the last element:\n{out}");
+    assert!(out.contains(".pop_back()"), "and removes it (the fix):\n{out}");
+}
+
+#[test]
+fn string_concat_with_int_operands() {
+    // `x + "," + y` with Int operands is string concatenation, not `int + const char*`
+    // pointer arithmetic. The ints are formatted and the chain is a `std::string`.
+    let out = gen_one(
+        "@:expose\nclass S {\n  public function new() {}\n  public function label(x:Int, y:Int):String { return x + \",\" + y; }\n}\n",
+        "S",
+    );
+    assert!(out.contains("sprintf("), "int operands are formatted to text:\n{out}");
+    assert!(out.contains("std::string(") && out.contains(" + "), "result is a std::string concatenation:\n{out}");
+    assert!(!out.contains("x + \",\""), "must not emit raw `int + const char*` pointer math:\n{out}");
+}
+
+#[test]
+fn cpp_qualified_fixed_width_uints_map_to_uint_aliases() {
+    // hxcpp's built-in `cpp.UInt8/16/32` (qualified) map to the fixed-width C++ aliases
+    // by their last path segment — in params, return types, and Array elements — so a
+    // project can use the idiomatic `cpp.*` types instead of a homegrown `UInt` shim.
+    let out = gen_one(
+        "package demo;\n@:expose\nclass W {\n  public function new() {}\n  public function f(a:cpp.UInt8, b:cpp.UInt16, t:Array<cpp.UInt32>):cpp.UInt32 { return b; }\n}\n",
+        "W",
+    );
+    assert!(out.contains("uint8_t a"), "cpp.UInt8 param → uint8_t:\n{out}");
+    assert!(out.contains("uint16_t b"), "cpp.UInt16 param → uint16_t:\n{out}");
+    assert!(out.contains("std::vector<uint32_t"), "Array<cpp.UInt32> → std::vector<uint32_t>:\n{out}");
+    assert!(out.contains("uint32_t W::f"), "cpp.UInt32 return → uint32_t:\n{out}");
+}
+
+#[test]
+fn interpolation_builds_incrementally_without_a_guessed_buffer() {
+    // A string operand is appended directly (`s += part`), so an arbitrarily long value
+    // can never overflow a fixed buffer; a numeric operand is formatted into a buffer
+    // sized by its TYPE (not guessed from the value).
+    let out = gen_one(
+        "@:expose\nclass G {\n  public function new() {}\n  public function f(s:String, n:Int):String { return 'a${s}b${n}c'; }\n}\n",
+        "G",
+    );
+    assert!(out.contains("std::string "), "builds a std::string accumulator:\n{out}");
+    assert!(out.contains("+= s"), "the string operand is appended directly (unbounded-safe):\n{out}");
+    // No single value-guessed buffer (the old `char buf[n*50+lit]` form).
+    assert!(!out.contains("[50]") && !out.contains("* 50"), "no guessed buffer size:\n{out}");
+    // The numeric operand still gets a type-bounded buffer.
+    assert!(out.contains("char ") && out.contains("sprintf(") && out.contains("[24]"), "int → type-bounded buffer:\n{out}");
+}
+
+#[test]
 fn final_constant_references_are_namespace_qualified() {
     // A `@:native final` (provided by the C++ engine, not emitted) is referenced
     // with its native namespace (`mucus::MAX_CHARS`). A public `final` is a
@@ -749,9 +822,11 @@ class Greeter {
     let out = generate_source(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("sprintf("), "`$name` shorthand must interpolate via sprintf:\n{out}");
-    assert!(out.contains("%s"), "the interpolated identifier formats as %s:\n{out}");
-    assert!(out.contains("name.c_str()"), "the bound argument is `name`:\n{out}");
+    // Built incrementally: a `std::string` accumulator with the string operand appended
+    // directly (no fixed-size buffer — unbounded-safe), the `$5` staying literal.
+    assert!(out.contains("std::string"), "interpolation builds a std::string accumulator:\n{out}");
+    assert!(out.contains("+= name"), "the string operand is appended directly:\n{out}");
+    assert!(!out.contains("sprintf"), "a string interpolation needs no fixed-size buffer:\n{out}");
     assert!(out.contains("$5"), "a `$` not before an identifier stays a literal:\n{out}");
 }
 

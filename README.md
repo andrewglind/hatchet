@@ -50,7 +50,9 @@ Supported today, end to end:
   annotation — `Cross:(Vec, Vec) -> Float = (a, b) -> …` types `a`/`b` as `Vec`); `String` methods
   (`charAt`/`charCodeAt`/`indexOf`/`lastIndexOf`/`toUpperCase`/
   `toLowerCase`/`split`) and `String.fromCharCode`, mapped to `std::string` expressions; string
-  interpolation (`sprintf`, including the `$ident` shorthand); the `??` null-coalesce and
+  interpolation and `+` concatenation (built as a `std::string` — text appended directly and numeric
+  operands formatted into type-bounded buffers, so no value-guessed buffer can overflow; interpolation
+  also supports the `$ident` shorthand); the `??` null-coalesce and
   NULL-guarded `?.`; `cast` (C-style cast for `cast(expr, T)`, passthrough for `cast expr`); the
   `(expr : Type)` type ascription (a compile-time hint that drives inference, e.g. `([] : Array<Int>)`);
   `switch`/enum constants; `trace(...)` (with `--no-traces` to strip it); and the `Math` / `Std` /
@@ -64,18 +66,22 @@ Supported today, end to end:
   matching heap-allocation at call sites); `Map.get(k)` lowers to an iterator with an existence
   check; `final` constants lower to namespace-scoped `static const` (no `#define`), namespace-
   qualified across boundaries.
-- **Memory ownership** — destructors free what a class `new`ed (and the typed pointer handed to a
-  base's `void*` field); short-lived heap locals are freed at scope close, and **before every early
-  `return`**; owned pointer fields are NULL-initialized, freed before reassignment, and freed in the
-  destructor; owned containers are walked and freed element-by-element. Borrowed dependencies, value
-  containers, and objects owned by a receiver are left alone. A field reference is recognized whether
-  written `this.field` or bare `field` (Haxe lets you omit `this.`), so ownership does not hinge on
-  the qualifier. For an **injected** pointer the class stores but did not `new` — where own-vs-borrow
-  is not locally decidable — mark the field **`@owned`** to have the destructor free it (a scalar
-  with `delete`, a container element-by-element); unmarked injected pointers stay borrowed. (Inferring
-  this automatically via whole-program escape analysis is a future improvement.) A `new` passed to a
-  constructor parameter the class owns (an `@owned`/allocated field) is emitted **inline** — the
-  constructed object frees it — rather than hoisted into a scope-owned local that would double-free it.
+- **Memory ownership** — a whole-program **escape/ownership analysis** decides what each class frees,
+  erring toward a leak (safe) over a double-free: destructors free what a class `new`ed (and the typed
+  pointer handed to a base's `void*` field); short-lived heap locals are freed at scope close, and
+  **before every early `return`**; owned pointer fields are NULL-initialized, freed before reassignment,
+  and freed in the destructor; owned containers are walked and freed element-by-element. Borrowed
+  dependencies, value containers, objects owned by a receiver, and fields handed back out of the object
+  are left alone. A field reference is recognized whether written `this.field` or bare `field` (Haxe
+  lets you omit `this.`), so ownership does not hinge on the qualifier. For an **injected** pointer the
+  class stores but did not `new` — where own-vs-borrow is not statically decidable — mark the field
+  **`@owned`** to have the destructor free it (a scalar with `delete`, a container element-by-element);
+  the local-scope counterpart **`@delete var x = …`** frees a marked local at scope close. Unmarked
+  injected pointers stay borrowed. These overrides are obeyed but **advisory-checked** — the analysis
+  warns when a tag looks unsound (e.g. an `@owned` field that is also handed out); auto-inferring an
+  injected pointer's ownership would need interprocedural call-site analysis and is a future improvement.
+  A `new` passed to a constructor parameter the class owns is emitted **inline** — the constructed object
+  frees it — rather than hoisted into a scope-owned local that would double-free it.
 
 Hatchet **fails loudly rather than guessing** — an unresolvable type or an unsupported idiom is a
 hard error that skips that module and fails the run (see *Diagnostics*) — and it **always generates
@@ -152,8 +158,8 @@ Source layout (`src/`):
 | `lexer.rs` | Haxe tokenizer (`'${...}'` interpolation, `1...6` ranges, `@:meta`, etc.) |
 | `ast.rs` | Typed AST for the supported Haxe subset |
 | `parser.rs` | Recursive-descent + precedence-climbing parser |
-| `sema/` | Symbol table, Haxe→C++ type & namespace mapping (`types.rs`), `@:include` resolution (`includes.rs`), pre-codegen validation (`validate.rs`) |
-| `codegen/` | C++ generation: `mod.rs` (headers), `source.rs` (`.cpp` bodies), `holder.rs` (base-from-member idiom), `ownership.rs` (destructor / scope ownership analysis) |
+| `sema/` | Symbol table, Haxe→C++ type & namespace mapping (`types.rs`), `@:include` resolution (`includes.rs`), pre-codegen validation (`validate.rs`), and the whole-program escape / ownership analysis (`escape.rs`) |
+| `codegen/` | C++ generation: `mod.rs` (headers), `source.rs` (`.cpp` bodies), `holder.rs` (base-from-member idiom), `ownership.rs` (destructor delete emission, driven by `sema/escape.rs`) |
 | `stdafx.rs` | `StdAfx.hx` → `StdAfx.h`, and the generated standard-library prelude |
 | `finals.rs` | Top-level `final` constant extraction |
 | `scan.rs` | Small comment-aware scanning helpers |

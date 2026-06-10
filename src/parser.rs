@@ -26,6 +26,10 @@ impl std::error::Error for ParseError {}
 
 /// Parse a full Haxe source file.
 pub fn parse(src: &str) -> Result<File, ParseError> {
+    // Strip a leading UTF-8 BOM (U+FEFF) that some editors prepend — it is not source.
+    // Done here (not in `lex`) so the lexer and the parser's source slice — used to
+    // capture `untyped`/verbatim spans — share the same byte offsets.
+    let src = src.strip_prefix('\u{FEFF}').unwrap_or(src);
     let tokens = lex(src).map_err(|e| ParseError {
         message: e.message,
         line: e.line,
@@ -1852,6 +1856,27 @@ mod tests {
         );
         // The DREAMCAST `return` carries the verbatim `untyped` operand.
         match &body[2] {
+            Stmt::Return(Some(Expr::Verbatim(code)), _) => assert_eq!(code, "fsqrtf(d * d)"),
+            other => panic!("expected verbatim return, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strips_a_leading_utf8_bom_keeping_offsets_aligned() {
+        // A leading UTF-8 BOM (U+FEFF) some editors prepend is stripped before lexing.
+        // Because it is stripped in `parse` (not `lex`), the parser's source slice stays
+        // byte-aligned with the token offsets, so a verbatim `untyped` capture — which
+        // slices the raw source — comes out exact, not shifted by the 3 BOM bytes.
+        let f = file(
+            "\u{FEFF}package p;\nclass X {\n  function f(d:Float):Float { return untyped fsqrtf(d * d); }\n}",
+        );
+        assert_eq!(f.package, vec!["p"]);
+        let cls = match &f.decls[0] {
+            Decl::Class(c) => c,
+            _ => panic!("expected class"),
+        };
+        let body = cls.methods[0].body.as_ref().expect("body");
+        match &body[0] {
             Stmt::Return(Some(Expr::Verbatim(code)), _) => assert_eq!(code, "fsqrtf(d * d)"),
             other => panic!("expected verbatim return, got {other:?}"),
         }

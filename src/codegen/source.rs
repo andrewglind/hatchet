@@ -163,6 +163,10 @@ pub fn generate_source_diagnostics(
             out.push_str(&g.class_impl());
             warnings.append(&mut g.warnings);
             errors.append(&mut g.errors);
+            // Advisory diagnostics for `@owned`/`@delete` overrides that look unsound to
+            // the escape analysis (the tags are still obeyed; this only flags a likely
+            // double-free / use-after-free).
+            warnings.extend(crate::sema::escape::advisory_warnings(prog, module_index, c));
         }
     }
 
@@ -295,8 +299,25 @@ impl<'a> BodyGen<'a> {
         no_trace: bool,
     ) -> Self {
         let ns = prog.modules[mi].package.clone();
-        let owned_containers =
-            crate::codegen::ownership::escaping_new_receivers(prog, mi, &ns, class);
+        // M5 cutover (consumer #2): the container receiver names into which a pushed
+        // `new` escapes to class-level storage (so it is emitted inline, not hoisted).
+        let owned_containers: std::collections::HashSet<String> =
+            crate::sema::escape::escaping_push_receivers(prog, mi, class).into_iter().collect();
+        // M5 cutover (consumer #3): the scalar pointer fields this object owns —
+        // NULL-initialised in the constructor and freed before reassignment. Sourced
+        // from the escape analysis (destructor-owned set), then filtered to the same
+        // shape the prior `owned_pointer_fields` heuristic produced: scalar pointers
+        // only (containers are value vectors, not NULL-initialised), and excluding
+        // `@owned` injected fields (always assigned, never NULL-initialised here).
+        let class_owned = crate::sema::escape::analyze_class(prog, mi, class).owned_fields;
+        let owned_fields: std::collections::HashSet<String> = class
+            .fields
+            .iter()
+            .filter(|f| class_owned.contains(&f.name))
+            .filter(|f| !f.meta.iter().any(|m| m.name == "owned"))
+            .filter(|f| f.ty.as_ref().is_some_and(|t| prog.map_type_use(t, mi, &ns).ends_with('*')))
+            .map(|f| f.name.clone())
+            .collect();
         BodyGen {
             prog,
             mi,
@@ -317,7 +338,7 @@ impl<'a> BodyGen<'a> {
             owned: vec![Vec::new()],
             escaping: std::collections::HashSet::new(),
             new_args_escape: false,
-            owned_fields: crate::codegen::ownership::owned_pointer_fields(class),
+            owned_fields,
             owned_containers,
             expected: None,
             no_trace,
@@ -1631,6 +1652,27 @@ impl<'a> BodyGen<'a> {
                         }
                     }
                 }
+                // String concatenation: in Haxe `+` with a `String` operand concatenates
+                // (stringifying the other side). In C++ `int + "literal"` would be
+                // pointer arithmetic and `std::string + int` does not compile, so build a
+                // `std::string` concatenation, formatting any non-string operand.
+                if matches!(*op, BinOp::Add) && (lty.base == "std::string" || rty.base == "std::string") {
+                    let lpart = self.concat_part(&l, &lty);
+                    let rpart = self.concat_part(&r, &rty);
+                    // `"a" + "b"` is `const char* + const char*` — anchor the left as a
+                    // `std::string` so the chain is string concatenation, not pointer math.
+                    let lpart = if matches!(lhs.as_ref(), Expr::Str { .. })
+                        && matches!(rhs.as_ref(), Expr::Str { .. })
+                    {
+                        format!("std::string({lpart})")
+                    } else {
+                        lpart
+                    };
+                    return (
+                        format!("{lpart} + {rpart}"),
+                        Ty { base: "std::string".into(), ..Default::default() },
+                    );
+                }
                 let ty = binop_result_ty(*op, lty);
                 (format!("{l} {} {r}", binop(*op)), ty)
             }
@@ -2041,7 +2083,7 @@ impl<'a> BodyGen<'a> {
     }
 
     /// Generate call arguments, hoisting anonymous struct literals to temporaries
-    /// typed by the callee's parameter (per SKILL: anon struct arg → temp var).
+    /// typed by the callee's parameter (an anon-struct argument → a named temp var).
     fn gen_args_typed(&mut self, args: &[Expr], param_tys: &[Option<Ty>], coerce_str: bool) -> String {
         self.gen_args_owned(args, param_tys, &[], coerce_str)
     }
@@ -2202,7 +2244,18 @@ impl<'a> BodyGen<'a> {
                 let val = self.gen_args_typed(&args[1..2], &[Some(elem)], false);
                 Some((format!("{rcode}.insert({rcode}.begin() + {pos}, {val})"), Ty::default()))
             }
-            "pop" => Some((format!("{rcode}.back()"), Ty::default())),
+            "pop" => {
+                // Haxe `Array.pop()` removes AND returns the last element; C++
+                // `back()` only *reads* it and `pop_back()` returns `void`, so capture
+                // the value into a temp first, then shrink the vector.
+                let elem = self.element_ty(_rty);
+                let spell = self.decl_spelling(&elem);
+                let tmp = self.fresh("pop");
+                let t = "\t".repeat(self.prelude_ind);
+                self.prelude.push_str(&format!("{t}{spell} {tmp} = {rcode}.back();\n"));
+                self.prelude.push_str(&format!("{t}{rcode}.pop_back();\n"));
+                Some((tmp, elem))
+            }
             // Map.get(k) → m[k]; element type is the map's value type.
             "get" if rcode_is_map(_rty) => {
                 let k = self.gen_expr(&args[0]).0;
@@ -2535,42 +2588,36 @@ impl<'a> BodyGen<'a> {
         if !interpolated || !has_interpolation(raw) {
             return (format!("\"{}\"", escape_str(raw)), str_ty);
         }
-        // String interpolation → sprintf into a stack buffer, returned as a temp.
-        let (literal, exprs) = split_interpolation(raw);
+        let (segments, exprs) = split_interpolation(raw);
         if exprs.is_empty() {
             return (format!("\"{}\"", escape_str(raw)), str_ty);
         }
-        let mut fmt = String::new();
-        let mut args = Vec::new();
-        let mut lit_chars = 0usize;
-        for seg in literal {
-            match seg {
-                Seg::Lit(s) => {
-                    lit_chars += s.len();
-                    fmt.push_str(&printf_escape(&s));
-                }
-                Seg::Expr(src) => {
-                    let (spec, arg) = match crate::parser::parse_expression(&src) {
-                        Ok(e) => {
-                            let (code, ty) = self.gen_expr(&e);
-                            self.spec_for(&code, &ty)
-                        }
-                        Err(_) => ("%s".to_string(), format!("\"{}\"", escape_str(&src))),
-                    };
-                    fmt.push_str(&spec);
-                    args.push(arg);
-                }
-            }
-        }
-        // Buffer sizing per SKILL: (n interpolations * 50) + literal characters.
-        let size = exprs.len() * 50 + lit_chars + 1;
-        let buf = self.fresh("buf");
+        // Build the result by appending each piece to a `std::string`: literal and string
+        // segments append directly (`s += part`) — `std::string` grows itself, so an
+        // arbitrarily long interpolated string is safe — while each numeric segment is
+        // formatted into a type-bounded buffer. There is no single value-guessed buffer,
+        // so this cannot overflow regardless of the runtime values.
+        let acc = self.fresh("str");
         let t = "\t".repeat(self.prelude_ind);
-        let mut pre = String::new();
-        let _ = writeln!(pre, "{t}char {buf}[{size}];");
-        let _ = writeln!(pre, "{t}sprintf({buf}, \"{fmt}\", {});", args.join(", "));
-        self.prelude.push_str(&pre);
-        (format!("std::string({buf})"), str_ty)
+        self.prelude.push_str(&format!("{t}std::string {acc};\n"));
+        for seg in segments {
+            let part = match seg {
+                Seg::Lit(s) => format!("\"{}\"", escape_str(&s)),
+                Seg::Expr(src) => match crate::parser::parse_expression(&src) {
+                    Ok(e) => {
+                        let (code, ty) = self.gen_expr(&e);
+                        if ty.base == "std::string" {
+                            code
+                        } else {
+                            self.format_scalar(&code, &ty)
+                        }
+                    }
+                    Err(_) => format!("\"{}\"", escape_str(&src)),
+                },
+            };
+            self.prelude.push_str(&format!("{t}{acc} += {part};\n"));
+        }
+        (acc, str_ty)
     }
 
     /// Lower a Haxe `trace(args...)` call. Like Haxe, the output is prefixed with
@@ -2636,13 +2683,7 @@ impl<'a> BodyGen<'a> {
                 str_ty,
             );
         }
-        let (spec, sarg) = self.spec_for(&code, &ty);
-        let buf = self.fresh("buf");
-        let t = "\t".repeat(self.prelude_ind);
-        let mut pre = String::new();
-        let _ = writeln!(pre, "{t}char {buf}[64];");
-        let _ = writeln!(pre, "{t}sprintf({buf}, \"{spec}\", {sarg});");
-        self.prelude.push_str(&pre);
+        let buf = self.format_scalar(&code, &ty);
         (format!("std::string({buf})"), str_ty)
     }
 
@@ -2671,6 +2712,38 @@ impl<'a> BodyGen<'a> {
         } else {
             ("%d".to_string(), code.to_string())
         }
+    }
+
+    /// Format a non-string scalar (`code` of type `ty`) into a hoisted stack buffer and
+    /// return the buffer name (a `const char*`). The buffer size is fixed by the *type*,
+    /// never guessed from the runtime value, so it can never overflow: a 32-bit `int`
+    /// prints ≤ 11 chars, a `float`/`double` via `%f` ≤ ~48 / ~316. This is the one place
+    /// that turns a number into text, shared by interpolation, concatenation and
+    /// `Std.string`. (Strings are never formatted through here — they are appended
+    /// directly, which is unbounded-safe.)
+    fn format_scalar(&mut self, code: &str, ty: &Ty) -> String {
+        let (spec, arg) = self.spec_for(code, ty);
+        let size = match ty.base.as_str() {
+            "double" => 320, // %f of DBL_MAX ≈ 316 chars
+            "float" => 64,   // %f of FLT_MAX ≈ 48 chars
+            _ => 24,         // a 64-bit integer ≤ 20 chars
+        };
+        let buf = self.fresh("buf");
+        let t = "\t".repeat(self.prelude_ind);
+        self.prelude.push_str(&format!("{t}char {buf}[{size}]; sprintf({buf}, \"{spec}\", {arg});\n"));
+        buf
+    }
+
+    /// One operand of a string concatenation, as a C++ expression that participates in
+    /// `std::string` `operator+`. A `String` operand (variable or literal) is used as-is;
+    /// a non-string (numeric) operand is formatted into a type-bounded buffer and wrapped
+    /// as a `std::string` so it anchors the chain (`std::string(buf) + ","`).
+    fn concat_part(&mut self, code: &str, ty: &Ty) -> String {
+        if ty.base == "std::string" {
+            return code.to_string();
+        }
+        let buf = self.format_scalar(code, ty);
+        format!("std::string({buf})")
     }
 
     // ---- object-literal expansion --------------------------------------
@@ -2929,10 +3002,12 @@ impl<'a> BodyGen<'a> {
     fn ctor_owned_params(&self, ty: &Type) -> Vec<bool> {
         let Some(info) = ty_named_info(self.prog, self.mi, ty) else { return Vec::new() };
         let Some(Decl::Class(c)) = self.prog.type_decl(&info) else { return Vec::new() };
-        let owned =
-            crate::codegen::ownership::owned_ctor_params(self.prog, info.module_index, &self.ns, c);
+        // M5 cutover (consumer #4): which constructor parameters take ownership of their
+        // argument comes from the escape analysis (proven equivalent to the heuristic
+        // `owned_ctor_params` across the corpus), as a per-position predicate.
+        let owned = crate::sema::escape::ctor_owned_params(self.prog, info.module_index, c);
         match &c.ctor {
-            Some(ctor) => ctor.params.iter().map(|p| owned.contains(&p.name)).collect(),
+            Some(ctor) => (0..ctor.params.len()).map(|i| owned.contains(&i)).collect(),
             None => Vec::new(),
         }
     }
@@ -3104,8 +3179,8 @@ impl<'a> BodyGen<'a> {
     /// lowers an *optional* value-struct (`?x:V`) to `V* x = NULL` — the same
     /// pointer shape as a *nullable* `Null<T>`. So optionality and nullability
     /// collapse to one C++ representation: mark such a param `nullable` so call
-    /// sites pass a pointer matching the signature (see SKILL: optional/nullable
-    /// value types both lower to `T*`). Reference types are already pointers (no
+    /// sites pass a pointer matching the signature (optional and nullable value
+    /// types both lower to `T*`). Reference types are already pointers (no
     /// change); `String`/primitive/`Array`/`Map` optionals stay by-value with a
     /// default, so they are left alone.
     fn param_ty_in(&self, p: &Param, ctx: usize) -> Option<Ty> {
