@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Cancel an in-progress run when a newer commit is pushed to the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Run every OS to completion even if one fails, so a single platform
+      # regression doesn't mask the others.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      # The compile gate (tests/example_compile.rs) and the ownership-runtime
+      # tests compile generated C++ with a C++98 compiler. The tests auto-detect
+      # `g++` on PATH (and skip gracefully if absent), so each runner just needs
+      # one available:
+      #   * Linux   — install g++ (build-essential is usually present, but be sure).
+      #   * Windows — install MinGW g++ via Chocolatey (preinstalled on the runner).
+      #   * macOS   — ships clang as `g++`, nothing to install.
+      - name: Install g++ (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y g++
+
+      - name: Install MinGW g++ (Windows)
+        if: runner.os == 'Windows'
+        run: choco install mingw --yes --no-progress
+
+      - name: Show compiler version
+        shell: bash
+        continue-on-error: true
+        run: g++ --version
+
+      - name: Build
+        run: cargo build --locked --verbose
+
+      - name: Test
+        run: cargo test --locked --verbose
+
+  lint:
+    name: Lint (clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets --locked -- -D warnings
