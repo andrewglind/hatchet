@@ -1,4 +1,4 @@
-package demo;
+package examples.shapes;
 
 // A 2-D point. A `typedef` of an anonymous structure lowers to a C++98 `struct`
 // (`struct Vec2 { float x; float y; };`) and is passed by value — there is no

@@ -1,5 +1,5 @@
 //! Header-generation rules, checked against small self-contained programs built
-//! in a temp directory (no external corpus required).
+//! in a temp directory (no external dependencies).
 
 use hatchet::codegen::generate_header;
 use hatchet::sema::Program;
@@ -29,12 +29,12 @@ fn decl_class_uses_the_portable_export_macro() {
     )
     .unwrap();
     let mut prog = Program::from_src_dir(&dir).expect("build program");
-    prog.export_macro = "MUCUS".to_string();
+    prog.export_macro = "NATIVE".to_string();
     let idx = module_index(&prog, "Widget");
     let out = generate_header(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("class MUCUS_CLASS Widget"), "@:decl → macro-decorated class:\n{out}");
+    assert!(out.contains("class NATIVE_CLASS Widget"), "@:decl → macro-decorated class:\n{out}");
     assert!(!out.contains("__declspec"), "no raw MSVC token leaks into output:\n{out}");
 }
 

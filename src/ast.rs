@@ -148,6 +148,11 @@ pub enum Expr {
     Cast { expr: Box<Expr>, ty: Option<Type> },
     /// `(expr : Type)`.
     TypeCheck { expr: Box<Expr>, ty: Type },
+    /// The Haxe 4.2 `expr is Type` runtime type-check operator. Hatchet does not
+    /// transpile it yet; this is carried only so the validation pass can flag it as
+    /// `Unsupported` with a precise location (a class-type check would need
+    /// `dynamic_cast` / RTTI, which is a separate, target-sensitive feature).
+    Is { expr: Box<Expr>, ty: Type },
     /// Parenthesised expression (grouping preserved for fidelity).
     Paren(Box<Expr>),
 
@@ -253,6 +258,11 @@ pub enum Stmt {
     Break,
     Continue,
     Throw(Expr, usize),
+    /// A `try { … } catch (e:T) { … }` block. Hatchet does not transpile exception
+    /// handling yet; the structure is parsed (so the validation pass can flag it as
+    /// `Unsupported` with a location, and so a future lowering has the AST it needs)
+    /// but no C++ is emitted for it.
+    Try { body: Box<Stmt>, catches: Vec<Catch>, line: usize },
     Block(Vec<Stmt>),
     /// Verbatim C++ injected at this point in the body, from `@:cppFileCode('...')`
     /// statement-level metadata. The code is emitted exactly as written (at column
@@ -264,6 +274,15 @@ pub enum Stmt {
 pub struct Case {
     /// One or more patterns share a body: `case A, B:`.
     pub patterns: Vec<Expr>,
+    pub body: Vec<Stmt>,
+}
+
+/// One `catch (name:Type) { … }` clause of a [`Stmt::Try`]. `ty` is `None` for the
+/// Haxe 4.2 type-less `catch (e)` form.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Catch {
+    pub name: String,
+    pub ty: Option<Type>,
     pub body: Vec<Stmt>,
 }
 
@@ -386,6 +405,11 @@ pub enum Decl {
     Global(GlobalVar),
     /// Top-level function (e.g. `extern inline function MCreateScene(...) {}`).
     Function(Function),
+    /// A recognised but not-yet-transpiled top-level declaration (an `abstract`
+    /// type or `enum abstract`). Its body is skipped at parse time; `feature` is a
+    /// human label and `line` its location, so the validation pass can flag it as
+    /// `Unsupported` rather than dying with a parse error.
+    Unsupported { feature: String, line: usize },
 }
 
 #[derive(Debug, Clone, PartialEq)]

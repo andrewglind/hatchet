@@ -15,7 +15,6 @@ pub mod cli;
 pub mod codegen;
 pub mod diag;
 pub mod discover;
-pub mod finals;
 pub mod lexer;
 pub mod parser;
 pub mod scan;

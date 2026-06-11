@@ -247,6 +247,80 @@ fn ereg_type_is_unsupported_not_unresolved() {
 }
 
 #[test]
+fn try_catch_is_unsupported() {
+    // Exception handling is parsed (so the rest of the file still parses) but not
+    // transpiled; it must raise an `Unsupported` diagnostic on the `try` line (4),
+    // not a parse error.
+    let (prog, idx) = program_from(
+        "Guard",
+        "class Guard {\n  public function new() {}\n  public function run():Void {\n    try { throw \"x\"; } catch (e:String) {}\n  }\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("exception handling")
+            && d.line == 4),
+        "expected an Unsupported try/catch diagnostic on line 4, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn is_operator_is_unsupported() {
+    // The Haxe 4.2 `expr is Type` operator is recognised in operator position and
+    // flagged (it would otherwise be an "unexpected token") on its statement line (4).
+    let (prog, idx) = program_from(
+        "Check",
+        "class Check {\n  public function new() {}\n  public function test(x:Dynamic):Bool {\n    return x is Check;\n  }\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("type-check operator")
+            && d.line == 4),
+        "expected an Unsupported `is` diagnostic on line 4, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn enum_abstract_is_unsupported() {
+    // `enum abstract` is parsed-and-skipped (so the file still parses) and flagged
+    // as unsupported on its declaration line (2), with the type name in the message.
+    let (prog, idx) = program_from(
+        "Color",
+        "package p;\nenum abstract Color(Int) {\n  var Red = 0;\n  var Green = 1;\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("enum abstract")
+            && d.message.contains("Color")
+            && d.line == 2),
+        "expected an Unsupported `enum abstract` diagnostic on line 2, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn abstract_type_is_unsupported() {
+    // A bare `abstract` type is parsed-and-skipped and flagged on its line (2).
+    let (prog, idx) = program_from(
+        "Meters",
+        "package p;\nabstract Meters(Float) {\n  public inline function new(v:Float) { this = v; }\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("`abstract` type")
+            && d.message.contains("Meters")
+            && d.line == 2),
+        "expected an Unsupported `abstract` diagnostic on line 2, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn primitives_containers_and_declared_types_are_not_flagged() {
     // Int/String/Array/Map/Null and a locally-declared struct all resolve.
     let (prog, idx) = program_from(

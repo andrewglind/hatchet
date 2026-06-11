@@ -111,6 +111,13 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
             format!("the `using` static-extension declaration `{}`", u.path.join(".")),
         ));
     }
+    // Top-level declarations Hatchet recognised but skipped at parse time (an
+    // `abstract` type or `enum abstract`) — flag each with the label the parser set.
+    for d in &m.file.decls {
+        if let Decl::Unsupported { feature, line } = d {
+            out.push(Diagnostic::unsupported(file.clone(), *line, feature.clone()));
+        }
+    }
     // Enum variants that take constructor parameters (`Move(dx:Int, dy:Int)`) need a
     // tagged-union lowering Hatchet does not implement — it emits plain C++ enums, so
     // the payload would be lost. Flag each parameterized variant.
@@ -229,6 +236,22 @@ impl<'a> UnsupportedWalker<'a> {
         ));
     }
 
+    fn flag_try(&mut self) {
+        self.out.push(Diagnostic::unsupported(
+            self.file.clone(),
+            self.line,
+            "a `try`/`catch` block (exception handling)",
+        ));
+    }
+
+    fn flag_is(&mut self) {
+        self.out.push(Diagnostic::unsupported(
+            self.file.clone(),
+            self.line,
+            "the `is` runtime type-check operator (Haxe 4.2)",
+        ));
+    }
+
     fn decl(&mut self, d: &Decl) {
         match d {
             Decl::Class(c) => {
@@ -252,6 +275,8 @@ impl<'a> UnsupportedWalker<'a> {
                 Some(e) => self.expr(e),
                 None => {}
             },
+            // Flagged directly in `unsupported_construct_errors` from its label.
+            Decl::Unsupported { .. } => {}
             Decl::Enum(_) | Decl::Typedef(_) => {}
         }
     }
@@ -340,6 +365,16 @@ impl<'a> UnsupportedWalker<'a> {
                 self.line = *line;
                 self.expr(e);
             }
+            Stmt::Try { body, catches, line } => {
+                self.line = *line;
+                self.flag_try();
+                self.stmt(body);
+                for c in catches {
+                    for s in &c.body {
+                        self.stmt(s);
+                    }
+                }
+            }
             Stmt::Block(stmts) => {
                 for s in stmts {
                     self.stmt(s);
@@ -378,6 +413,10 @@ impl<'a> UnsupportedWalker<'a> {
                 for a in args {
                     self.expr(a);
                 }
+            }
+            Expr::Is { expr, .. } => {
+                self.flag_is();
+                self.expr(expr);
             }
             Expr::Cast { expr, .. }
             | Expr::TypeCheck { expr, .. }
@@ -559,6 +598,9 @@ impl Collector {
                 }
             }
             Decl::Function(f) => self.func(f),
+            // Skipped at parse time (body discarded) and flagged elsewhere — nothing
+            // to collect type references from.
+            Decl::Unsupported { .. } => {}
         }
     }
 
@@ -620,6 +662,17 @@ impl Collector {
             }
             Stmt::Return(Some(e), _) => self.expr(e, ctx),
             Stmt::Throw(e, _) => self.expr(e, ctx),
+            // Unsupported (flagged elsewhere). Walk the bodies for nested type refs,
+            // but not the catch parameter types — those are the exception types we do
+            // not support, and reporting them as "unresolved" would be misleading.
+            Stmt::Try { body, catches, .. } => {
+                self.stmt(body, ctx);
+                for c in catches {
+                    for s in &c.body {
+                        self.stmt(s, ctx);
+                    }
+                }
+            }
             Stmt::Block(stmts) => {
                 for s in stmts {
                     self.stmt(s, ctx);
@@ -657,6 +710,10 @@ impl Collector {
                 self.check(ty, ctx);
                 self.expr(expr, ctx);
             }
+            // Unsupported (flagged elsewhere). Walk the operand for nested refs, but
+            // skip the checked type — it is the construct we do not support, so a
+            // separate "unresolved type" report on it would be misleading.
+            Expr::Is { expr, .. } => self.expr(expr, ctx),
             Expr::Lambda { params, ret, body } => {
                 for p in params {
                     self.opt(&p.ty, ctx);

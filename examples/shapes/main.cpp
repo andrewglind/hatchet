@@ -1,24 +1,24 @@
 // Hand-written entry point for the transpiled `shapes` example.
 //
 // Hatchet never transpiles `Main.hx` (it is the hxcpp entry point), so a real
-// build supplies its own `main()`. This one constructs a `demo::World`, prints
-// its report, and walks the tally — exercising the generated C++ end to end.
+// build supplies its own `main()`. This one constructs an `examples::shapes::World`,
+// prints its report, and walks the tally — exercising the generated C++ end to end.
 //
 // It is deliberately written in plain, VC6-friendly C++98: C standard headers,
 // `printf`, and a loop variable declared outside the `for` (VC6 leaks the
 // `for`-init into the enclosing scope).
 //
 // Build (after transpiling to ./out — see README.md):
-//   g++ -std=c++98 -I out main.cpp out/demo/*.cpp -o shapes
+//   g++ -std=c++98 -I out main.cpp out/examples/shapes/*.cpp -o shapes
 
 #include <stdio.h>
 #include <string>
 #include <map>
 
-#include "demo/World.h"
+#include "examples/shapes/World.h"
 
 int main() {
-	demo::World world("demo");
+	examples::shapes::World world("shapes");
 
 	printf("%s\n", world.report().c_str());
 	printf("shape count: %d\n", world.count());

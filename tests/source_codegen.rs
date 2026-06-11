@@ -1,5 +1,5 @@
 //! Body (`.cpp`) transpilation checks against small self-contained programs
-//! built in a temp directory (no external corpus required): `super(...)` → init
+//! built in a temp directory (no external dependencies): `super(...)` → init
 //! list, `this->`, anonymous struct → named temp, ownership, the Std/Math/String
 //! intrinsics, and the sugar lowerings.
 
@@ -308,24 +308,24 @@ fn bare_enum_constant_is_qualified_in_expression_position() {
 #[test]
 fn final_constant_references_are_namespace_qualified() {
     // A `@:native final` (provided by the C++ engine, not emitted) is referenced
-    // with its native namespace (`mucus::MAX_CHARS`). A public `final` is a
+    // with its native namespace (`native::MAX_CHARS`). A public `final` is a
     // `static const` inside its namespace, so a reference from a *different*
     // namespace — here a global-scope `extern "C"` export — is qualified too
     // (`game::SCENE_ID`), while a reference from within the same namespace stays
     // bare.
     let native = "\
-package mucus;
+package native;
 @:native @:include(\"engine.h\")
 final MAX_CHARS:Int = 100;
 ";
     let scenes = "\
 package game;
-import mucus.Mucus;
+import native.Native;
 final SCENE_ID:Int = 7;
 
 class Scene {
   public function new() {}
-  public function cap():Int { return MAX_CHARS; }        // native const → mucus::
+  public function cap():Int { return MAX_CHARS; }        // native const → native::
   public function id():Int { return SCENE_ID; }          // same ns → bare
 }
 
@@ -337,9 +337,9 @@ extern inline function Pick(n:Int):Int {
 }
 ";
     let dir = std::env::temp_dir().join(format!("hatchet_finalref_{}", std::process::id()));
-    std::fs::create_dir_all(dir.join("mucus")).unwrap();
+    std::fs::create_dir_all(dir.join("native")).unwrap();
     std::fs::create_dir_all(dir.join("game")).unwrap();
-    std::fs::write(dir.join("mucus").join("Mucus.hx"), native).unwrap();
+    std::fs::write(dir.join("native").join("Native.hx"), native).unwrap();
     std::fs::write(dir.join("game").join("Game.hx"), scenes).unwrap();
     let prog = Program::from_src_dir(&dir).expect("build program");
     let idx = prog
@@ -350,7 +350,7 @@ extern inline function Pick(n:Int):Int {
     let out = generate_source(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("return mucus::MAX_CHARS;"), "native const → native namespace:\n{out}");
+    assert!(out.contains("return native::MAX_CHARS;"), "native const → native namespace:\n{out}");
     assert!(out.contains("return SCENE_ID;"), "same-namespace ref stays bare:\n{out}");
     assert!(out.contains("case game::SCENE_ID:"), "global-scope ref → namespace-qualified:\n{out}");
 }
@@ -1464,4 +1464,50 @@ final Square:(Int, Int) -> Int = (a:Int, b:Int) -> a * b;
         "return type taken from the (Int,Int)->Int annotation:\n{out}"
     );
     assert!(out.contains("return a * b;"), "lambda body transpiled:\n{out}");
+}
+
+#[test]
+fn elseif_conditional_compilation_maps_to_elif_defined() {
+    // `#elseif FLAG` lowers to `#elif defined(FLAG)` (C++98 has no `#elifdef`);
+    // `#if`/`#else`/`#end` keep their established mappings.
+    let out = gen_one(
+        "class Cond {\n  public function new() {}\n  public function pick():Int {\n    #if WIN98\n    return 1;\n    #elseif DREAMCAST\n    return 2;\n    #else\n    return 3;\n    #end\n  }\n}\n",
+        "Cond",
+    );
+    assert!(out.contains("#ifdef WIN98"), "#if → #ifdef:\n{out}");
+    assert!(out.contains("#elif defined(DREAMCAST)"), "#elseif → #elif defined(...):\n{out}");
+    assert!(out.contains("#else"), "#else preserved:\n{out}");
+    assert!(out.contains("#endif"), "#end → #endif:\n{out}");
+}
+
+#[test]
+fn stringbuf_lowers_to_a_string_accumulator() {
+    // `new StringBuf()` → `std::string()`; `add`/`addChar` → `+=`; `toString()` → it.
+    let out = gen_one(
+        "class B {\n  public function new() {}\n  public function build():String {\n    var b = new StringBuf();\n    b.add(\"n=\");\n    b.add(7);\n    b.addChar(33);\n    return b.toString();\n  }\n}\n",
+        "B",
+    );
+    assert!(out.contains("std::string"), "StringBuf declared as std::string:\n{out}");
+    assert!(out.contains("+= "), "add/addChar append with +=:\n{out}");
+    assert!(!out.contains("new StringBuf"), "StringBuf is not heap-allocated:\n{out}");
+}
+
+#[test]
+fn std_random_lowers_to_guarded_rand_modulo() {
+    let out = gen_one(
+        "class R {\n  public function new() {}\n  public function roll():Int {\n    return Std.random(6);\n  }\n}\n",
+        "R",
+    );
+    assert!(out.contains("rand() %"), "Std.random → rand() %:\n{out}");
+}
+
+#[test]
+fn stringtools_statics_lower_without_using() {
+    // `StringTools.x(...)` is a plain static call — no `using` needed.
+    let out = gen_one(
+        "class Stools {\n  public function new() {}\n  public function clean(s:String):String {\n    return StringTools.replace(StringTools.trim(s), \"a\", \"b\");\n  }\n}\n",
+        "Stools",
+    );
+    assert!(out.contains(".replace("), "StringTools.replace → std::string::replace loop:\n{out}");
+    assert!(out.contains(".substr("), "StringTools.trim → substr of the trimmed range:\n{out}");
 }

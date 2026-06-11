@@ -3,7 +3,7 @@
 //! Per the rules, when a `StdAfx.hx` is found we create a `StdAfx.h` and inject
 //! the code exactly as specified in the `@:headerCode(...)` metadata; no
 //! `StdAfx.cpp` is generated. The include guard is derived from the package, e.g.
-//! package `modules` → `STDAFX_MODULES_H` (this matches the committed goldens).
+//! package `modules` → `STDAFX_MODULES_H`.
 
 use std::path::{Path, PathBuf};
 
@@ -89,8 +89,8 @@ const REQUIRED_CPP: [&str; 3] = ["<string>", "<vector>", "<map>"];
 
 /// The required `#include`s **not already present** in `existing`, formatted as a
 /// block (C group, blank line, C++ group). Empty when `existing` already has them
-/// all — which is what keeps the corpus `StdAfx.h` byte-exact, since its
-/// `@:headerCode` lists every required header itself.
+/// all — so a hand-written `StdAfx.h` whose `@:headerCode` already lists every
+/// required header is left exactly as written.
 fn missing_includes(existing: &str) -> String {
     let mut groups: Vec<String> = Vec::new();
     for group in [&REQUIRED_C[..], &REQUIRED_CPP[..]] {
@@ -123,8 +123,8 @@ fn merged_body(header_code: Option<&str>) -> String {
 
 /// The platform export / calling-convention macro block, parameterised by the
 /// `export_macro` prefix (default `HATCHET` → `HATCHET_EXPORT`/`HATCHET_CALL`). On MSVC
-/// these expand to exactly the Visual C++ `__declspec(dllexport)`/`__cdecl` tokens
-/// the corpus goldens use, so the VC6 output is unchanged after preprocessing;
+/// these expand to exactly the Visual C++ `__declspec(dllexport)`/`__cdecl` tokens,
+/// so the VC6 output is the expected native form after preprocessing;
 /// elsewhere they degrade to the GCC/Clang visibility attribute (or bare
 /// `extern "C"`), keeping Hatchet's output portable across Linux, macOS and embedded
 /// (e.g. Dreamcast SH4) toolchains.
@@ -197,7 +197,7 @@ pub fn content_for(
 /// Generate the prelude header (`<stem>.h`) that sits next to the given prelude
 /// source (`<stem>.hx`), merging its `@:headerCode` with the required includes.
 pub fn generate(stem: &str, hx_path: &Path, src: &str, export_macro: &str) -> Option<GeneratedFile> {
-    // Sources are commonly CRLF; generated C++ is always LF to match the goldens.
+    // Sources are commonly CRLF; generated C++ is always LF for consistency.
     let header_code = extract_header_code(src).map(|h| h.replace("\r\n", "\n").replace('\r', "\n"));
     let package = package_parts(src);
     let content = content_for(stem, header_code.as_deref(), &package, export_macro);
@@ -235,8 +235,8 @@ mod tests {
         assert_eq!(guard_for_package("StdAfx", &["modules".into()]), "STDAFX_MODULES_H");
         assert_eq!(guard_for_package("StdAfx", &["game".into()]), "STDAFX_GAME_H");
         assert_eq!(
-            guard_for_package("StdAfx", &["mucus".into(), "api".into()]),
-            "STDAFX_MUCUS_API_H"
+            guard_for_package("StdAfx", &["native".into(), "api".into()]),
+            "STDAFX_NATIVE_API_H"
         );
         assert_eq!(guard_for_package("StdAfx", &[]), "STDAFX_H");
         // A custom prelude name flows into the guard.
@@ -288,15 +288,15 @@ mod tests {
     fn content_for_emits_export_macros_with_prefix() {
         // The export macros land in the prelude, parameterised by the prefix, and
         // expand to the MSVC tokens under `_MSC_VER`.
-        let out = content_for("StdAfx", None, &["game".into()], "MUCUS");
+        let out = content_for("StdAfx", None, &["game".into()], "NATIVE");
         assert!(out.contains("#if defined(_MSC_VER)"), "platform guard present:\n{out}");
         assert!(
-            out.contains("#define MUCUS_EXPORT extern \"C\" __declspec(dllexport)"),
+            out.contains("#define NATIVE_EXPORT extern \"C\" __declspec(dllexport)"),
             "MSVC export macro:\n{out}"
         );
-        assert!(out.contains("#define MUCUS_CALL   __cdecl"), "MSVC call macro:\n{out}");
+        assert!(out.contains("#define NATIVE_CALL   __cdecl"), "MSVC call macro:\n{out}");
         assert!(
-            out.contains("#define MUCUS_CLASS  __declspec(dllexport)"),
+            out.contains("#define NATIVE_CLASS  __declspec(dllexport)"),
             "MSVC class-export macro (no extern \"C\"):\n{out}"
         );
         assert!(

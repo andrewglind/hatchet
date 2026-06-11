@@ -1,4 +1,5 @@
-package demo;
+package examples.shapes;
+import examples.shapes.Geometry;
 
 // The abstract base for every shape. `World` owns its shapes and deletes them
 // through this base pointer, so Hatchet gives `Shape` a `virtual ~Shape()`

@@ -20,8 +20,7 @@ Hatchet is a working transpiler with a real lexer, recursive-descent parser, typ
 A bundled [standalone example](examples/shapes) is transpiled, compiled under `g++ -std=c++98`, run,
 and output-checked by the test suite (see *Validation*), and the generated output has been **built
 with Visual C++ 6.0 and run on Windows 98** — the primary target — closing the loop from Haxe source
-to a running legacy binary. Hatchet has additionally been validated against a larger real Haxe game
-engine (the author's private offline corpus).
+to a running legacy binary. Hatchet has additionally been validated against a larger, real C++ game engine.
 
 Supported today, end to end:
 
@@ -36,27 +35,31 @@ Supported today, end to end:
 - **Statements & expressions** — `super(...)` initializer lists; `.`-vs-`->` selection via type
   inference (including inherited fields); anonymous-struct-to-temporary expansion (typed, untyped,
   nested); array / map / object literals; `Array`→`std::vector` and `Map`→`std::map` with their
-  container ops — Array `push`/`insert`/`pop`/`length`/`indexOf`/`contains`/`remove`/`reverse`/
-  `copy`/`join` and Map `get`/`exists`/`set`/`remove`/`keys` (each an inline loop/expression, no
-  `<algorithm>` dependency); Haxe's **auto-extending array writes** — `a[i] = v` past the end grows
+  container ops — Array `push`/`insert`/`pop`/`shift`/`unshift`/`length`/`indexOf`/`lastIndexOf`/
+  `contains`/`remove`/`reverse`/`concat`/`slice`/`copy`/`join` and Map `get`/`exists`/`set`/`remove`/
+  `keys` (each an inline loop/expression, no `<algorithm>` dependency); Haxe's **auto-extending array
+  writes** — `a[i] = v` past the end grows
   the vector first (an inline `resize`), matching Haxe rather than letting C++ `operator[]` run off
   the end; `for` over a range, an array, an anonymous array literal
   (`for (i in [1,2,3])`), or a map (`for (v in m)` over values, `for (k => v in m)` over key/value
   pairs, via a `std::map` iterator); array & map comprehensions; closures / `Array.map` lowered to
   free functions (an arrow param's type may be left off and taken from the binding's function-type
   annotation — `Cross:(Vec, Vec) -> Float = (a, b) -> …` types `a`/`b` as `Vec`); `String` methods
-  (`charAt`/`charCodeAt`/`indexOf`/`lastIndexOf`/`toUpperCase`/
-  `toLowerCase`/`split`) and `String.fromCharCode`, mapped to `std::string` expressions; string
+  (`charAt`/`charCodeAt`/`indexOf`/`lastIndexOf`/`substr`/`substring`/`toUpperCase`/
+  `toLowerCase`/`split`), `String.fromCharCode`, `StringBuf` (an `add`/`addChar`/`toString`
+  accumulator over `std::string`), and the `StringTools` statics
+  (`replace`/`trim`/`startsWith`/`endsWith`/`hex`) — all mapped to `std::string` expressions; string
   interpolation and `+` concatenation (built as a `std::string` — text appended directly and numeric
   operands formatted into type-bounded buffers, so no value-guessed buffer can overflow; interpolation
   also supports the `$ident` shorthand); the `??` null-coalesce and
   NULL-guarded `?.`; `cast` (C-style cast for `cast(expr, T)`, passthrough for `cast expr`); the
   `(expr : Type)` type ascription (a compile-time hint that drives inference, e.g. `([] : Array<Int>)`);
   `switch`/enum constants; `trace(...)` (with `--no-traces` to strip it); and the `Math` / `Std` /
-  `Sys` intrinsics (`Std.int`/`Std.string`/`Std.parseInt`/`Std.parseFloat` → inline
-  `(int)`/`sprintf`/`strtol`/`atof`).
-- **Conditional compilation & escape hatches** — Haxe `#if FLAG` / `#else` / `#end` map to the C++
-  preprocessor (`#ifdef`/`#else`/`#endif`); `untyped <expr>` passes an expression through to C++
+  `Sys` intrinsics (`Std.int`/`Std.string`/`Std.parseInt`/`Std.parseFloat`/`Std.random` → inline
+  `(int)`/`sprintf`/`strtol`/`atof`/`rand()`).
+- **Conditional compilation & escape hatches** — Haxe `#if FLAG` / `#elseif FLAG` / `#else` / `#end`
+  map to the C++ preprocessor (`#ifdef` / `#elif defined(FLAG)` / `#else` / `#endif`); `untyped
+  <expr>` passes an expression through to C++
   verbatim; a statement-level `@:include("…")` emits an `#include` at that point; and
   `@:cppFileCode('…')` injects verbatim C++ in a body.
 - **Types & nullability** — `Null<T>` and optional value-structs lower uniformly to `T*` (with
@@ -108,14 +111,14 @@ hatchet --src path/to/project --out path/to/output --force
 
 # A glob works too (expanded by Hatchet itself, so quote it on shells that would
 # otherwise expand it). Mix files, dirs, and globs freely:
-hatchet --src modules/*.hx mucus/Mucus.hx --out path/to/output --force
+hatchet --src modules/*.hx --out path/to/output --force
 
 # Transpile a single file — pass its dependencies too (superclasses, native stubs),
 # since the listed sources are the entire resolution scope:
-hatchet --src game/Scene.hx modules/Module.hx mucus/Mucus.hx --out out
+hatchet --src game/Scene.hx modules/Module.hx --out out
 
 # Preview on stdout, or validate without writing anything:
-hatchet --src game/Scene.hx modules/Module.hx mucus/Mucus.hx --stdout
+hatchet --src game/Scene.hx modules/Module.hx --stdout
 hatchet --src . --dry-run
 
 # Run interactively (prompts for a source and a target dir) when --src is omitted:
@@ -138,7 +141,7 @@ its package path).
 | `--dry-run` | Transpile and report info/warnings/errors only — write nothing. Takes precedence over `--stdout`/`-o`/`--force` |
 | `--stdout` | Write generated C++ to stdout instead of files (status goes to stderr) |
 | `--stdafx <NAME>` | Stem of the prelude source/header (default `StdAfx` → `StdAfx.h`; e.g. `MyGame` → `MyGame.h`) |
-| `--export-macro <PREFIX>` | Prefix for the portable DLL-export macros wrapped around `extern inline` functions (default `HATCHET` → `HATCHET_EXPORT`/`HATCHET_CALL`/`HATCHET_CLASS`; e.g. `MUCUS`) |
+| `--export-macro <PREFIX>` | Prefix for the portable DLL-export macros wrapped around `extern inline` functions (default `HATCHET` → `HATCHET_EXPORT`/`HATCHET_CALL`/`HATCHET_CLASS`) |
 | `--depth <N>` | Max expression-nesting depth at which a buried `Null<T>` call is auto-extracted into a freed local instead of warned about (default `1`; e.g. `2` auto-extracts `if (GetEdge(e) == null)`) |
 | `--no-traces` | Strip all `trace(...)` calls from the generated C++ (lowered to no-ops, arguments not evaluated), mirroring hxcpp's `-D no-traces` |
 
@@ -162,7 +165,6 @@ Source layout (`src/`):
 | `sema/` | Symbol table, Haxe→C++ type & namespace mapping (`types.rs`), `@:include` resolution (`includes.rs`), pre-codegen validation (`validate.rs`), and the whole-program escape / ownership analysis (`escape.rs`) |
 | `codegen/` | C++ generation: `mod.rs` (headers), `source.rs` (`.cpp` bodies), `holder.rs` (base-from-member idiom), `ownership.rs` (destructor delete emission, driven by `sema/escape.rs`) |
 | `stdafx.rs` | `StdAfx.hx` → `StdAfx.h`, and the generated standard-library prelude |
-| `finals.rs` | Top-level `final` constant extraction |
 | `scan.rs` | Small comment-aware scanning helpers |
 | `diag.rs` | Diagnostics (`error:` / unsupported-feature reporting) |
 
@@ -187,10 +189,12 @@ This distinguishes "your input is wrong" (fix the Haxe) from "Hatchet doesn't do
 PR). Currently flagged as unsupported: a **lambda** used outside a top-level `final` binding or an
 `Array.map(...)` argument; **Haxe macros** (a `macro` function, or the macro AST type `Expr`);
 **regular expressions** (both the `~/pattern/flags` literal and the `EReg` type); **`using` static
-extensions**; and **parameterized enum variants** (a variant with constructor parameters, e.g.
-`Move(dx:Int, dy:Int)`, which would need a tagged-union lowering). Relatedly, a `for` loop over
-anything other than a range, an `Array`, or a `Map` (a custom `Iterator`/`Iterable`) is a hard
-error rather than a guess.
+extensions**; **parameterized enum variants** (a variant with constructor parameters, e.g.
+`Move(dx:Int, dy:Int)`, which would need a tagged-union lowering); **`try`/`catch`** exception
+handling; the **`is`** runtime type-check operator (Haxe 4.2); and **`abstract` types** (including
+`enum abstract`). These last three are parsed but not transpiled, so they are reported with a clean
+diagnostic rather than a parse error. Relatedly, a `for` loop over anything other than a range, an
+`Array`, or a `Map` (a custom `Iterator`/`Iterable`) is a hard error rather than a guess.
 
 ## Standalone projects and the prelude
 
@@ -225,9 +229,9 @@ cargo test                 # whole suite; the compile gate is skipped if no C++ 
 HATCHET_GXX=/path/to/g++ cargo test   # point it at a specific compiler
 ```
 
-Hatchet was also developed against a larger private Haxe game-engine corpus whose output is built
-on real Visual C++ 6.0 / Windows 98 hardware; that corpus is the author's offline validation harness
-and is not part of the shipped test suite.
+Hatchet was also developed against a larger private Haxe game engine whose output is built on real
+Visual C++ 6.0 / Windows 98 hardware; that project is the author's offline validation harness and is
+not part of the shipped test suite.
 
 ### The native boundary contract
 

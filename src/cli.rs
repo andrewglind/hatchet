@@ -29,7 +29,7 @@ pub struct Args {
     /// Haxe `.hx` source(s) to transpile (prompted if omitted). Each entry may be
     /// a single file, a directory (crawled recursively for `.hx`), or a glob
     /// (`*`/`?`/`**`, e.g. `modules/*.hx` or `src/**/*.hx`) — and you may pass
-    /// several, e.g. `--src modules mucus/Mucus.hx`. Globs are expanded by Hatchet
+    /// several, e.g. `--src modules native/Native.hx`. Globs are expanded by Hatchet
     /// itself, so quoting them to bypass shell expansion works too. The full
     /// expanded set is also the whole resolution scope, so a file's dependencies
     /// (superclasses, native `@:native` stubs) must be reachable in it. Each
@@ -74,8 +74,8 @@ pub struct Args {
     pub stdafx: String,
 
     /// Prefix for the platform export/calling-convention macros wrapped around
-    /// `extern inline` functions. e.g. `--export-macro MUCUS` emits `MUCUS_EXPORT`
-    /// / `MUCUS_CALL` (defined in the prelude). Defaults to `HATCHET`.
+    /// `extern inline` functions. e.g. `--export-macro API` emits `API_EXPORT`
+    /// / `API_CALL` (defined in the prelude). Defaults to `HATCHET`.
     #[arg(long, default_value = "HATCHET")]
     pub export_macro: String,
 }

@@ -171,7 +171,7 @@ fn file_name_is(path: &Path, name: &str) -> bool {
 }
 
 /// Infer the package (dotted parts) from a file's directory relative to the
-/// source root. e.g. `<root>/mucus/api/Mucus.hx` → `["mucus", "api"]`.
+/// source root. e.g. `<root>/native/api/Native.hx` → `["native", "api"]`.
 pub fn package_from_path(src_root: &Path, hx_path: &Path) -> Vec<String> {
     let parent = match hx_path.parent() {
         Some(p) => p,
@@ -240,8 +240,8 @@ mod tests {
     fn package_from_dirs() {
         let root = Path::new("/src");
         assert_eq!(
-            package_from_path(root, Path::new("/src/mucus/api/Mucus.hx")),
-            vec!["mucus", "api"]
+            package_from_path(root, Path::new("/src/native/api/Native.hx")),
+            vec!["native", "api"]
         );
         assert_eq!(
             package_from_path(root, Path::new("/src/modules/Vertex.hx")),

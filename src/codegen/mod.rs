@@ -525,8 +525,8 @@ impl<'a> HeaderGen<'a> {
 
 // ---- reusable param / type helpers (shared with source.rs) -------------
 
-/// A parameter declaration (with default value), per the rules derived from the
-/// goldens: reference types → `T*`; nullable value-struct → `T*`; non-optional
+/// A parameter declaration (with default value), per the pointer/reference rules:
+/// reference types → `T*`; nullable value-struct → `T*`; non-optional
 /// `String`/struct/container → `const T&`; primitives by value.
 pub(crate) fn param_decl(prog: &Program, mi: usize, ns: &[String], p: &Param) -> String {
     let name = &p.name;

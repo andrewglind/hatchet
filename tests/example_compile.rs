@@ -1,6 +1,6 @@
 //! In-repo compile + run gate for the bundled `examples/shapes` project.
 //!
-//! Unlike the corpus tests, this needs nothing outside the repository: the
+//! This test needs nothing outside the repository: the
 //! example ships in `examples/shapes`, so the only external requirement is a
 //! C++98 compiler. It transpiles the example with the built `hatchet` binary,
 //! compiles the generated C++ together with the hand-written `main.cpp` under
@@ -54,17 +54,18 @@ fn shapes_example_transpiles_compiles_and_runs() {
         return;
     };
     let example = example_dir();
-    let demo = example.join("demo");
     let main_cpp = example.join("main.cpp");
-    assert!(demo.is_dir(), "example sources missing: {}", demo.display());
+    assert!(example.join("World.hx").is_file(), "example sources missing: {}", example.display());
     assert!(main_cpp.is_file(), "example driver missing: {}", main_cpp.display());
 
-    // Transpile into a throwaway output dir with the built binary.
+    // Transpile into a throwaway output dir with the built binary. The example's
+    // `.hx` sources live directly in `examples/shapes` (package `examples.shapes`),
+    // so `--src` points at that directory and Hatchet crawls it for `.hx` files.
     let out = std::env::temp_dir().join(format!("hatchet_example_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
     let gen_ok = Command::new(env!("CARGO_BIN_EXE_hatchet"))
         .arg("--src")
-        .arg(&demo)
+        .arg(&example)
         .arg("--out")
         .arg(&out)
         .arg("--force")

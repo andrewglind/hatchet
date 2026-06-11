@@ -11,9 +11,9 @@
 //!   2. re-express that path as relative to the directory of the file being
 //!      generated.
 //!
-//! Example: `modules/Foo.hx` imports `mucus/api/Mucus.hx`, which declares
-//! `@:include("../../src/Mucus.h")`. Step 1: `mucus/api` + `../../src/Mucus.h`
-//! → `src/Mucus.h`. Step 2: from `modules`, that is `../src/Mucus.h`.
+//! Example: `modules/Foo.hx` imports `native/api/Native.hx`, which declares
+//! `@:include("../../src/Native.h")`. Step 1: `native/api` + `../../src/Native.h`
+//! → `src/Native.h`. Step 2: from `modules`, that is `../src/Native.h`.
 
 /// Split a path string (using `/` or `\`) into non-empty components.
 fn split_path(s: &str) -> Vec<String> {
@@ -43,7 +43,7 @@ fn normalize(parts: Vec<String>) -> Vec<String> {
 
 /// Compute a relative path string from directory `from` to file `to`
 /// (both source-root-relative component lists). Uses `/` separators and no
-/// leading `./` for same-directory targets (matching the goldens).
+/// leading `./` for same-directory targets.
 fn relative(from: &[String], to: &[String]) -> String {
     let common = from
         .iter()
@@ -180,9 +180,9 @@ mod tests {
 
     #[test]
     fn two_step_inherited_include() {
-        // mucus/api declares ../../src/Mucus.h ; target is modules/
-        let got = resolve_include("../../src/Mucus.h", &parts("mucus/api"), &parts("modules"));
-        assert_eq!(got, "../src/Mucus.h");
+        // native/api declares ../../src/Native.h ; target is modules/
+        let got = resolve_include("../../src/Native.h", &parts("native/api"), &parts("modules"));
+        assert_eq!(got, "../src/Native.h");
     }
 
     #[test]
@@ -203,8 +203,8 @@ mod tests {
 
     #[test]
     fn header_up_and_over() {
-        let got = relative_header(&parts("src/Mucus.h"), &parts("game"));
-        assert_eq!(got, "../src/Mucus.h");
+        let got = relative_header(&parts("src/Native.h"), &parts("game"));
+        assert_eq!(got, "../src/Native.h");
     }
 
     #[test]
@@ -228,20 +228,20 @@ mod tests {
 
     #[test]
     fn rebase_repoints_an_escaping_include_when_the_dep_stayed_put() {
-        // Layout: <t>/Modules is the source root, engine at <t>/MucusEngine. Output
+        // Layout: <t>/Modules is the source root, engine at <t>/NativeEngine. Output
         // is nested at <t>/Modules/out, and the engine is NOT mirrored there, so the
-        // escaping include must gain one `..` to keep resolving to <t>/MucusEngine.
+        // escaping include must gain one `..` to keep resolving to <t>/NativeEngine.
         let t = std::env::temp_dir().join(format!("hatchet_rebase_a_{}", std::process::id()));
-        let engine = t.join("MucusEngine/src");
+        let engine = t.join("NativeEngine/src");
         std::fs::create_dir_all(&engine).unwrap();
-        std::fs::write(engine.join("Mucus.h"), "").unwrap();
+        std::fs::write(engine.join("Native.h"), "").unwrap();
         let src = t.join("Modules");
         let out = t.join("Modules/out");
         std::fs::create_dir_all(out.join("modules")).unwrap();
 
-        let got = rebase_if_escaping("../../MucusEngine/src/Mucus.h", &parts("modules"), &src, &out);
+        let got = rebase_if_escaping("../../NativeEngine/src/Native.h", &parts("modules"), &src, &out);
         let _ = std::fs::remove_dir_all(&t);
-        assert_eq!(got, "../../../MucusEngine/src/Mucus.h");
+        assert_eq!(got, "../../../NativeEngine/src/Native.h");
     }
 
     #[test]
@@ -250,19 +250,19 @@ mod tests {
         // mirrored under the output's parent, so the source-relative path still
         // resolves from the output and must be left untouched.
         let t = std::env::temp_dir().join(format!("hatchet_rebase_b_{}", std::process::id()));
-        let mirrored = t.join("gate/MucusEngine/src");
+        let mirrored = t.join("gate/NativeEngine/src");
         std::fs::create_dir_all(&mirrored).unwrap();
-        std::fs::write(mirrored.join("Mucus.h"), "").unwrap();
-        // src_root is the *real* corpus, which also exists, but the alongside copy
+        std::fs::write(mirrored.join("Native.h"), "").unwrap();
+        // src_root is the *real* source tree, which also exists, but the alongside copy
         // wins because the source-relative path resolves from the output.
         let src = t.join("real/Modules");
-        std::fs::create_dir_all(src.join("../MucusEngine/src")).unwrap();
-        std::fs::write(t.join("real/MucusEngine/src/Mucus.h"), "").unwrap();
+        std::fs::create_dir_all(src.join("../NativeEngine/src")).unwrap();
+        std::fs::write(t.join("real/NativeEngine/src/Native.h"), "").unwrap();
         let out = t.join("gate/Modules");
         std::fs::create_dir_all(out.join("modules")).unwrap();
 
-        let got = rebase_if_escaping("../../MucusEngine/src/Mucus.h", &parts("modules"), &src, &out);
+        let got = rebase_if_escaping("../../NativeEngine/src/Native.h", &parts("modules"), &src, &out);
         let _ = std::fs::remove_dir_all(&t);
-        assert_eq!(got, "../../MucusEngine/src/Mucus.h");
+        assert_eq!(got, "../../NativeEngine/src/Native.h");
     }
 }

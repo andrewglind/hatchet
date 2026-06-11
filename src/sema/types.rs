@@ -19,6 +19,9 @@ pub fn map_primitive(name: &str) -> Option<&'static str> {
         "Bool" => "bool",
         "Void" => "void",
         "String" => "std::string",
+        // `StringBuf` lowers to a `std::string` accumulator: `new StringBuf()` →
+        // `std::string()`, `add`/`addChar` → `+=`, `toString()` → the string itself.
+        "StringBuf" => "std::string",
         "UInt8" => "uint8_t",
         "UInt16" => "uint16_t",
         "UInt32" => "uint32_t",
@@ -27,8 +30,8 @@ pub fn map_primitive(name: &str) -> Option<&'static str> {
     })
 }
 
-/// The fixed-width unsigned aliases (`UInt8`/`UInt16`/`UInt32`). In the corpus
-/// these are declared as `typedef UInt8 = UInt;` purely to keep the Haxe valid;
+/// The fixed-width unsigned aliases (`UInt8`/`UInt16`/`UInt32`). These are
+/// commonly declared as `typedef UInt8 = UInt;` purely to keep the Haxe valid;
 /// Hatchet maps them directly to `<stdint.h>` types and never emits the typedef.
 pub fn is_uint_shim(name: &str) -> bool {
     matches!(name, "UInt8" | "UInt16" | "UInt32")

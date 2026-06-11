@@ -1,4 +1,6 @@
-package demo;
+package examples.shapes;
+import examples.shapes.Geometry;
+import examples.shapes.Shape;
 
 class Circle extends Shape {
 	public var center(default, null):Vec2;

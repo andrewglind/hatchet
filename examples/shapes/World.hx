@@ -1,4 +1,8 @@
-package demo;
+package examples.shapes;
+import examples.shapes.Geometry;
+import examples.shapes.Shape;
+import examples.shapes.Circle;
+import examples.shapes.Rectangle;
 
 // Owns a collection of shapes and reports on them. Demonstrates owned
 // containers, comprehensions, Array/Map methods, a switch over an enum, and

@@ -492,8 +492,8 @@ pub fn analyze_fn(prog: &Program, mi: usize, class: &Class, f: &Function) -> FnE
 /// The names of `class`'s methods that return a freshly-allocated value the caller
 /// owns (their body has an allocation classified `Owner::Return`). Each method is
 /// analysed *without* return-consumption (an empty summary) so this is a single
-/// non-recursive pass — it sees a direct `return new T(...)`, which is what the
-/// corpus factories (`Graph.GetEdge`) do. A method that returns the result of
+/// non-recursive pass — it sees a direct `return new T(...)`, which is what a
+/// factory method (e.g. `Graph.GetEdge`) does. A method that returns the result of
 /// *another* owned-returning call would need a fixpoint; left for later.
 fn owned_returning_methods(
     prog: &Program,
@@ -1430,10 +1430,9 @@ mod tests {
     }
 
     // ---- field-ownership flow cases ---------------------------------------
-    // Pin the analysis's owned-field result across the flow shapes the corpus relies
-    // on. (These were originally diffed against the now-deleted `codegen::ownership`
-    // heuristics; the corpus-wide M5 de-risk confirmed equivalence before cutover, so
-    // they are now direct assertions on the analysis.)
+    // Pin the analysis's owned-field result across the common flow shapes. (These
+    // were originally diffed against the now-deleted `codegen::ownership` heuristics;
+    // after confirming equivalence they are now direct assertions on the analysis.)
 
     #[test]
     fn owns_the_direct_cases() {
@@ -1476,7 +1475,7 @@ mod tests {
 
     #[test]
     fn sound_owned_and_delete_produce_no_advisory() {
-        // The corpus shapes: `@owned` fields used only as receivers, and a scope-local
+        // The common shapes: `@owned` fields used only as receivers, and a scope-local
         // `@delete`. Nothing looks unsound, so no advisory fires.
         assert!(advisories_of(
             "class V { public function use():Void {} } class C { @owned var a:V; public function new(a:V) { this.a = a; } public function draw():Void { this.a.use(); } }",

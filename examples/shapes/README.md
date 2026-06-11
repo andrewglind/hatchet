@@ -3,13 +3,13 @@
 A small, **standalone** Haxe project (no native `@:native` engine stub) that
 transpiles cleanly to C++98 and compiles under both `g++ -std=c++98` and
 Visual C++ 6.0. It exists so Hatchet's output can be exercised end to end — and
-checked for VC6 compatibility offline — without the private game corpus.
+checked for VC6 compatibility offline.
 
 ## What it exercises
 
 | Feature | Where |
 |---------|-------|
-| Package → C++ `namespace` | every file is `package demo;` → `namespace demo` |
+| Package → C++ `namespace` | every file is `package examples.shapes;` → `namespace examples { namespace shapes` |
 | Class inheritance + **virtual dispatch** | `Shape` ← `Circle`, `Rectangle` |
 | Auto virtual destructor on an owned base | `Shape` (deleted through `Shape*`) |
 | **Base-from-member "Holder" idiom** (work before `super`) | `Circle` → `CircleHolder` |
@@ -30,10 +30,11 @@ checked for VC6 compatibility offline — without the private game corpus.
 ## Build and run
 
 From the repository root, transpile the project (the project root is inferred
-from the `package demo;` declarations, so `--src` points at the package folder):
+from the `package examples.shapes;` declarations, so `--src` points at the
+folder holding the `.hx` sources):
 
 ```bash
-hatchet --src examples/shapes/demo --out examples/shapes/out --force
+hatchet --src examples/shapes --out examples/shapes/out --force
 ```
 
 Then compile the generated C++ together with the hand-written `main.cpp`
@@ -41,14 +42,14 @@ Then compile the generated C++ together with the hand-written `main.cpp`
 
 ```bash
 cd examples/shapes
-g++ -std=c++98 -pedantic -Wall -I out main.cpp out/demo/*.cpp -o shapes
+g++ -std=c++98 -pedantic -Wall -I out main.cpp out/examples/shapes/*.cpp -o shapes
 ./shapes
 ```
 
 Expected output:
 
 ```text
-World "demo": 3 shapes, total area 31.634937
+World "shapes": 3 shapes, total area 31.634937
 shape count: 3
 area rms: 10
   circle x2
@@ -57,10 +58,22 @@ area rms: 10
 
 ### On Windows 98 / Visual C++ 6.0
 
-Copy the generated `out/demo/*.h` / `*.cpp` and `main.cpp` to the target, add
+Copy the generated `out/examples/shapes/*.h` / `*.cpp` and `main.cpp` to the target, add
 them to a VC6 project (or `cl`-compile them together with `main.cpp`), and build.
 The generated code uses only standard headers pulled in by the generated
 `StdAfx.h`, so no extra setup is required.
 
 > The `out/` directory and any built binary are generated artifacts and are
 > git-ignored; only the `.hx` sources, `main.cpp`, and this README are tracked.
+
+## It is also valid hxcpp input
+
+A core Hatchet rule is that every input must be real, compilable Haxe — not a
+transpiler-only dialect. These sources are therefore kept buildable by Haxe's
+own C++ backend: the repo-root [`build.hxml`](../../build.hxml) compiles
+[`examples/Main.hx`](../Main.hx) (which imports every example package) with
+hxcpp, so the example doubles as an hxcpp conformance check:
+
+```bash
+haxe build.hxml      # from the repository root
+```

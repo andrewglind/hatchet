@@ -514,11 +514,11 @@ class Scenario {
     assert_eq!(r.live, 0, "@delete frees the returned pointer the analysis would leak");
 }
 
-// ---- corpus structural features (engine-free) -----------------------------
-// These mirror the shapes the real corpus uses around ownership — property
+// ---- real-world structural features (engine-free) -------------------------
+// These mirror the shapes real Haxe code uses around ownership — property
 // accessors, inheritance + `super` forwarding, and the base-from-member holder
-// idiom — without needing the engine, so the codegen paths the corpus exercises
-// are checked at runtime too.
+// idiom — without needing the engine, so the codegen paths real projects
+// exercise are checked at runtime too.
 
 /// `@owned` on a property field (`var a(default, null):Child`) — the Quad/Line
 /// shape: the accessor is generated and the field is still freed exactly once.
