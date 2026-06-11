@@ -1104,7 +1104,8 @@ impl<'a> BodyGen<'a> {
                 let (e, _) = self.gen_expr(end);
                 self.flush(out);
                 self.define_local(var, Ty { base: "int".into(), ..Default::default() });
-                let _ = writeln!(out, "{t}for (int {var} = {s}; {var} < {e}; ++{var}) {{");
+                let lv = self.loop_var(var);
+                let _ = writeln!(out, "{t}for (int {lv} = {s}; {lv} < {e}; ++{lv}) {{");
                 self.gen_block_inner(body, ind + 1, out);
                 self.emit_owned_deletes(out, ind + 1);
                 let _ = writeln!(out, "{t}}}");
@@ -1192,8 +1193,9 @@ impl<'a> BodyGen<'a> {
                 let (s, _) = self.gen_expr(start);
                 let (e, _) = self.gen_expr(end);
                 self.define_local(var, int_ty());
+                let lv = self.loop_var(var);
                 (
-                    format!("{t}for (int {var} = {s}; {var} < {e}; ++{var}) {{\n"),
+                    format!("{t}for (int {lv} = {s}; {lv} < {e}; ++{lv}) {{\n"),
                     format!("{t}}}\n"),
                 )
             }
@@ -1838,6 +1840,14 @@ impl<'a> BodyGen<'a> {
         // or `game::ALIENBEACH_SCENE_ID` inside a global-scope `extern "C"` export.
         if let Some(qref) = self.prog.global_final_ref(name, self.mi, &self.ns) {
             return (qref, Ty::default());
+        }
+        // A bare enum variant in expression position (`return CircleKind`,
+        // `kind = RectKind`): qualify it with its enum's C++ type, mirroring the
+        // `switch`-case path (`demo::ShapeKind_::CircleKind`). Without this the
+        // raw `CircleKind` is undeclared in C++ (the constant lives inside the
+        // enum's `struct E_`).
+        if let Some((qref, ty)) = self.enum_variant_ref(name) {
+            return (qref, ty);
         }
         // free function / global / unknown — pass through
         (name.to_string(), Ty::default())
@@ -3139,6 +3149,20 @@ impl<'a> BodyGen<'a> {
         format!("_{hint}{}", self.tmp)
     }
 
+    /// Allocate a unique C++ name for a counter-style loop control variable (a
+    /// `for`-init `int`) and register the rename so the loop body resolves the
+    /// Haxe name to it. VC6 uses the pre-standard `for` scope rule, where a
+    /// `for (int i ...)` init variable leaks into the *enclosing* block; two
+    /// loops (or comprehensions) reusing the same Haxe name in one function would
+    /// then redeclare `i` (`error C2374`). A fresh name per loop sidesteps that
+    /// with no change in behaviour. (Element/iterator bindings declared inside the
+    /// loop braces are already block-scoped, so only the `for`-init needs this.)
+    fn loop_var(&mut self, haxe: &str) -> String {
+        let cpp = self.fresh(haxe);
+        self.renames.last_mut().unwrap().insert(haxe.to_string(), cpp.clone());
+        cpp
+    }
+
     // ---- type helpers --------------------------------------------------
 
     fn ty_of(&self, ht: &Type) -> Ty {
@@ -3466,6 +3490,43 @@ impl<'a> BodyGen<'a> {
             Expr::Ident(n) => self.lookup_local(n).unwrap_or_default(),
             _ => Ty::default(),
         }
+    }
+
+    /// Resolve a bare enum-variant identifier (e.g. `CircleKind`) to its
+    /// qualified C++ constant (`demo::ShapeKind_::CircleKind`) and enum type.
+    /// Searches enums in scope by variant name, preferring the expected type when
+    /// it is an enum (so a name shared by two enums resolves to the contextual
+    /// one). Returns `None` when no enum declares the variant — the caller then
+    /// treats the identifier as an ordinary unknown.
+    fn enum_variant_ref(&self, name: &str) -> Option<(String, Ty)> {
+        let mut order: Vec<&TypeInfo> = Vec::new();
+        if let Some(info) = self.expected.as_ref().and_then(|t| t.info.as_ref()) {
+            if info.kind == TypeKind::Enum {
+                order.push(info);
+            }
+        }
+        for info in &self.prog.types {
+            if info.kind == TypeKind::Enum {
+                order.push(info);
+            }
+        }
+        for info in order {
+            if self.enum_has_variant(info, name) {
+                let ty = Ty { base: info.name.clone(), info: Some(info.clone()), ..Default::default() };
+                return Some((self.enum_constant(info, name), ty));
+            }
+        }
+        None
+    }
+
+    /// Whether the enum `info` declares a variant named `name`.
+    fn enum_has_variant(&self, info: &TypeInfo, name: &str) -> bool {
+        let Some(m) = self.prog.modules.get(info.module_index) else {
+            return false;
+        };
+        m.file.decls.iter().any(|d| {
+            matches!(d, Decl::Enum(e) if e.name == info.name && e.variants.iter().any(|v| v.name == name))
+        })
     }
 
     fn enum_constant(&self, info: &TypeInfo, variant: &str) -> String {

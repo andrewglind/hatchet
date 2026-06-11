@@ -317,8 +317,14 @@ impl<'a> HeaderGen<'a> {
                 continue;
             }
             let sig = self.method_signature(m, false);
-            let virt = if m.modifiers.is_override
-                || self.prog.method_overrides_base(c, self.mi, name)
+            // Haxe methods are virtual by default. Emit `virtual` when this method
+            // either overrides a base (the derived side) or is itself overridden by
+            // a subclass (the base side) — otherwise a call through a base pointer
+            // would static-bind. Static methods are never virtual.
+            let virt = if !m.modifiers.is_static
+                && (m.modifiers.is_override
+                    || self.prog.method_overrides_base(c, self.mi, name)
+                    || self.prog.method_overridden_in_subclass(c, self.mi, name))
             {
                 "virtual "
             } else {

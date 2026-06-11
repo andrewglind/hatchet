@@ -3,11 +3,8 @@
 **Hatchet** is a transpiler from [Haxe](https://haxe.org) 4.x to **C++98** — portable source that
 compiles under **Visual C++ 6.0**, and therefore targets legacy platforms such as **Windows 9x** and
 older Unix toolchains. It is a *transpiler*, not a compiler: it emits C++ source you then build on the
-target, and it never produces a custom C++ runtime — every Haxe construct maps to an equivalent,
-hand-writable C++ idiom.
-
-The name is a play on Haxe — a *hatchet* is a small axe (Hatchet implements a focused subset of
-Haxe 4.x) — and on "hatch it": develop on a modern machine, then hatch your ideas onto legacy targets.
+target, and it never produces a custom C++ runtime. Supported Haxe constructs map to an equivalent,
+hand-writable C++ idiom. Hatchet implements a focused subset of Haxe 4.x; it is **not** a drop-in for hxcpp.
 
 ## Motivation
 
@@ -18,13 +15,13 @@ C++98, then copy the generated `.h`/`.cpp` to the target and build them with the
 
 ## Status
 
-Hatchet is a working transpiler with a real lexer, recursive-descent parser, typed AST, semantic
-model, and C++ code generator. It supersedes an earlier regex-driven Python prototype.
+Hatchet is a working transpiler with a real lexer, recursive-descent parser, typed AST, semantic model, and C++ code generator.
 
-It is validated against a real Haxe game engine corpus (see *Validation*): **every generated `.cpp`
-in the corpus (24 of 24) compiles under `g++ -std=c++98`**, and the header goldens that have a
-byte-for-byte reference (`Module.h`, `IModule.h`) match exactly. The whole-corpus compile gate runs
-as a `cargo test`.
+A bundled [standalone example](examples/shapes) is transpiled, compiled under `g++ -std=c++98`, run,
+and output-checked by the test suite (see *Validation*), and the generated output has been **built
+with Visual C++ 6.0 and run on Windows 98** — the primary target — closing the loop from Haxe source
+to a running legacy binary. Hatchet has additionally been validated against a larger real Haxe game
+engine (the author's private offline corpus).
 
 Supported today, end to end:
 
@@ -89,49 +86,53 @@ the `StdAfx.h` prelude**, so a standalone project compiles with no boilerplate.
 
 ## Requirements
 
-- **Rust** (stable; install via [rustup](https://rustup.rs)). On Windows this links via the MSVC
-  linker from a Visual Studio / Build Tools install. **Build from PowerShell, cmd, or a VS developer
-  prompt** — not Git Bash, whose `/usr/bin/link.exe` shadows the MSVC linker.
+- **Rust** (stable; install via [rustup](https://rustup.rs))
 - A **C++98 toolchain** to build the generated output. The development validation gate uses
-  `g++ -std=c++98`; the production target is Visual C++ 6.0.
+  `g++ -std=c++98`; the production target is Visual C++ 6.0 up.
 
 ## Building
 
 ```powershell
 cargo build            # debug binary at target/debug/hatchet
 cargo build --release  # optimized binary at target/release/hatchet
-cargo test             # unit tests + corpus lex/parse + goldens + the C++98 compile gate
+cargo test             # unit tests, header/body codegen checks, and the bundled-example compile+run gate
 ```
 
 ## Usage
 
 ```bash
-# Transpile a whole project — pass the files (a shell glob), not a directory. The C++
-# namespace of each file follows its Haxe `package`, and the project root is inferred
-# from that package.
-hatchet --src modules/*.hx mucus/*.hx --out path/to/output --force
+# Transpile a whole project — point --src at its root directory; Hatchet crawls it
+# recursively for .hx. The C++ namespace of each file follows its Haxe `package`, and
+# the project root is inferred from that package.
+hatchet --src path/to/project --out path/to/output --force
+
+# A glob works too (expanded by Hatchet itself, so quote it on shells that would
+# otherwise expand it). Mix files, dirs, and globs freely:
+hatchet --src modules/*.hx mucus/Mucus.hx --out path/to/output --force
 
 # Transpile a single file — pass its dependencies too (superclasses, native stubs),
-# since the listed files are the entire resolution scope:
+# since the listed sources are the entire resolution scope:
 hatchet --src game/Scene.hx modules/Module.hx mucus/Mucus.hx --out out
 
 # Preview on stdout, or validate without writing anything:
 hatchet --src game/Scene.hx modules/Module.hx mucus/Mucus.hx --stdout
-hatchet --src modules/*.hx mucus/*.hx --dry-run
+hatchet --src . --dry-run
 
-# Run interactively (prompts for files and a target dir) when --src is omitted:
+# Run interactively (prompts for a source and a target dir) when --src is omitted:
 hatchet
 ```
 
-`--src` accepts **one or more `.hx` files** — Hatchet does not crawl directories (passing a directory
-is an error). The listed files are also the **entire resolution scope**, so a file's dependencies
-(superclasses, native `@:native` stubs) must be in the list too; to transpile a whole project, glob
-it. Each file's **project root** — the base for the output layout and relative includes — is inferred
-from its `package` declaration (the file's directory minus its package path).
+`--src` accepts any mix of **single `.hx` files, directories (crawled recursively for `.hx`), and
+globs** (`*`, `?`, `**` — e.g. `modules/*.hx` or `src/**/*.hx`). Globs are expanded by Hatchet itself,
+so quoting them to bypass shell expansion works. The full expanded set is also the **entire resolution
+scope**, so a file's dependencies (superclasses, native `@:native` stubs) must be reachable in it —
+crawl the project root to pull everything in. Each file's **project root** — the base for the output
+layout and relative includes — is inferred from its `package` declaration (the file's directory minus
+its package path).
 
 | Flag | Description |
 |------|-------------|
-| `--src, -s <FILE>...` | Haxe `.hx` file(s) to transpile — one or many, e.g. a shell glob (prompted if omitted). Not a directory. Also the full resolution scope |
+| `--src, -s <PATH>...` | Haxe sources to transpile — any mix of `.hx` files, directories (crawled recursively), and globs (`*`/`?`/`**`); prompted if omitted. Also the full resolution scope |
 | `--out, -o <DIR>` | Output directory (defaults to the inferred project root; ignored with `--dry-run`/`--stdout`). Generated files mirror the source package layout; includes that point at external dependencies (a native engine, a sibling project) are re-pointed at the dependency's real location when needed, so `--out` resolves from any directory |
 | `--force` | Overwrite existing generated files (ignored with `--dry-run`) |
 | `--dry-run` | Transpile and report info/warnings/errors only — write nothing. Takes precedence over `--stdout`/`-o`/`--force` |
@@ -141,7 +142,7 @@ from its `package` declaration (the file's directory minus its package path).
 | `--depth <N>` | Max expression-nesting depth at which a buried `Null<T>` call is auto-extracted into a freed local instead of warned about (default `1`; e.g. `2` auto-extracts `if (GetEdge(e) == null)`) |
 | `--no-traces` | Strip all `trace(...)` calls from the generated C++ (lowered to no-ops, arguments not evaluated), mirroring hxcpp's `-D no-traces` |
 
-A `Main.hx` is never transpiled, it is treated as the hxcpp entry point only
+A `Main.hx` is never transpiled — it is treated as the hxcpp entry point only.
 
 ## Architecture
 
@@ -193,7 +194,7 @@ error rather than a guess.
 
 ## Standalone projects and the prelude
 
-Hatchet transpiles a **standalone** project — pure `@:expose` Haxe with no `@:native` API stub —
+Hatchet transpiles a **standalone** project — plain Haxe with no `@:native` API stub —
 with no special setup: cross-file types resolve, a type used without an explicit `import` (legal for
 same-package Haxe) still has its header pulled in, and the **standard-library prelude is generated
 automatically**. Hatchet owns that prelude — it knows which headers its supported idioms need
@@ -210,25 +211,23 @@ project header stays relative and quoted.
 
 ## Validation
 
-Hatchet is validated against the **MucusEngine** project — a real Haxe game engine whose committed
-C++ output (the `.h`/`.cpp` files beside each `.hx`) has been compiled on Visual C++ 6.0 and serves
-as the golden reference. The corpus is split into three sibling repositories — `MucusEngine` (the
-native C++ engine), `Modules` (engine modules in Haxe), and `Game` (game scenes in Haxe) — which
-live outside this repository. Tests locate them via environment variables, falling back to siblings
-of this crate, and skip when absent.
+The test suite is self-contained — it needs nothing outside this repository. Alongside the unit
+tests and the header/body codegen checks (which build small synthetic programs in a temp directory),
+the **bundled-example compile gate** (`tests/example_compile.rs`) transpiles the standalone
+[`examples/shapes`](examples/shapes) project, compiles the generated C++ together with its
+hand-written `main.cpp` under `g++ -std=c++98 -pedantic -Wall`, runs it, and checks the output — so
+it validates not just that the code compiles but that it *behaves* (virtual dispatch through owned
+base pointers, the enum `switch`, ownership cleanup). It locates a compiler via `HATCHET_GXX`, else
+`g++` on `PATH`, else a default MSYS2 install, and skips only if none is found.
 
 ```bash
-# Point the test harness at the corpus explicitly if needed:
-HATCHET_CORPUS=/path/to/Modules \
-HATCHET_GAME_CORPUS=/path/to/Game \
-HATCHET_ENGINE=/path/to/MucusEngine \
-cargo test
+cargo test                 # whole suite; the compile gate is skipped if no C++ compiler is present
+HATCHET_GXX=/path/to/g++ cargo test   # point it at a specific compiler
 ```
 
-The whole-corpus **compile gate** (`tests/compile_gate.rs`) transpiles both Haxe repos into a
-temporary mirror and compiles every generated `.cpp` with `g++ -std=c++98 -fsyntax-only`; it locates
-a compiler via `HATCHET_GXX`, else `g++` on `PATH`, else a default MSYS2 install, and skips if none
-is found.
+Hatchet was also developed against a larger private Haxe game-engine corpus whose output is built
+on real Visual C++ 6.0 / Windows 98 hardware; that corpus is the author's offline validation harness
+and is not part of the shipped test suite.
 
 ### The native boundary contract
 
@@ -242,4 +241,4 @@ backstop that enforces agreement with the native side.
 
 ## License
 
-MIT.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE.md) file for details.

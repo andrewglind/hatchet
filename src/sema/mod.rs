@@ -248,7 +248,7 @@ impl Program {
             }
         }
         // Bare name: pick the best candidate. A local declaration always wins;
-        // otherwise a generated (`@:expose`, non-native) type beats a native
+        // otherwise a generated (transpiled, non-native) type beats a native
         // shadow of the same name (the `mucus.modules.api` re-export declares
         // native aliases of the real `modules` classes, and references from
         // other packages should resolve to the real ones). Tie-break by scope:
@@ -359,6 +359,59 @@ impl Program {
             if decl_has_method(decl, name) {
                 return true;
             }
+            frontier.extend(decl_bases(decl));
+        }
+        false
+    }
+
+    /// Whether some subclass of `class` declares (overrides) the method `name`.
+    /// Haxe methods are virtual by default, but C++ only dispatches through a base
+    /// pointer when the *base* declaration is `virtual`. So a base method that any
+    /// descendant overrides must itself be emitted `virtual`, or calls through a
+    /// base pointer would statically bind to the base version.
+    pub fn method_overridden_in_subclass(&self, class: &Class, ctx_module: usize, name: &str) -> bool {
+        let Some(base_ti) = self.resolve_type(std::slice::from_ref(&class.name), ctx_module) else {
+            return false;
+        };
+        let target = (base_ti.package.clone(), base_ti.name.clone());
+        for (mj, m) in self.modules.iter().enumerate() {
+            for d in &m.file.decls {
+                if let Decl::Class(dc) = d {
+                    if decl_has_method(d, name) && self.class_has_ancestor(dc, mj, &target) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether `class` (declared in module `ctx_module`) has the `(package, name)`
+    /// type `target` somewhere up its `extends`/`implements` chain.
+    fn class_has_ancestor(
+        &self,
+        class: &Class,
+        ctx_module: usize,
+        target: &(Vec<String>, String),
+    ) -> bool {
+        let mut frontier: Vec<Type> = class
+            .extends
+            .iter()
+            .cloned()
+            .chain(class.implements.iter().cloned())
+            .collect();
+        let mut seen: BTreeSet<(Vec<String>, String)> = BTreeSet::new();
+        while let Some(base) = frontier.pop() {
+            let Type::Named { path, .. } = &base else { continue };
+            let Some(ti) = self.resolve_type(path, ctx_module) else { continue };
+            let key = (ti.package.clone(), ti.name.clone());
+            if &key == target {
+                return true;
+            }
+            if !seen.insert(key) {
+                continue;
+            }
+            let Some(decl) = self.type_decl(ti) else { continue };
             frontier.extend(decl_bases(decl));
         }
         false
@@ -678,11 +731,11 @@ mod tests {
             "package modules;\n\
              import mucus.api.Mucus;\n\
              import modules.Module;\n\
-             @:expose class Vertex extends Module {}",
+             class Vertex extends Module {}",
         );
         let module = (
             "/src/modules/Module.hx",
-            "package modules; @:expose class Module {}",
+            "package modules; class Module {}",
         );
         let p = prog(&[mucus, vertex, module]);
         let vidx = p.modules.iter().position(|m| m.path.ends_with("Vertex.hx")).unwrap();
@@ -709,13 +762,13 @@ mod tests {
              @:native interface IEngine {}",
         );
         let stdafx = ("/src/modules/StdAfx.hx", "package modules;");
-        let module = ("/src/modules/Module.hx", "package modules; @:expose class Module {}");
+        let module = ("/src/modules/Module.hx", "package modules; class Module {}");
         let vertex = (
             "/src/modules/Vertex.hx",
             "package modules;\n\
              import mucus.api.Mucus;\n\
              import modules.Module;\n\
-             @:expose class Vertex extends Module {}",
+             class Vertex extends Module {}",
         );
         let p = prog(&[mucus, stdafx, module, vertex]);
         let vidx = p.modules.iter().position(|m| m.path.ends_with("Vertex.hx")).unwrap();
@@ -730,10 +783,10 @@ mod tests {
         // A standalone, import-free project: B uses A (same package) with no
         // `import`. The header must pull in A.h (driven by the reference). StdAfx.h
         // is always present (Hatchet generates one for every output directory).
-        let a = ("/src/A.hx", "@:expose class A { public function new() {} }");
+        let a = ("/src/A.hx", "class A { public function new() {} }");
         let b = (
             "/src/B.hx",
-            "@:expose class B { var a:A; public function new() { this.a = new A(); } }",
+            "class B { var a:A; public function new() { this.a = new A(); } }",
         );
         let p = prog(&[a, b]);
         let bidx = p.modules.iter().position(|m| m.path.ends_with("B.hx")).unwrap();
@@ -743,11 +796,11 @@ mod tests {
 
     #[test]
     fn at_include_works_on_any_file_and_keeps_system_headers() {
-        // `@:include` is not exclusive to @:native API stubs: a pure @:expose
+        // `@:include` is not exclusive to @:native API stubs: a plain transpiled
         // class can pull in C/C++ headers, and a system header keeps its `<...>`.
         let w = (
             "/src/W.hx",
-            "@:include(\"<string>\")\n@:expose class W { public function new() {} }",
+            "@:include(\"<string>\")\nclass W { public function new() {} }",
         );
         let p = prog(&[w]);
         let idx = p.modules.iter().position(|m| m.path.ends_with("W.hx")).unwrap();

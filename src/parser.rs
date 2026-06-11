@@ -1937,7 +1937,7 @@ mod tests {
     fn parses_class_with_accessors_and_ctor() {
         let f = file(
             "package modules;\n\
-             @:expose class Vertex extends Module {\n\
+             class Vertex extends Module {\n\
                public var x(default, set):Float;\n\
                public function new(engine:IEngine, x:Float) { this.x = x; }\n\
                public function set_x(x:Float) { return this.x = x; }\n\
@@ -1945,7 +1945,6 @@ mod tests {
         );
         let Decl::Class(c) = &f.decls[0] else { panic!() };
         assert_eq!(c.name, "Vertex");
-        assert!(has_meta(&c.meta, "expose"));
         assert_eq!(c.extends.as_ref().unwrap().base_name(), Some("Module"));
         assert_eq!(c.fields[0].name, "x");
         assert_eq!(c.fields[0].set, PropAccess::Set);

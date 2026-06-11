@@ -2,8 +2,8 @@
 //!
 //! The tree models the Haxe subset Hatchet supports, independent of any particular
 //! project. Metadata is attached to the construct it decorates; semantic meaning
-//! (e.g. `@:expose`, `@:native`, `@:include`) is interpreted later in the `sema`
-//! layer, not here.
+//! (e.g. `@:native`, `@:include`) is interpreted later in the `sema` layer, not
+//! here.
 
 // ---------------------------------------------------------------------------
 // Metadata

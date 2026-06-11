@@ -1,9 +1,9 @@
 //! Command-line interface and top-level driver.
 //!
-//! Hatchet transpiles an explicit set of `.hx` *files* — it does not crawl
-//! directories to decide what to transpile (the build system or shell supplies the
-//! list). The files passed are also the entire resolution scope, so a file's
-//! dependencies (superclasses, native `@:native` stubs) must be in the list too.
+//! `--src` accepts any mix of single `.hx` files, glob patterns (`modules/*.hx`,
+//! `src/**/*.hx`), and directories (crawled recursively for `.hx`). The resulting
+//! set of files is also the entire resolution scope, so a file's dependencies
+//! (superclasses, native `@:native` stubs) must be reachable in that set too.
 //!
 //! There is no `--root` flag and no namespace flag: a file's project root (used for
 //! the output layout and relative includes) is inferred from its `package`
@@ -26,13 +26,15 @@ use crate::{codegen, diag, discover, parser, sema, stdafx};
     about = "Transpile Haxe 4.x to C++98 / Visual C++ 6.0 compatible code"
 )]
 pub struct Args {
-    /// Haxe `.hx` file(s) to transpile (prompted if omitted). Accepts one or many
-    /// — e.g. `--src A.hx B.hx` or a shell glob `--src modules/*.hx mucus/*.hx`.
-    /// Directories are rejected: Hatchet does not crawl. The listed files are also
-    /// the whole resolution scope, so a file's dependencies (superclasses, native
-    /// `@:native` stubs) must be listed too. Each file's project root is inferred
-    /// from its `package` declaration.
-    #[arg(short, long, value_name = "FILE", num_args = 1..)]
+    /// Haxe `.hx` source(s) to transpile (prompted if omitted). Each entry may be
+    /// a single file, a directory (crawled recursively for `.hx`), or a glob
+    /// (`*`/`?`/`**`, e.g. `modules/*.hx` or `src/**/*.hx`) — and you may pass
+    /// several, e.g. `--src modules mucus/Mucus.hx`. Globs are expanded by Hatchet
+    /// itself, so quoting them to bypass shell expansion works too. The full
+    /// expanded set is also the whole resolution scope, so a file's dependencies
+    /// (superclasses, native `@:native` stubs) must be reachable in it. Each
+    /// file's project root is inferred from its `package` declaration.
+    #[arg(short, long, value_name = "PATH", num_args = 1..)]
     pub src: Vec<PathBuf>,
 
     /// Output directory for generated .h/.cpp (defaults to the inferred project
@@ -137,9 +139,9 @@ impl Config {
 fn run(args: Args) -> Result<(), String> {
     let cfg = resolve_config(args)?;
 
-    // The resolution scope is exactly the files passed — Hatchet does not crawl. A
-    // file's dependencies (superclasses, native stubs) must therefore be in the
-    // list, or its references will not resolve.
+    // The resolution scope is exactly the expanded file set (files + crawled
+    // directories + globs). A file's dependencies (superclasses, native stubs)
+    // must therefore be reachable in that set, or its references will not resolve.
     cfg.info(&format!("Transpiling {} Haxe file(s).", cfg.files.len()));
 
     // Parse everything, keeping the raw source alongside (StdAfx needs it).
@@ -311,6 +313,40 @@ fn module_rel(m: &Module, ext: &str) -> String {
     }
 }
 
+/// Expand one `--src` entry into the concrete `.hx` files it denotes:
+/// - a glob (`*`/`?`/`**`) → its matching `.hx` files;
+/// - a directory → every `.hx` under it (recursively);
+/// - a plain file → itself (which must exist and be a `.hx`).
+///
+/// Globs and directories pre-filter to `.hx`; only a directly-named file is
+/// rejected for a wrong extension (a clear user mistake rather than a sweep).
+fn expand_input(arg: &Path) -> Result<Vec<PathBuf>, String> {
+    let s = arg.to_string_lossy();
+    if discover::is_glob(&s) {
+        let matches = discover::glob_hx(&s);
+        if matches.is_empty() {
+            return Err(format!("no .hx files match pattern: {s}"));
+        }
+        return Ok(matches);
+    }
+    let p = canonical(arg)?;
+    if p.is_dir() {
+        let files =
+            discover::find_haxe_files(&p).map_err(|e| format!("crawling {}: {e}", p.display()))?;
+        if files.is_empty() {
+            return Err(format!("no .hx files under directory: {}", p.display()));
+        }
+        return Ok(files);
+    }
+    if !p.is_file() {
+        return Err(format!("source not found: {}", p.display()));
+    }
+    if p.extension().and_then(|e| e.to_str()) != Some("hx") {
+        return Err(format!("not a Haxe (.hx) file: {}", p.display()));
+    }
+    Ok(vec![p])
+}
+
 /// Infer a file's project root: its directory with its `package` path stripped
 /// from the end. e.g. `<root>/modules/Vertex.hx` declaring `package modules;`
 /// → `<root>`. Falls back to the file's own directory when the layout does not
@@ -363,38 +399,33 @@ fn resolve_config(args: Args) -> Result<Config, String> {
         }
     };
 
-    // Gather the explicit file list (prompt for one when none was given). Hatchet
-    // transpiles exactly these files and resolves only against them — directories
-    // are rejected.
+    // Gather the inputs (prompt for one when none was given), then expand each
+    // entry — file, directory, or glob — into concrete `.hx` files. The expanded
+    // set is the whole resolution scope.
     let raw = if args.src.is_empty() {
-        vec![PathBuf::from(prompt("Enter a Haxe (.hx) file", Some("src/Game.hx")))]
+        vec![PathBuf::from(prompt(
+            "Enter a Haxe (.hx) file, directory, or glob",
+            Some("src"),
+        ))]
     } else {
         args.src.clone()
     };
 
     let mut files = Vec::new();
-    for p in raw {
-        let p = canonical(&p)?;
-        if p.is_dir() {
-            return Err(format!(
-                "{} is a directory — Hatchet transpiles explicit files, not directories \
-                 (pass the files, e.g. a shell glob `modules/*.hx mucus/*.hx`)",
-                p.display()
-            ));
+    let mut seen = std::collections::BTreeSet::new();
+    for arg in raw {
+        for p in expand_input(&arg)? {
+            let p = canonical(&p)?;
+            // Main.hx is the hxcpp entry point and is never transpiled; a crawl or
+            // glob may sweep it in, so drop it rather than erroring.
+            if discover::is_main(&p) {
+                info(&format!("Skipping {} (Main.hx is never transpiled).", p.display()));
+                continue;
+            }
+            if seen.insert(p.clone()) {
+                files.push(p);
+            }
         }
-        if !p.is_file() {
-            return Err(format!("source not found: {}", p.display()));
-        }
-        if p.extension().and_then(|e| e.to_str()) != Some("hx") {
-            return Err(format!("not a Haxe (.hx) file: {}", p.display()));
-        }
-        // Main.hx is the hxcpp entry point and is never transpiled; a glob may have
-        // swept it in, so drop it from the set rather than erroring.
-        if discover::is_main(&p) {
-            info(&format!("Skipping {} (Main.hx is never transpiled).", p.display()));
-            continue;
-        }
-        files.push(p);
     }
     if files.is_empty() {
         return Err("no transpilable .hx files given".to_string());

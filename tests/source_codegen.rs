@@ -1,42 +1,10 @@
-//! Milestone-5 checks: the core `.cpp` body transpilations against the corpus —
-//! `super(...)` → init list, `this->`, inherited-field pointer access, anonymous
-//! struct → named temp (with pointer deref), and external accessor rewrites.
-//! Skipped when the corpus is absent.
-
-use std::path::PathBuf;
+//! Body (`.cpp`) transpilation checks against small self-contained programs
+//! built in a temp directory (no external corpus required): `super(...)` → init
+//! list, `this->`, anonymous struct → named temp, ownership, the Std/Math/String
+//! intrinsics, and the sugar lowerings.
 
 use hatchet::codegen::{generate_source, generate_source_diagnostics};
 use hatchet::sema::Program;
-
-/// A sibling corpus repo: `$env` if set, else `../<name>` next to this crate.
-fn repo_root(env: &str, name: &str) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var(env) {
-        let p = PathBuf::from(p);
-        return p.is_dir().then_some(p);
-    }
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let sibling = manifest.parent()?.join(name);
-    sibling.is_dir().then_some(sibling)
-}
-
-/// The `Modules` corpus (`modules/*.hx` + `mucus/Mucus.hx`).
-fn modules_root() -> Option<PathBuf> {
-    repo_root("HATCHET_CORPUS", "Modules")
-}
-
-/// The `Game` corpus (`game/*.hx` + native binding stubs).
-fn game_root() -> Option<PathBuf> {
-    repo_root("HATCHET_GAME_CORPUS", "Game")
-}
-
-fn source(prog: &Program, stem: &str) -> String {
-    let idx = prog
-        .modules
-        .iter()
-        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some(stem))
-        .unwrap_or_else(|| panic!("module {stem} not found"));
-    generate_source(prog, idx).unwrap_or_else(|| panic!("no source for {stem}"))
-}
 
 /// Transpile a single synthetic `.hx` source and return class `stem`'s generated `.cpp`.
 fn gen_one(src: &str, stem: &str) -> String {
@@ -55,299 +23,11 @@ fn gen_one(src: &str, stem: &str) -> String {
 }
 
 #[test]
-fn body_transpilation_core() {
-    let Some(root) = modules_root() else {
-        eprintln!("skipping: Modules corpus not found (set HATCHET_CORPUS)");
-        return;
-    };
-    let prog = Program::from_src_dir(&root).expect("build program");
-
-    let vertex = source(&prog, "Vertex");
-    // super(engine) becomes a base initialiser list
-    assert!(vertex.contains(": Module(engine)"), "super → init list");
-    // this. → this->
-    assert!(vertex.contains("this->x = x;"));
-    // anonymous struct return → named temp of the native return type, with
-    // value-typed struct fields copied directly.
-    assert!(vertex.contains("mucus::Vertex _ret"));
-    assert!(vertex.contains(".effects = this->effects;"), "value struct field copy");
-    // inherited pointer field accessed with -> and chained calls
-    assert!(vertex.contains("this->engine->GetRenderer()->PushVertex(vertex());"));
-
-    // Anonymous struct passed as an argument is hoisted to a typed temporary.
-    let line = source(&prog, "Line");
-    assert!(line.contains("mucus::Line _anon1;"), "anon arg hoisted to native type");
-    assert!(line.contains("PushLine(_anon1)"));
-
-    // External property access uses generated getters/setters.
-    let quad = source(&prog, "Quad");
-    assert!(quad.contains("->SetX("), "external (default,set) write → SetX");
-    assert!(quad.contains("->GetX()"), "external (default,set) read → GetX");
-    // Enum value access is namespace + `_::` qualified.
-    assert!(quad.contains("mucus::EffectType_::"), "enum constant qualified");
-}
-
-#[test]
-fn statement_and_expression_forms() {
-    let (Some(mroot), Some(groot)) = (modules_root(), game_root()) else {
-        eprintln!("skipping: Modules/Game corpora not found (set HATCHET_CORPUS / HATCHET_GAME_CORPUS)");
-        return;
-    };
-    let prog = Program::from_src_dir(&mroot).expect("build Modules program");
-    let game = Program::from_src_dir(&groot).expect("build Game program");
-
-    // `new Array<T>()` → value-constructed container; `?.` method → guarded call.
-    let backdrop = source(&prog, "Backdrop");
-    assert!(
-        backdrop.contains("std::vector<std::vector<Tile*> >()"),
-        "new Array<Array<Tile>>() → value container"
-    );
-    assert!(
-        backdrop.contains("!= NULL ? (") && backdrop.contains("->AddLighting"),
-        "safe-navigation method call is NULL-guarded"
-    );
-
-    // Untyped object literal → local anonymous struct.
-    let camera = source(&prog, "Camera");
-    assert!(camera.contains("struct { int x; int y; }"), "untyped object → anon struct");
-
-    // Non-empty array literal (here as a return) → vector + push_backs;
-    // `Math.POSITIVE_INFINITY` → a portable large float.
-    let graph = source(&prog, "Graph");
-    assert!(graph.contains(".push_back(startIndex);"), "array literal → push_back");
-    assert!(graph.contains("HUGE_VAL"), "Math.POSITIVE_INFINITY intrinsic");
-
-    // Map `.get(k)` → an iterator alias: `find(k)`, a null check on the result is
-    // the existence check (`it == map.end()`), and value/member use is `it->second`.
-    let animation = source(&prog, "Animation");
-    assert!(
-        animation.contains("std::map<std::string, AnimationSequence>::iterator")
-            && animation.contains(".sequences.find(name)"),
-        "Map.get → iterator via find():\n{animation}"
-    );
-    assert!(
-        animation.contains("== this->animationData.sequences.end()"),
-        "null check on a Map.get result → iterator existence check:\n{animation}"
-    );
-    assert!(animation.contains("->second.frames"), "member use of the get result → it->second:\n{animation}");
-    assert!(!animation.contains(".sequences[name]"), "Map.get must not lower to operator[]:\n{animation}");
-
-    // String interpolation → sprintf into a stack buffer.
-    let tile = source(&prog, "Tile");
-    assert!(tile.contains("sprintf("), "string interpolation → sprintf");
-
-    // Array comprehension → hoisted vector populated by a loop.
-    let text = source(&prog, "Text");
-    assert!(
-        text.contains("std::vector<mucus::Quad > _compr"),
-        "array comprehension → hoisted vector"
-    );
-
-    // Base-from-member idiom: the Holder ctor runs the pre-super logic and stores
-    // the hoisted `new` arguments; the class ctor chains through both bases.
-    let tile = source(&prog, "Tile");
-    assert!(tile.contains("TileHolder::TileHolder("), "Holder ctor defined");
-    assert!(tile.contains("this->_super1 = new Quad("), "hoisted super arg stored");
-    assert!(
-        tile.contains(": TileHolder(engine, tilesetId, x, y, textureName), TexturedQuad(engine, _super1, _super2)"),
-        "class ctor chains Holder then base"
-    );
-    // A local that would shadow a parameter is renamed.
-    assert!(tile.contains("textureName_2"), "shadowing local renamed");
-
-    // Nullable value types (`Null<T>`) lower to pointers: the return type is a
-    // pointer, a value result is heap-allocated, `null` becomes NULL, and
-    // comparisons use NULL.
-    let graph = source(&prog, "Graph");
-    assert!(graph.contains("Edge* Graph::GetEdge("), "Null<Edge> return → Edge*");
-    assert!(graph.contains("return new Edge("), "value result heap-allocated");
-    assert!(graph.contains("== NULL"), "`== null` → `== NULL` on the pointer");
-    assert!(graph.contains("std::vector<int>* Graph::FindPath("), "Null<Array<Int>> → vector*");
-    // An aliased import (`Distance as Heuristic`) is called by its real name.
-    assert!(graph.contains("Distance(this->nodes["), "import alias resolved to real name");
-
-    // Top-level `final NAME = function/lambda` → namespace free functions
-    // (public defined plainly, file-local ones `static`).
-    let utilities = source(&prog, "Utilities");
-    assert!(utilities.contains("float Distance(const Vector& a, const Vector& b) {"), "public free fn");
-    assert!(utilities.contains("static float CrossProduct("), "private free fn is static");
-    // Conditional compilation: `#if DREAMCAST`/`#else`/`#end` lower to `#ifdef`/
-    // `#else`/`#endif` at column 0; a statement-level `@:include` emits `#include`
-    // inside the block; `untyped` passes its operand (`fsqrtf`) through verbatim;
-    // the `#else` branch transpiles normally (`Math.sqrt` → `sqrt`).
-    assert!(utilities.contains("\n#ifdef DREAMCAST\n"), "#if → #ifdef at column 0");
-    assert!(utilities.contains("\n#else\n") && utilities.contains("\n#endif\n"), "#else/#end → #else/#endif");
-    assert!(utilities.contains("#include <dc/fmath.h>"), "stmt @:include → #include");
-    assert!(utilities.contains("return fsqrtf(dx * dx + dy * dy);"), "untyped operand verbatim");
-    assert!(utilities.contains("return sqrt(dx * dx + dy * dy);"), "#else branch is transpiled");
-
-    // SceneFactory (game): `extern inline function` → an `extern "C"` export
-    // DEFINED at global scope (no namespace), body fully qualified, `null` → `NULL`.
-    let factory = source(&game, "SceneFactory");
-    assert!(
-        factory.contains("HATCHET_EXPORT mucus::IScene* HATCHET_CALL MCreateScene(mucus::IEngine* engine, int sceneId) {"),
-        "extern \"C\" definition at global scope:\n{factory}"
-    );
-    assert!(factory.contains("new game::AlienBeach(engine)"), "body types fully qualified:\n{factory}");
-    assert!(!factory.contains("namespace game"), "definition is not wrapped in a namespace:\n{factory}");
-
-    // A value argument passed to a `Null<T>` parameter is heap-allocated so the
-    // callee can own it (FogEffect takes `Null<FogEffectData>`). (game)
-    let alien = source(&game, "AlienBeach");
-    assert!(
-        alien.contains("new modules::FogEffect(engine, new mucus::FogEffectData(fogEffectData))"),
-        "value arg to Null<T> param → heap-allocated"
-    );
-
-    // Method-scope ownership: a scope-local `new` (`line`) is freed at scope close,
-    // and a `new` argument the constructed object owns (Line `@owned`s its vertices)
-    // stays inline — freed transitively by `delete line`, never hoisted into a
-    // separate scope-owned local that would double-free it. A nullable result
-    // (`path`) is still freed.
-    let actor = source(&prog, "Actor");
-    assert!(
-        actor.contains("new Line(this->engine, new Vertex("),
-        "vertices into Line's @owned params stay inline:\n{actor}"
-    );
-    assert!(actor.contains("delete line;"), "the scope-local Line is freed at scope close");
-    assert!(
-        !actor.contains("delete _v"),
-        "owned vertices must not be separately scope-deleted (double-free):\n{actor}"
-    );
-    assert!(actor.contains("delete path;"), "nullable result freed at scope close");
-
-    // A `new` forwarded into a base initialiser list stays inline (the base owns
-    // it) — it is never hoisted into the constructor body or scope-deleted.
-    let sprite = source(&prog, "Sprite");
-    assert!(
-        sprite.contains(": TexturedQuad(engine, new Quad(engine, new Vertex("),
-        "super-call `new` args stay inline in the initialiser list"
-    );
-    assert!(!sprite.contains("delete _v"), "base-owned args are not scope-deleted");
-
-    // Owned pointer fields are NULL-initialised in the constructor and the prior
-    // value is freed before reassignment (delete-before-overwrite).
-    let dialog = source(&prog, "DialogBox");
-    assert!(dialog.contains(": Module(engine), text(NULL)"), "owned field NULL-initialised");
-    assert!(
-        dialog.contains("delete this->text;\n\tthis->text = new ShadowText("),
-        "delete-before-overwrite on field reassignment"
-    );
-
-    // Walkbox: `Array.map(lambda)` → a hoisted vector filled by a loop (the
-    // Map-comprehension + Lambda composition).
-    let walkbox = source(&prog, "Walkbox");
-    // Case 1: object-literal body expands into the element struct via the
-    // contextual (assignment-target) element type, not an anonymous struct.
-    assert!(
-        walkbox.contains("std::vector<Vector > _map")
-            && walkbox.contains("for (size_t")
-            && walkbox.contains(".push_back("),
-        "map → hoisted vector + loop + push_back:\n{walkbox}"
-    );
-    assert!(
-        walkbox.contains("Vector v = this->polygon.vertices[")
-            && walkbox.contains(".x = (v.x * scaleFactor);"),
-        "map lambda body (object literal) expanded into the element struct:\n{walkbox}"
-    );
-    // Case 2: the receiver is a `Null<Array<Int>>` pointer — iterate the pointee.
-    assert!(
-        walkbox.contains("for (size_t _i") && walkbox.contains("< (*indices).size();"),
-        "map over a nullable container dereferences the pointer:\n{walkbox}"
-    );
-    // The nullable container's `.length` also dereferences (no `.size()` on a ptr).
-    assert!(
-        walkbox.contains("(*indices).size() > 0"),
-        ".length on a Null<Array<T>> dereferences:\n{walkbox}"
-    );
-}
-
-#[test]
-fn corpus_nullable_warnings_are_only_the_known_buried_calls() {
-    // The corpus is free of nullable *misuse* (a `Null<T>` value flowing into a
-    // non-`Null<T>` `var`/assignment) and of discarded nullable results (those are
-    // auto-extracted). The only remaining warnings are two *buried* nullable
-    // calls in `Graph.AddEdge` — `if (GetEdge(edge) == null)` / `if (GetEdge(test)
-    // == null)` — where the heap `Edge` the call returns has nowhere to be freed.
-    // They are flagged, not auto-fixed: the fix belongs in the Haxe (extract the
-    // call to a `Null<Edge>` local). This test pins that known set so a new buried
-    // nullable elsewhere is caught as a regression.
-    let (Some(mroot), Some(groot)) = (modules_root(), game_root()) else {
-        eprintln!("skipping: Modules/Game corpora not found (set HATCHET_CORPUS / HATCHET_GAME_CORPUS)");
-        return;
-    };
-    // Sweep both standalone repos: the whole corpus must be free of nullable misuse
-    // bar the two known buried calls in `Modules`' Graph.AddEdge.
-    let mut all = Vec::new();
-    for root in [&mroot, &groot] {
-        let prog = Program::from_src_dir(root).expect("build program");
-        for i in 0..prog.modules.len() {
-            if let Some((_, w, _)) = generate_source_diagnostics(&prog, i, 1, false) {
-                all.extend(w);
-            }
-        }
-    }
-    // Every warning is a buried-nullable one from Graph.AddEdge at lines 34 / 39.
-    let buried = "used inside a larger expression";
-    assert!(
-        all.iter().all(|(line, w)| {
-            w.starts_with("AddEdge:") && w.contains(buried) && (*line == 34 || *line == 39)
-        }),
-        "unexpected nullable warnings (only the two known Graph.AddEdge buried calls are allowed): {all:?}"
-    );
-    assert_eq!(all.len(), 2, "expected exactly the two known buried calls, got: {all:?}");
-}
-
-#[test]
-fn depth_two_auto_extracts_the_graph_buried_calls() {
-    // With `--depth 2`, the two depth-2 buried `GetEdge(...)` calls in
-    // `Graph.AddEdge` (the `if (GetEdge(e) == null)` checks) are no longer warned
-    // about: each is hoisted into an owned `Edge*` local that is freed at scope
-    // close, so the warning set is empty and the locals appear in the output.
-    let Some(root) = modules_root() else {
-        eprintln!("skipping: Modules corpus not found (set HATCHET_CORPUS)");
-        return;
-    };
-    let prog = Program::from_src_dir(&root).expect("build program");
-    let idx = prog
-        .modules
-        .iter()
-        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Graph"))
-        .unwrap();
-    let (source, warnings, _) = generate_source_diagnostics(&prog, idx, 2, false).unwrap();
-    assert!(
-        warnings.is_empty(),
-        "depth 2 should auto-extract the buried Graph calls, leaving no warnings: {warnings:?}"
-    );
-    // Each buried `GetEdge(...)` is hoisted into an owned local that is freed at
-    // scope close — two of them, so two `= GetEdge(` hoists and two deletes.
-    // (Indices are not pinned: the `tmp` counter is shared across the class's
-    // methods.)
-    assert_eq!(
-        source.matches("= GetEdge(").count(),
-        2,
-        "both buried calls should be hoisted into locals, got:\n{source}"
-    );
-    assert_eq!(
-        source.matches("delete _null").count(),
-        2,
-        "both hoisted locals should be freed, got:\n{source}"
-    );
-    // The conditions now compare a hoisted local against NULL rather than calling
-    // GetEdge inline inside the `if`.
-    assert!(
-        source.contains("_null") && source.contains("== NULL"),
-        "hoisted locals should be compared against NULL, got:\n{source}"
-    );
-}
-
-#[test]
 fn nullable_misuse_is_warned() {
     // A nullable (`Null<T>`) result assigned to a non-`Null<T>` local must warn.
     let src = "\
 typedef Pt = { var x:Int; var y:Int; }
 
-@:expose
 class Probe {
   public function new() {}
   public function find():Null<Pt> { return null; }
@@ -367,10 +47,10 @@ class Probe {
         .unwrap();
     let (_, warnings, _) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-    // The misuse is the `var p:Pt = this.find();` on line 8 of `src`.
+    // The misuse is the `var p:Pt = this.find();` on line 7 of `src`.
     assert!(
-        warnings.iter().any(|(line, w)| *line == 8 && w.contains("Null<T>")),
-        "expected a nullable warning on line 8, got: {warnings:?}"
+        warnings.iter().any(|(line, w)| *line == 7 && w.contains("Null<T>")),
+        "expected a nullable warning on line 7, got: {warnings:?}"
     );
 }
 
@@ -382,7 +62,6 @@ fn discarded_nullable_call_is_extracted_to_a_local() {
     let src = "\
 typedef Pt = { var x:Int; var y:Int; }
 
-@:expose
 class Probe {
   public function new() {}
   public function find():Null<Pt> { return null; }
@@ -435,7 +114,6 @@ interface IProps {
   public function GetOr(k:String, d:Dynamic):Dynamic;
 }
 
-@:expose
 class C {
   var props:IProps;
   public function new() {}
@@ -479,7 +157,6 @@ private final ORIGIN:Coord = { u: 0.0, v: 0.0 };
 private final CORNER:Coord = { u: 16.0, v: 32.0 };
 private final TABLE:Array<Coord> = [ ORIGIN, CORNER ];
 
-@:expose
 class Atlas {
   public function new() {}
   public function At(i:Int):Coord { return TABLE[i]; }
@@ -520,7 +197,7 @@ fn array_pop_removes_and_returns_the_last_element() {
     // `Array.pop()` must both read the last element AND shrink the vector — a bare
     // `back()` (the prior lowering) never removed it.
     let out = gen_one(
-        "@:expose\nclass Q {\n  public var items(default, null):Array<Int>;\n  public function new() { this.items = []; }\n  public function take():Int { return this.items.pop(); }\n}\n",
+        "class Q {\n  public var items(default, null):Array<Int>;\n  public function new() { this.items = []; }\n  public function take():Int { return this.items.pop(); }\n}\n",
         "Q",
     );
     assert!(out.contains(".back()"), "reads the last element:\n{out}");
@@ -532,7 +209,7 @@ fn string_concat_with_int_operands() {
     // `x + "," + y` with Int operands is string concatenation, not `int + const char*`
     // pointer arithmetic. The ints are formatted and the chain is a `std::string`.
     let out = gen_one(
-        "@:expose\nclass S {\n  public function new() {}\n  public function label(x:Int, y:Int):String { return x + \",\" + y; }\n}\n",
+        "class S {\n  public function new() {}\n  public function label(x:Int, y:Int):String { return x + \",\" + y; }\n}\n",
         "S",
     );
     assert!(out.contains("sprintf("), "int operands are formatted to text:\n{out}");
@@ -546,7 +223,7 @@ fn cpp_qualified_fixed_width_uints_map_to_uint_aliases() {
     // by their last path segment — in params, return types, and Array elements — so a
     // project can use the idiomatic `cpp.*` types instead of a homegrown `UInt` shim.
     let out = gen_one(
-        "package demo;\n@:expose\nclass W {\n  public function new() {}\n  public function f(a:cpp.UInt8, b:cpp.UInt16, t:Array<cpp.UInt32>):cpp.UInt32 { return b; }\n}\n",
+        "package demo;\nclass W {\n  public function new() {}\n  public function f(a:cpp.UInt8, b:cpp.UInt16, t:Array<cpp.UInt32>):cpp.UInt32 { return b; }\n}\n",
         "W",
     );
     assert!(out.contains("uint8_t a"), "cpp.UInt8 param → uint8_t:\n{out}");
@@ -561,7 +238,7 @@ fn interpolation_builds_incrementally_without_a_guessed_buffer() {
     // can never overflow a fixed buffer; a numeric operand is formatted into a buffer
     // sized by its TYPE (not guessed from the value).
     let out = gen_one(
-        "@:expose\nclass G {\n  public function new() {}\n  public function f(s:String, n:Int):String { return 'a${s}b${n}c'; }\n}\n",
+        "class G {\n  public function new() {}\n  public function f(s:String, n:Int):String { return 'a${s}b${n}c'; }\n}\n",
         "G",
     );
     assert!(out.contains("std::string "), "builds a std::string accumulator:\n{out}");
@@ -570,6 +247,62 @@ fn interpolation_builds_incrementally_without_a_guessed_buffer() {
     assert!(!out.contains("[50]") && !out.contains("* 50"), "no guessed buffer size:\n{out}");
     // The numeric operand still gets a type-bounded buffer.
     assert!(out.contains("char ") && out.contains("sprintf(") && out.contains("[24]"), "int → type-bounded buffer:\n{out}");
+}
+
+#[test]
+fn range_loop_variables_are_unique_per_loop() {
+    // VC6 uses the pre-standard `for` scope: a `for (int i ...)` init variable
+    // leaks into the enclosing block, so reusing the same Haxe loop name across
+    // several range loops/comprehensions in one function would redeclare it
+    // (error C2374). Each generated `for`-init must get a distinct name even when
+    // the Haxe source reuses `i`.
+    let out = gen_one(
+        "\
+         class G {\n\
+         \tpublic function new() {}\n\
+         \tpublic function f(n:Int):Int {\n\
+         \t\tvar a:Array<Int> = [for (i in 0...n) -1];\n\
+         \t\tvar b:Array<Int> = [for (i in 0...n) 0];\n\
+         \t\tvar total:Int = 0;\n\
+         \t\tfor (i in 0...n) total += i;\n\
+         \t\tfor (i in 0...n) total += i;\n\
+         \t\treturn total + a.length + b.length;\n\
+         \t}\n\
+         }\n",
+        "G",
+    );
+    // No two `for`-inits may share a control-variable name. Collect every
+    // `for (int <name> = ` declaration and assert they are all distinct.
+    let mut names = Vec::new();
+    for piece in out.split("for (int ").skip(1) {
+        let name: String = piece.chars().take_while(|c| *c != ' ').collect();
+        names.push(name);
+    }
+    assert!(names.len() >= 4, "expected four range loops, found {}:\n{out}", names.len());
+    let mut sorted = names.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), names.len(), "range loop control variables must be unique: {names:?}\n{out}");
+    // And the user's bare `i` must not survive as a raw for-init (it was renamed).
+    assert!(!out.contains("for (int i ="), "the reused Haxe `i` must be renamed:\n{out}");
+}
+
+#[test]
+fn bare_enum_constant_is_qualified_in_expression_position() {
+    // Returning (or assigning) a bare enum variant must qualify it with the
+    // enum's `struct E_` scope — the raw `Red` is undeclared in C++.
+    let out = gen_one(
+        "\
+         enum Color { Red; Green; }\n\
+         \
+         class Paint {\n\
+         \tpublic function new() {}\n\
+         \tpublic function pick():Color { return Green; }\n\
+         }\n",
+        "Paint",
+    );
+    assert!(out.contains("return Color_::Green;"), "bare enum variant must be scoped:\n{out}");
+    assert!(!out.contains("return Green;"), "unqualified variant must not leak:\n{out}");
 }
 
 #[test]
@@ -590,14 +323,12 @@ package game;
 import mucus.Mucus;
 final SCENE_ID:Int = 7;
 
-@:expose
 class Scene {
   public function new() {}
   public function cap():Int { return MAX_CHARS; }        // native const → mucus::
   public function id():Int { return SCENE_ID; }          // same ns → bare
 }
 
-@:expose
 extern inline function Pick(n:Int):Int {
   switch (n) {
     case SCENE_ID: return 1;                              // global scope → game::
@@ -633,7 +364,6 @@ fn map_get_lowers_to_iterator_with_existence_check() {
     let src = "\
 typedef Entry = { var count:Int; }
 
-@:expose
 class Store {
   private var entries:Map<String, Entry>;
   public function new() { this.entries = []; }
@@ -673,7 +403,6 @@ fn for_over_anonymous_array_literal_hoists_the_vector_before_the_loop() {
     // `for (i in [1,2,3])` builds a `std::vector` temporary, emitted *before* the
     // loop (in scope), then iterates it by index.
     let src = "\
-@:expose
 class Summer {
   public function new() {}
   public function total():Int {
@@ -713,7 +442,6 @@ fn trace_lowers_to_printf_with_file_and_line_and_no_trace_strips_it() {
     // single printf (reusing the interpolation type→spec mapping). `--no-trace`
     // strips the call (and its argument evaluation) to a no-op.
     let src = "\
-@:expose
 class Tracer {
   public function new() {}
   public function go(count:Int):Void {
@@ -735,11 +463,11 @@ class Tracer {
     // Default: trace → printf with the file:line prefix.
     let out = generate_source_diagnostics(&prog, idx, 1, false).unwrap().0;
     assert!(
-        out.contains(r#"printf("Tracer.hx:5: %s\n", "hello")"#),
+        out.contains(r#"printf("Tracer.hx:4: %s\n", "hello")"#),
         "string-literal trace → printf with file:line, no .c_str():\n{out}"
     );
     assert!(
-        out.contains(r#"printf("Tracer.hx:6: %s, %d\n", "count", count)"#),
+        out.contains(r#"printf("Tracer.hx:5: %s, %d\n", "count", count)"#),
         "multi-arg trace → comma-separated specs:\n{out}"
     );
 
@@ -757,7 +485,6 @@ fn conditional_compilation_and_untyped_lower_to_preprocessor_and_verbatim() {
     // `@:include` becomes an `#include` at that point; `untyped` hands the rest of
     // the statement to C++ verbatim (here `fsqrtf`, which Haxe cannot see).
     let src = "\
-@:expose
 class Maths {
   public function new() {}
   public function Dist(dx:Float, dy:Float):Float {
@@ -802,7 +529,6 @@ fn plain_dollar_interpolation_is_supported() {
     // `'$name'` shorthand interpolates the identifier, exactly like `'${name}'`.
     // A `$` not followed by an identifier (here `$5`) stays a literal dollar.
     let src = "\
-@:expose
 class Greeter {
   public function new() {}
   public function Greet(name:String):String {
@@ -837,10 +563,8 @@ fn early_return_frees_owned_locals() {
     // local before EVERY return, while never double-freeing: a tail return frees it
     // and emits no trailing (dead) delete.
     let src = "\
-@:expose
 class Helper { public function new() {} }
 
-@:expose
 class Runner {
   public function new() {}
   public function run(early:Bool):Null<Helper> {
@@ -892,7 +616,6 @@ interface IProps {
   public function GetOr(k:String, d:Dynamic):Dynamic;
 }
 
-@:expose
 class C {
   var props:IProps;
   public function new() {}
@@ -927,12 +650,10 @@ fn new_pushed_into_owned_container_is_not_scope_deleted() {
     // double-frees). Covers a direct field push AND a local that flows into a
     // field (the bare-`field` form, with `this.` omitted, must be recognised too).
     let src = "\
-@:expose
 class Tile {
   public function new(v:Int) {}
 }
 
-@:expose
 class Grid {
   private var tiles:Array<Tile>;
   private var rows:Array<Array<Tile>>;
@@ -976,17 +697,14 @@ fn bare_field_assigned_new_behaves_like_qualified() {
     // constructor frees, which would leave `field` dangling), the field is
     // NULL-initialised, and the destructor deletes it.
     let src = "\
-@:expose
 class Leaf {
   public function new(n:Int) {}
 }
 
-@:expose
 class Holder {
   public function new(a:Leaf) {}
 }
 
-@:expose
 class Owner {
   var h:Holder;
   public function new() {
@@ -1035,7 +753,6 @@ typedef Vec = {
 
 final Cross:(Vec, Vec) -> Float = (a, b) -> a.x * b.y - a.y * b.x;
 
-@:expose
 class M {}
 ";
     let dir = std::env::temp_dir().join(format!("hatchet_lambdaty_{}", std::process::id()));
@@ -1066,24 +783,20 @@ fn new_passed_to_an_owning_ctor_param_is_inline_not_double_freed() {
     // destructor runs). A *borrowing* ctor param keeps the hoist (the scope must
     // free the fresh `new`, since the borrower never will).
     let src = "\
-@:expose
 class Child {
   public function new() {}
 }
 
-@:expose
 class Owner {
   @owned var c:Child;
   public function new(c:Child) { this.c = c; }
 }
 
-@:expose
 class Borrower {
   var c:Child;
   public function new(c:Child) { this.c = c; }
 }
 
-@:expose
 class User {
   public function new() {}
   public function owns():Void {
@@ -1130,12 +843,10 @@ fn delete_tag_forces_a_scope_free() {
     // `@delete var t = make()` frees `t` at scope close even though the analysis
     // would leak a returned pointer. `@delete` is the local-scope override.
     let src = "\
-@:expose
 class Thing {
   public function new() {}
 }
 
-@:expose
 class C {
   public function new() {}
   public function make():Thing { return new Thing(); }
@@ -1166,7 +877,6 @@ fn array_index_write_grows_the_vector() {
     // must be preceded by a grow-guard. A map write (`std::map::operator[]` inserts)
     // must NOT be guarded.
     let src = "\
-@:expose
 class G {
   public function new() {}
   public function fill(n:Int):Array<Int> {
@@ -1212,12 +922,10 @@ fn owned_marker_deletes_injected_pointers() {
     // field gets a plain `delete`; a container field is freed element-wise (never
     // a flat `delete` on the std::vector).
     let src = "\
-@:expose
 class Dep {
   public function new() {}
 }
 
-@:expose
 class Widget {
   @owned var dep:Dep;
   @owned var kids:Array<Dep>;
@@ -1263,13 +971,11 @@ typedef Coords = {
   var v:Float;
 }
 
-@:expose
 class Quad {
   public function new() {}
   public function set(a:Coords, ?b:Coords):Void {}
 }
 
-@:expose
 class User {
   var q:Quad;
   public function new() {}
@@ -1326,13 +1032,11 @@ fn property_access_on_new_hoists_to_a_local() {
     // local and reads the property off it. The temporary is not freed (only the
     // property value escapes; the object's dtor would free it).
     let src = "\
-@:expose
 class Cell {
   public var value(default, null):Int;
   public function new(v:Int) { this.value = v; }
 }
 
-@:expose
 class Grid {
   private var values:Array<Int>;
   public function new() {
@@ -1373,7 +1077,6 @@ fn string_null_check_lowers_to_empty() {
     // comparison cannot stay `s == NULL`. Optional `String` params default to `""`,
     // so "null" ≡ empty: `s == null` → `s.empty()`, `s != null` → `!s.empty()`.
     let src = "\
-@:expose
 class S {
   public function new() {}
   public function run(?palette:String):Void {
@@ -1404,7 +1107,6 @@ class S {
 fn string_tier1_methods_map_to_std_string() {
     // Tier-1 Haxe `String` API → single C++98 `std::string` expressions.
     let src = "\
-@:expose
 class S {
   public function new() {}
   public function run():Void {
@@ -1458,10 +1160,8 @@ fn type_ascription_honors_the_ascribed_type() {
     // type drives inference where the inner expression's own type is uninformative
     // (a class-typed `null`, an empty array literal).
     let src = "\
-@:expose
 class Widget { public function new() {} }
 
-@:expose
 class A {
   public function new() {}
   public function run():Void {
@@ -1492,7 +1192,6 @@ fn string_tier2_case_and_split() {
     // toUpperCase/toLowerCase (ASCII, in-place on a copy) and split → vector, all
     // self-contained C++98 (no <cctype>/<algorithm>).
     let src = "\
-@:expose
 class S {
   public function new() {}
   public function run():Void {
@@ -1530,7 +1229,6 @@ class S {
 fn math_intrinsics_map_inline() {
     // Math API → inline C++98 expressions (no helper functions / shims).
     let src = "\
-@:expose
 class M {
   public function new() {}
   public function run():Void {
@@ -1577,7 +1275,6 @@ fn std_intrinsics_map_to_c_stdlib() {
     // Std.string/parseInt/parseFloat → inline C++98 (sprintf / strtol / atof), no
     // custom runtime helpers.
     let src = "\
-@:expose
 class S {
   public function new() {}
   public function run():Void {
@@ -1624,7 +1321,6 @@ fn array_and_map_methods_lower_to_inline_cpp() {
     // Array indexOf/contains/remove/reverse/copy/join and Map set/remove/keys →
     // self-contained C++98 (explicit loops; no <algorithm>, no runtime helpers).
     let src = "\
-@:expose
 class C {
   public function new() {}
   public function run():Void {
@@ -1677,7 +1373,6 @@ fn map_iteration_lowers_to_a_std_map_iterator() {
     // `for (v in map)` iterates values; `for (k => v in map)` binds key and value.
     // Both lower to a std::map iterator loop (not the index path).
     let src = "\
-@:expose
 class M {
   public function new() {}
   public function run():Void {
@@ -1717,7 +1412,6 @@ fn for_over_a_non_container_is_an_error() {
     // Hatchet has no general Iterator/Iterable protocol; iterating something that is
     // not a range, Array, or Map must fail loudly rather than emit invalid C++.
     let src = "\
-@:expose
 class B {
   public function new() {}
   public function run():Void {

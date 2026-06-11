@@ -54,7 +54,15 @@ void* operator new(std::size_t n) throw(std::bad_alloc) {
     return p;
 }
 void operator delete(void* p) throw() {
-    if (p && g_track && !g_in) { g_in = true; if (g_live.erase(p) == 0) g_double++; g_in = false; }
+    if (p && g_track && !g_in) {
+        g_in = true;
+        // Untracked pointer => double-free / use-after-free. Count it, but do NOT
+        // pass it to std::free again: a real second free would let a hardened
+        // libc/CRT abort() the process before mem_report() runs, so the harness
+        // could never observe the double-free it is meant to detect.
+        if (g_live.erase(p) == 0) { g_double++; g_in = false; return; }
+        g_in = false;
+    }
     std::free(p);
 }
 void* operator new[](std::size_t n) throw(std::bad_alloc) { return operator new(n); }
@@ -196,18 +204,15 @@ fn harness_detects_a_double_free() {
 #[test]
 fn owned_ctor_param_is_freed_once() {
     let src = "\
-@:expose
 class Child {
   public function new() {}
 }
 
-@:expose
 class Owner {
   @owned var c:Child;
   public function new(c:Child) { this.c = c; }
 }
 
-@:expose
 class Scenario {
   public function new() {}
   public function run():Void {
@@ -228,19 +233,16 @@ class Scenario {
 #[test]
 fn scope_local_with_nested_owned_args_is_freed() {
     let src = "\
-@:expose
 class Leaf {
   public function new() {}
 }
 
-@:expose
 class Node {
   @owned var a:Leaf;
   @owned var b:Leaf;
   public function new(a:Leaf, b:Leaf) { this.a = a; this.b = b; }
 }
 
-@:expose
 class Scenario {
   public function new() {}
   public function run():Void {
@@ -262,12 +264,10 @@ class Scenario {
 #[test]
 fn aliased_object_is_not_double_freed() {
     let src = "\
-@:expose
 class Thing {
   public function new() {}
 }
 
-@:expose
 class Holder {
   var a:Thing;
   var b:Thing;
@@ -278,7 +278,6 @@ class Holder {
   }
 }
 
-@:expose
 class Scenario {
   public function new() {}
   public function run():Void {
@@ -298,7 +297,6 @@ class Scenario {
 #[test]
 fn array_auto_grow_runs_clean() {
     let src = "\
-@:expose
 class Scenario {
   public function new() {}
   public function run():Void {
@@ -322,12 +320,10 @@ class Scenario {
 #[test]
 fn owned_container_of_pointers_freed_once() {
     let src = "\
-@:expose
 class Item {
   public function new() {}
 }
 
-@:expose
 class Bag {
   @owned var items:Array<Item>;
   public function new() {
@@ -338,7 +334,6 @@ class Bag {
   }
 }
 
-@:expose
 class Scenario {
   public function new() {}
   public function run():Void {
@@ -359,12 +354,10 @@ class Scenario {
 #[test]
 fn nested_owned_container_freed_once() {
     let src = "\
-@:expose
 class Tile {
   public function new() {}
 }
 
-@:expose
 class Grid {
   @owned var rows:Array<Array<Tile>>;
   public function new() {
@@ -376,7 +369,6 @@ class Grid {
   }
 }
 
-@:expose
 class Scenario {
   public function new() {}
   public function run():Void {
@@ -397,19 +389,16 @@ class Scenario {
 #[test]
 fn delete_before_overwrite_is_clean() {
     let src = "\
-@:expose
 class Thing {
   public function new() {}
 }
 
-@:expose
 class Box {
   var t:Thing;
   public function new() { this.t = new Thing(); }
   public function swap():Void { this.t = new Thing(); }
 }
 
-@:expose
 class Scenario {
   public function new() {}
   public function run():Void {
@@ -432,18 +421,15 @@ class Scenario {
 #[test]
 fn bare_field_assign_with_nested_owned_is_clean() {
     let src = "\
-@:expose
 class Inner {
   public function new() {}
 }
 
-@:expose
 class Outer {
   @owned var i:Inner;
   public function new(i:Inner) { this.i = i; }
 }
 
-@:expose
 class Holder {
   var o:Outer;
   public function new() {
@@ -451,7 +437,6 @@ class Holder {
   }
 }
 
-@:expose
 class Scenario {
   public function new() {}
   public function run():Void {
@@ -474,18 +459,15 @@ class Scenario {
 #[test]
 fn returned_new_is_not_double_freed() {
     let src = "\
-@:expose
 class Thing {
   public function new() {}
 }
 
-@:expose
 class Factory {
   public function new() {}
   public function make():Thing { return new Thing(); }
 }
 
-@:expose
 class Scenario {
   public function new() {}
   public function run():Void {
@@ -507,18 +489,15 @@ class Scenario {
 #[test]
 fn delete_tag_frees_a_returned_pointer() {
     let src = "\
-@:expose
 class Thing {
   public function new() {}
 }
 
-@:expose
 class Factory {
   public function new() {}
   public function make():Thing { return new Thing(); }
 }
 
-@:expose
 class Scenario {
   public function new() {}
   public function run():Void {
@@ -546,18 +525,15 @@ class Scenario {
 #[test]
 fn owned_property_field_is_freed_once() {
     let src = "\
-@:expose
 class Child {
   public function new() {}
 }
 
-@:expose
 class Owner {
   @owned public var a(default, null):Child;
   public function new(a:Child) { this.a = a; }
 }
 
-@:expose
 class Scenario {
   public function new() {}
   public function run():Void {
@@ -579,18 +555,15 @@ class Scenario {
 #[test]
 fn inherited_super_forward_plus_owned_field_is_clean() {
     let src = "\
-@:expose
 class Base {
   var tag:Int;
   public function new(tag:Int) { this.tag = tag; }
 }
 
-@:expose
 class Leaf {
   public function new() {}
 }
 
-@:expose
 class Derived extends Base {
   @owned var c:Leaf;
   public function new(tag:Int, c:Leaf) {
@@ -599,7 +572,6 @@ class Derived extends Base {
   }
 }
 
-@:expose
 class Scenario {
   public function new() {}
   public function run():Void {
@@ -621,18 +593,15 @@ class Scenario {
 #[test]
 fn holder_idiom_with_owned_field_is_clean() {
     let src = "\
-@:expose
 class Base {
   var v:Int;
   public function new(v:Int) { this.v = v; }
 }
 
-@:expose
 class Leaf {
   public function new() {}
 }
 
-@:expose
 class Sub extends Base {
   @owned var c:Leaf;
   public function new(c:Leaf) {
@@ -642,7 +611,6 @@ class Sub extends Base {
   }
 }
 
-@:expose
 class Scenario {
   public function new() {}
   public function run():Void {
