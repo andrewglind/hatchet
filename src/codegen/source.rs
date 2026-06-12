@@ -317,6 +317,23 @@ struct BodyGen<'a> {
     /// `return`), `new` arguments are owned by the receiver, not this scope, so
     /// they are emitted inline rather than hoisted into owned locals.
     new_args_escape: bool,
+    /// Container (`Array`/`Map`) parameters of the function currently being
+    /// generated. Haxe containers are shared by reference — mutating one inside
+    /// a function is visible to the caller — but Hatchet lowers container
+    /// parameters to `const&` values, so a mutation through a parameter is
+    /// flagged with a lint warning (ahead of the C++ const error). A local
+    /// shadowing the name drops it from the set.
+    container_params: std::collections::HashSet<String>,
+    /// Loop nesting depth at the statement currently being generated. Drives the
+    /// `break`-in-`switch` lowering (Haxe `switch` has no break semantics — a
+    /// `break` in a case body exits the enclosing *loop*).
+    loop_depth: usize,
+    /// While generating the case bodies of a C++ `switch` that sits inside a
+    /// loop and contains a loop-bound `break`: the hoisted flag a user `break`
+    /// must set (`f = true; break;` exits the switch; `if (f) break;` after the
+    /// switch exits the loop). Cleared inside nested loops, whose `break`s bind
+    /// to themselves; chained for switches nested in other switches' cases.
+    switch_break_flag: Option<String>,
     /// Pointer fields this class allocates with `new` (owned). They are
     /// NULL-initialised in the constructor and `delete`d before reassignment.
     owned_fields: std::collections::HashSet<String>,
@@ -388,6 +405,9 @@ impl<'a> BodyGen<'a> {
             owned: vec![Vec::new()],
             escaping: std::collections::HashSet::new(),
             new_args_escape: false,
+            container_params: std::collections::HashSet::new(),
+            loop_depth: 0,
+            switch_break_flag: None,
             owned_fields,
             owned_containers,
             expected: None,
@@ -467,6 +487,30 @@ impl<'a> BodyGen<'a> {
         self.warnings.push((self.current_line, format!("{ctx}{msg}")));
     }
 
+    /// Lint a container mutation through a parameter. Haxe `Array`/`Map` are
+    /// shared by reference — the caller sees a mutation made inside the
+    /// function — but Hatchet lowers container parameters to `const&` values, so
+    /// this neither compiles (const) nor would match Haxe if it did. Warn at
+    /// the Haxe line, ahead of the C++ error. `what` names the mutation
+    /// (`push`, `set`, `[i] = …`).
+    fn warn_if_param_container_mutated(&mut self, recv: &Expr, what: &str) {
+        let Expr::Ident(name) = recv else { return };
+        if !self.container_params.contains(name) {
+            return;
+        }
+        let kind = match self.lookup_local(name) {
+            Some(t) if t.base.starts_with("std::vector") => "an Array",
+            Some(t) if t.base.starts_with("std::map") => "a Map",
+            _ => return,
+        };
+        self.warn(format!(
+            "`{what}` mutates `{name}`, {kind} parameter — Haxe containers are shared by \
+             reference (the caller would see this change), but Hatchet passes containers by \
+             value (`const&`), so the mutation is lost and the generated C++ will not compile; \
+             mutate a local copy and return it, or hold the container in a class"
+        ));
+    }
+
     fn err(&mut self, msg: String) {
         let ctx = if self.current_fn.is_empty() {
             String::new()
@@ -500,6 +544,14 @@ impl<'a> BodyGen<'a> {
             }
             if m.body.is_none() {
                 continue;
+            }
+            // A custom accessor with an omitted return type returns the
+            // property's type in Haxe — never void (mirrors the header side).
+            let mut m = m;
+            if m.ret.is_none() {
+                if let Some(t) = crate::codegen::accessor_ret_type(self.class, &mname) {
+                    m.ret = Some(t);
+                }
             }
             s.push_str(&self.method_impl(&name, &m));
             s.push('\n');
@@ -880,6 +932,7 @@ impl<'a> BodyGen<'a> {
     }
 
     fn bind_params(&mut self, params: &[Param]) {
+        self.container_params.clear();
         for p in params {
             let ty = match &p.ty {
                 Some(t) => {
@@ -896,7 +949,12 @@ impl<'a> BodyGen<'a> {
                 }
                 None => Ty::default(),
             };
+            let is_container = !ty.is_ptr && is_container_ty(&ty);
             self.define_local(&p.name, ty);
+            // after define_local, which clears any earlier shadow bookkeeping
+            if is_container {
+                self.container_params.insert(p.name.clone());
+            }
         }
     }
 
@@ -1028,10 +1086,15 @@ impl<'a> BodyGen<'a> {
                     }
                     // Delete-before-overwrite: reassigning an owned pointer field
                     // (outside the constructor, where it is NULL-initialised) frees
-                    // the prior value first.
+                    // the prior value first. When the write routes through a custom
+                    // `set_x`, the setter's own direct `x = v` is the single funnel
+                    // for all writes — the delete is emitted *there*, so the routed
+                    // caller must not also free (that would be a double delete).
                     if self.current_fn != "new" {
                         if let Some(field) = &own_field {
-                            if self.owned_fields.contains(field) {
+                            if self.owned_fields.contains(field)
+                                && self.own_field_setter(target).is_none()
+                            {
                                 let _ = writeln!(out, "{t}delete this->{field};");
                             }
                         }
@@ -1116,6 +1179,7 @@ impl<'a> BodyGen<'a> {
             Stmt::While { cond, body, do_while, line } => {
                 self.current_line = *line;
                 self.prelude_ind = ind;
+                let saved = self.enter_loop();
                 if *do_while {
                     let _ = writeln!(out, "{t}do {{");
                     self.gen_block(body, ind + 1, out);
@@ -1129,10 +1193,13 @@ impl<'a> BodyGen<'a> {
                     self.gen_block(body, ind + 1, out);
                     let _ = writeln!(out, "{t}}}");
                 }
+                self.exit_loop(saved);
             }
             Stmt::For { var, value_var, iter, body, line } => {
                 self.current_line = *line;
-                self.gen_for(var, value_var.as_deref(), iter, body, ind, out)
+                let saved = self.enter_loop();
+                self.gen_for(var, value_var.as_deref(), iter, body, ind, out);
+                self.exit_loop(saved);
             }
             Stmt::Switch { subject, cases, default, line } => {
                 self.current_line = *line;
@@ -1149,6 +1216,12 @@ impl<'a> BodyGen<'a> {
                 let _ = writeln!(out, "{t}}}");
             }
             Stmt::Break => {
+                // Inside a generated C++ `switch`, a bare `break` would exit the
+                // switch; Haxe's `break` exits the enclosing loop. Route it
+                // through the hoisted flag checked after the switch.
+                if let Some(f) = self.switch_break_flag.clone() {
+                    let _ = writeln!(out, "{t}{f} = true;");
+                }
                 let _ = writeln!(out, "{t}break;");
             }
             Stmt::Continue => {
@@ -1242,7 +1315,7 @@ impl<'a> BodyGen<'a> {
         if dynamic {
             return ("catch (...)".to_string(), false);
         }
-        let p = Param { name: c.name.clone(), ty: c.ty.clone(), optional: false, default: None };
+        let p = Param { name: c.name.clone(), ty: c.ty.clone(), optional: false, default: None, rest: false };
         (format!("catch ({})", super::param_decl(self.prog, self.mi, &self.ns, &p)), true)
     }
 
@@ -1627,6 +1700,17 @@ impl<'a> BodyGen<'a> {
         }
     }
 
+    /// Enter a loop body: bump the depth and suspend any enclosing switch's
+    /// break flag — a `break` inside the nested loop binds to that loop.
+    fn enter_loop(&mut self) -> Option<String> {
+        self.loop_depth += 1;
+        self.switch_break_flag.take()
+    }
+    fn exit_loop(&mut self, saved: Option<String>) {
+        self.loop_depth -= 1;
+        self.switch_break_flag = saved;
+    }
+
     fn gen_switch(
         &mut self,
         subject: &Expr,
@@ -1649,15 +1733,86 @@ impl<'a> BodyGen<'a> {
             self.gen_equality_switch(&subj, &spell, cases, default, ind, out);
             return;
         }
-        let _ = writeln!(out, "{t}switch ({subj}) {{");
+        // An ADT subject (a tagged value class) dispatches on its `kind`; a
+        // destructuring case (`case Add(a, b):`) binds payload fields to locals.
+        // The subject is hoisted into a local unless it is already a bare name,
+        // so payload reads never re-evaluate a side-effecting expression.
+        let adt = sty.info.as_ref().and_then(|i| self.adt_enum(i).map(|e| (i.clone(), e)));
+        let (switch_subj, sv, acc) = match &adt {
+            Some(_) => {
+                let acc = if sty.is_ptr { "->" } else { "." };
+                let sv = if matches!(subject, Expr::Ident(_)) {
+                    subj.clone()
+                } else {
+                    let tmp = self.fresh("subj");
+                    let spell = self.decl_spelling(&sty);
+                    let _ = writeln!(out, "{t}{spell} {tmp} = {subj};");
+                    tmp
+                };
+                (format!("{sv}{acc}kind"), sv, acc)
+            }
+            None => (subj.clone(), subj.clone(), "."),
+        };
+        // Haxe `switch` has no break semantics: a `break` in a case body exits
+        // the enclosing *loop*. A bare C++ `break` inside the generated switch
+        // would exit only the switch — so when a case body contains a loop-bound
+        // break, hoist a flag, set it at the break, and re-break after the
+        // switch. (Chained when this switch sits in an outer switch's case: the
+        // post-check then sets the outer flag instead of breaking bare.)
+        let needs_break_flag = self.loop_depth > 0
+            && (cases.iter().any(|c| stmts_contain_loop_break(&c.body))
+                || default.map_or(false, stmts_contain_loop_break));
+        let break_flag = if needs_break_flag {
+            let f = self.fresh("brk");
+            let _ = writeln!(out, "{t}bool {f} = false;");
+            Some(f)
+        } else {
+            None
+        };
+        let outer_flag = std::mem::replace(&mut self.switch_break_flag, break_flag.clone());
+        let _ = writeln!(out, "{t}switch ({switch_subj}) {{");
         for case in cases {
             for pat in &case.patterns {
-                // enum case labels need the enum-qualified constant
-                let label = self.case_label(pat, &sty);
+                // enum case labels need the enum-qualified constant; a
+                // destructuring pattern labels with its variant's tag
+                let label = match (&adt, pat) {
+                    (Some((info, _)), Expr::Call(callee, _)) => {
+                        self.enum_constant(info, &call_pattern_variant(callee))
+                    }
+                    _ => self.case_label(pat, &sty),
+                };
                 let _ = writeln!(out, "{t}\tcase {label}:");
             }
             let _ = writeln!(out, "{t}\t{{");
             self.push_scope();
+            // Destructuring bindings: `case Add(a, b):` declares one typed local
+            // per non-`_` capture, read from the variant's payload fields.
+            // (Validation guarantees a destructuring pattern is its case's only
+            // pattern, so the bindings are unambiguous.)
+            if let Some((_, e)) = &adt {
+                if let (1, Some(Expr::Call(callee, pargs))) =
+                    (case.patterns.len(), case.patterns.first())
+                {
+                    let vname = call_pattern_variant(callee);
+                    if let Some(v) = e.variants.iter().find(|v| v.name == vname) {
+                        for (i, parg) in pargs.iter().enumerate() {
+                            let Expr::Ident(bind) = parg else { continue };
+                            if bind == "_" {
+                                continue;
+                            }
+                            let Some(p) = v.params.get(i) else { continue };
+                            let pty = p.ty.as_ref().map(|t| self.ty_of(t)).unwrap_or_default();
+                            let spell = self.decl_spelling(&pty);
+                            let _ = writeln!(
+                                out,
+                                "{t}\t\t{spell} {bind} = {sv}{acc}{vname}_{};",
+                                p.name
+                            );
+                            self.define_local(bind, pty);
+                        }
+                    }
+                }
+            }
             for s in &case.body {
                 self.gen_stmt(s, ind + 2, out);
             }
@@ -1677,6 +1832,20 @@ impl<'a> BodyGen<'a> {
             let _ = writeln!(out, "{t}\tbreak;");
         }
         let _ = writeln!(out, "{t}}}");
+        // Re-raise a routed loop break: bare when the loop is the next enclosing
+        // construct; through the outer switch's flag when this switch sits inside
+        // another switch's case body (whose own post-check then breaks the loop).
+        self.switch_break_flag = outer_flag;
+        if let Some(f) = &break_flag {
+            match &self.switch_break_flag {
+                Some(of) => {
+                    let _ = writeln!(out, "{t}if ({f}) {{ {of} = true; break; }}");
+                }
+                None => {
+                    let _ = writeln!(out, "{t}if ({f}) break;");
+                }
+            }
+        }
     }
 
     /// Lower a `switch` on a non-integral subject (a `String`, or a float-backed
@@ -1809,6 +1978,20 @@ impl<'a> BodyGen<'a> {
                 }
             }
         }
+        // Qualified enum variant (`EnumType.Variant`): a `case` label is always
+        // the tag — even for an ADT, whose *value*-position spelling is the
+        // factory call (`Op::Halt()`), which cannot label a case.
+        if let Expr::Field(recv, name) = pat {
+            if let Expr::Ident(tname) = &**recv {
+                if let Some(info) =
+                    self.prog.resolve_type(std::slice::from_ref(tname), self.mi).cloned()
+                {
+                    if info.kind == TypeKind::Enum {
+                        return self.enum_constant(&info, name);
+                    }
+                }
+            }
+        }
         self.gen_expr(pat).0
     }
 
@@ -1832,6 +2015,7 @@ impl<'a> BodyGen<'a> {
         if !rty.base.starts_with("std::vector") {
             return None;
         }
+        self.warn_if_param_container_mutated(recv, "[i] = …");
         let access = if rty.is_ptr && is_container_ty(&rty) {
             format!("(*{rcode})")
         } else {
@@ -1861,6 +2045,68 @@ impl<'a> BodyGen<'a> {
         Some((format!("{access}[{ix}] = {vcode}"), ety))
     }
 
+    /// Generate an assignment target. A store into a custom `(get, …)` property's
+    /// own field is a direct (physical) write — Haxe's `null`/`never` write
+    /// access — so the read-side `get_x()` routing must not apply to it. Anything
+    /// that is not an own-field of a custom-getter property generates exactly as
+    /// an expression.
+    fn gen_lvalue(&mut self, target: &Expr) -> (String, Ty) {
+        let own = match target {
+            Expr::Ident(name) if self.lookup_local(name).is_none() => Some(name),
+            Expr::Field(recv, name) if matches!(&**recv, Expr::This) => Some(name),
+            _ => None,
+        };
+        if let Some(name) = own {
+            if let Some(f) = self.class_field(name) {
+                if f.get == PropAccess::Get {
+                    return (format!("this->{name}"), self.field_ty(f));
+                }
+            }
+        }
+        self.gen_expr(target)
+    }
+
+    /// Resolve a mutation target (`x += v`, `x++`, …) that must route through a
+    /// property setter. Returns the setter call prefix (e.g. `this->set_x` or
+    /// `rcv->SetX`), the routed *read* of the current value, and the field type —
+    /// the caller wraps them as `prefix(read op v)`, Haxe's own desugaring of a
+    /// compound write to a property. A side-effecting external receiver is
+    /// hoisted into a temp so it is evaluated exactly once. `None` means the
+    /// target is not a setter-routed property (direct C++ mutation applies).
+    fn routed_compound_write(&mut self, target: &Expr) -> Option<(String, String, Ty)> {
+        // own field with a custom user setter
+        if let Some(name) = self.own_field_setter(target) {
+            let (read, fty) = self.gen_expr(target); // routes get_x() / direct
+            return Some((format!("this->set_{name}"), read, fty));
+        }
+        // external property with a routed (custom or generated) setter
+        if let Expr::Field(recv, name) = target {
+            if matches!(&**recv, Expr::This) {
+                return None;
+            }
+            let (rc, rty) = self.gen_expr(recv);
+            let info = rty.info.clone()?;
+            let setter = self.field_setter(&info, name)?;
+            let r = if matches!(&**recv, Expr::Ident(_)) {
+                rc
+            } else {
+                let tmp = self.fresh("rcv");
+                let t = "\t".repeat(self.prelude_ind);
+                let spell = self.decl_spelling(&rty);
+                self.prelude.push_str(&format!("{t}{spell} {tmp} = {rc};\n"));
+                tmp
+            };
+            let op = if rty.is_ptr { "->" } else { "." };
+            let read = match self.field_getter(&info, name) {
+                Some(g) => format!("{r}{op}{g}()"),
+                None => format!("{r}{op}{name}"),
+            };
+            let fty = self.accessor_field_ty(&info, name);
+            return Some((format!("{r}{op}{setter}"), read, fty));
+        }
+        None
+    }
+
     fn gen_assign_or_expr(&mut self, e: &Expr) -> (String, Ty) {
         if let Expr::Assign { op: None, target, value } = e {
             // `arr[i] = v` into an Array (→ std::vector): Haxe auto-extends the
@@ -1871,10 +2117,32 @@ impl<'a> BodyGen<'a> {
                 if let Some(result) = self.try_array_index_assign(recv, idx, value) {
                     return result;
                 }
+                // not a vector: `m[k] = v` on a map inserts — a mutation too
+                self.warn_if_param_container_mutated(recv, "[k] = …");
+            }
+            // Own-field write through a user-written setter (`this.x = v` or bare
+            // `x = v` where the property declares `set` and `set_x` exists):
+            // `this->set_x(v)`, exactly as Haxe routes it. Checked before the
+            // `x = []`/object-literal shortcuts — those must route too.
+            if let Some(name) = self.own_field_setter(target) {
+                let fty = self.class_field(&name).map(|f| self.field_ty(f)).unwrap_or_default();
+                let vcode = if let Expr::ObjectLit(fields) = &**value {
+                    if fty.info.is_some() && !fty.base.is_empty() {
+                        self.hoist_object(fields, fty.clone())
+                    } else {
+                        self.gen_expr(value).0
+                    }
+                } else {
+                    self.expected = Some(fty.clone());
+                    let v = self.gen_expr(value).0;
+                    self.expected = None;
+                    v
+                };
+                return (format!("this->set_{name}({vcode})"), fty);
             }
             // x = []  → x.clear()
             if matches!(&**value, Expr::ArrayLit(v) if v.is_empty()) {
-                let (t, _) = self.gen_expr(target);
+                let (t, _) = self.gen_lvalue(target);
                 return (format!("{t}.clear()"), Ty::default());
             }
             // accessor setter: a.x = v → a->SetX(v)
@@ -1885,7 +2153,7 @@ impl<'a> BodyGen<'a> {
             }
             // x = { ... }  → hoist a temp of x's struct type, then assign it
             if let Expr::ObjectLit(fields) = &**value {
-                let (tcode, tty) = self.gen_expr(target);
+                let (tcode, tty) = self.gen_lvalue(target);
                 if tty.info.is_some() && !tty.base.is_empty() {
                     let tmp = self.hoist_object(fields, tty);
                     return (format!("{tcode} = {tmp}"), Ty::default());
@@ -1893,7 +2161,7 @@ impl<'a> BodyGen<'a> {
             }
             // plain reassignment: warn when a nullable value lands in a
             // non-nullable target.
-            let (tcode, tty) = self.gen_expr(target);
+            let (tcode, tty) = self.gen_lvalue(target);
             // The target type is the contextual hint for the RHS (e.g. an
             // `Array.map` result whose element type comes from the LHS).
             self.expected = Some(tty.clone());
@@ -1910,20 +2178,20 @@ impl<'a> BodyGen<'a> {
     }
 
     /// If `recv.field = value` targets an external property accessor, produce the
-    /// `recv->SetField(value)` call.
+    /// `recv->SetField(value)` (generated) or `recv->set_field(value)` (custom
+    /// `set_x`) call.
     fn accessor_set(&mut self, recv: &Expr, field: &str, value: &Expr) -> Option<String> {
-        // own fields (`this.x`) are assigned directly, never via a setter
+        // own fields (`this.x`) are handled by the own-field routing (custom
+        // setter) or assigned directly (generated trivial setter).
         if matches!(recv, Expr::This) {
             return None;
         }
         let (rcode, rty) = self.gen_expr(recv);
         let info = rty.info.clone()?;
-        if !self.field_has_setter(&info, field) {
-            return None;
-        }
+        let setter = self.field_setter(&info, field)?;
         let (vcode, _) = self.gen_expr(value);
         let op = if rty.is_ptr { "->" } else { "." };
-        Some(format!("{rcode}{op}Set{}({vcode})", cap(field)))
+        Some(format!("{rcode}{op}{setter}({vcode})"))
     }
 
     // ---- expression generation -----------------------------------------
@@ -1952,7 +2220,7 @@ impl<'a> BodyGen<'a> {
     fn gen_expr_inner(&mut self, e: &Expr) -> (String, Ty) {
         match e {
             Expr::Int(s) => (s.clone(), Ty { base: "int".into(), ..Default::default() }),
-            Expr::Float(s) => (float_lit(s), Ty { base: "float".into(), ..Default::default() }),
+            Expr::Float(s) => (float_lit(s), float_ty()),
             Expr::Bool(b) => (b.to_string(), Ty { base: "bool".into(), ..Default::default() }),
             Expr::Null => ("NULL".into(), Ty::default()),
             // `untyped X` — emit X verbatim; its type is opaque to Hatchet.
@@ -2051,7 +2319,25 @@ impl<'a> BodyGen<'a> {
                 )
             }
             Expr::Unary { op, expr, prefix } => {
-                let (c, ty) = self.gen_expr(expr);
+                // `++`/`--` on a setter-routed property desugar to a setter call,
+                // as in Haxe: `x++` → `set_x(read + 1)`. (The expression's value
+                // is the setter's return — the *new* value — so a postfix use in
+                // value position differs from Haxe's old-value result; in
+                // statement position, the overwhelmingly common case, the value
+                // is discarded and the semantics match.)
+                if matches!(op, UnOp::Incr | UnOp::Decr) {
+                    if let Some((w, read, fty)) = self.routed_compound_write(expr) {
+                        let delta = if matches!(op, UnOp::Incr) { "+ 1" } else { "- 1" };
+                        return (format!("{w}({read} {delta})"), fty);
+                    }
+                }
+                // `++`/`--` mutate their operand — an lvalue, so a custom-getter
+                // property's own field is the direct (physical) store.
+                let (c, ty) = if matches!(op, UnOp::Incr | UnOp::Decr) {
+                    self.gen_lvalue(expr)
+                } else {
+                    self.gen_expr(expr)
+                };
                 let o = unop(*op);
                 if *prefix {
                     (format!("{o}{c}"), ty)
@@ -2104,6 +2390,23 @@ impl<'a> BodyGen<'a> {
                         Ty { base: "std::string".into(), ..Default::default() },
                     );
                 }
+                // Haxe `/` always yields Float, even for Int operands; C++ `/`
+                // would truncate. When both operand types are statically known
+                // integers, force double division (Std.int(a / b) still truncates,
+                // matching Haxe).
+                if matches!(*op, BinOp::Div) && is_int_ty(&lty) && is_int_ty(&rty) {
+                    return (format!("((double)({l}) / {r})"), float_ty());
+                }
+                // Haxe `>>>` is a 32-bit unsigned right shift; C++98 has no `>>>`,
+                // so shift the value through `unsigned int` and come back to `int`.
+                if matches!(*op, BinOp::UShr) {
+                    return (format!("((int)((unsigned int)({l}) >> {r}))"), int_ty());
+                }
+                // Haxe `%` works on Floats; C++ `%` is integer-only. With a float
+                // operand, lower to `fmod` (C89 <math.h>, portable to VC6).
+                if matches!(*op, BinOp::Mod) && (is_float_base(&lty) || is_float_base(&rty)) {
+                    return (format!("fmod({l}, {r})"), float_ty());
+                }
                 let ty = binop_result_ty(*op, lty);
                 (format!("{l} {} {r}", binop(*op)), ty)
             }
@@ -2114,9 +2417,42 @@ impl<'a> BodyGen<'a> {
                 (format!("{c} ? {a} : {b}"), aty)
             }
             Expr::Assign { op, target, value } => {
-                let (t, tty) = self.gen_expr(target);
-                let (v, _) = self.gen_expr(value);
+                // A compound write to a setter-routed property desugars as Haxe
+                // does: `x op= v` → `set_x(read op v)`.
+                if op.is_some() {
+                    if let Some((w, read, fty)) = self.routed_compound_write(target) {
+                        let (v, vty) = self.gen_expr(value);
+                        let combined = match op.unwrap() {
+                            BinOp::UShr => format!("(int)((unsigned int)({read}) >> {v})"),
+                            BinOp::Mod if is_float_base(&fty) || is_float_base(&vty) => {
+                                format!("fmod({read}, {v})")
+                            }
+                            o => format!("{read} {} {v}", binop(o)),
+                        };
+                        return (format!("{w}({combined})"), fty);
+                    }
+                }
+                // A plain expression-position assignment to an own setter-routed
+                // property routes like the statement form.
+                if op.is_none() {
+                    if let Some(name) = self.own_field_setter(target) {
+                        let fty =
+                            self.class_field(&name).map(|f| self.field_ty(f)).unwrap_or_default();
+                        let (v, _) = self.gen_expr(value);
+                        return (format!("this->set_{name}({v})"), fty);
+                    }
+                }
+                let (t, tty) = self.gen_lvalue(target);
+                let (v, vty) = self.gen_expr(value);
                 match op {
+                    // `x >>>= y` — no C++ spelling; expand through the unsigned cast.
+                    Some(BinOp::UShr) => {
+                        (format!("{t} = (int)((unsigned int)({t}) >> {v})"), tty)
+                    }
+                    // `x %= y` with a float operand — C++ `%=` is integer-only.
+                    Some(BinOp::Mod) if is_float_base(&tty) || is_float_base(&vty) => {
+                        (format!("{t} = fmod({t}, {v})"), tty)
+                    }
                     Some(o) => (format!("{t} {}= {v}", binop(*o)), tty),
                     None => (format!("{t} = {v}"), tty),
                 }
@@ -2250,6 +2586,12 @@ impl<'a> BodyGen<'a> {
         // implicit `this` field?
         if let Some(f) = self.class_field(name) {
             let ty = self.field_ty(f);
+            // A custom `(get, …)` property reads through its accessor, exactly as
+            // in Haxe — except inside that accessor itself, where the backing
+            // field is accessed directly.
+            if f.get == PropAccess::Get && self.current_fn != format!("get_{name}") {
+                return (format!("this->get_{name}()"), ty);
+            }
             return (format!("this->{name}"), ty);
         }
         // a type name (for static / enum access)?
@@ -2301,6 +2643,23 @@ impl<'a> BodyGen<'a> {
             if self.lookup_local(tname).is_none() && self.class_field(tname).is_none() {
                 if let Some(info) = self.prog.resolve_type(std::slice::from_ref(tname), self.mi).cloned() {
                     if matches!(info.kind, TypeKind::Enum | TypeKind::EnumAbstract) {
+                        // Qualified ADT variant (`Op.Halt` in value position) →
+                        // the factory call; parameterized variants are handled
+                        // by `gen_call` (and `case` labels by `case_label`).
+                        if let Some(e) = self.adt_enum(&info) {
+                            let paramless =
+                                e.variants.iter().any(|v| v.name == name && v.params.is_empty());
+                            let ctor = self.enum_value_ctor(&info, name);
+                            let code = if paramless { format!("{ctor}()") } else { ctor };
+                            return (
+                                code,
+                                Ty {
+                                    base: info.name.clone(),
+                                    info: Some(info),
+                                    ..Default::default()
+                                },
+                            );
+                        }
                         let base = if info.kind == TypeKind::EnumAbstract {
                             self.prog
                                 .enum_abstract_underlying(&info)
@@ -2363,12 +2722,24 @@ impl<'a> BodyGen<'a> {
 
         let op = if rty.is_ptr { "->" } else { "." };
 
-        // External property accessor read: `obj.x` → `obj->GetX()`
+        // External property accessor read: `obj.x` → `obj->GetX()` (generated)
+        // or `obj->get_x()` (custom `(get, …)` accessor).
         if !matches!(recv, Expr::This) {
             if let Some(info) = &rty.info {
-                if self.field_has_getter(info, name) {
+                if let Some(g) = self.field_getter(info, name) {
                     let fty = self.accessor_field_ty(info, name);
-                    return (format!("{rcode}{op}Get{}()", cap(name)), fty);
+                    return (format!("{rcode}{op}{g}()"), fty);
+                }
+            }
+        }
+
+        // Internal read of a custom `(get, …)` property: `this.x` routes through
+        // the accessor, exactly as in Haxe — except inside that accessor itself,
+        // where the backing field is accessed directly.
+        if matches!(recv, Expr::This) {
+            if let Some(f) = self.class_field(name) {
+                if f.get == PropAccess::Get && self.current_fn != format!("get_{name}") {
+                    return (format!("this->get_{name}()"), self.field_ty(f));
                 }
             }
         }
@@ -2407,19 +2778,69 @@ impl<'a> BodyGen<'a> {
         // Value receivers cannot be null in C++ — access directly.
         if !rty.is_ptr {
             if let Some(info) = &rty.info {
-                if self.field_has_getter(info, field) {
-                    return (format!("{rcode}.Get{}()", cap(field)), self.accessor_field_ty(info, field));
+                if let Some(g) = self.field_getter(info, field) {
+                    return (format!("{rcode}.{g}()"), self.accessor_field_ty(info, field));
                 }
             }
             let fty = rty.info.as_ref().and_then(|i| self.member_field_ty(i, field)).unwrap_or_default();
             return (format!("{rcode}.{field}"), fty);
         }
         // Pointer receiver: guard against NULL.
-        let access = match &rty.info {
-            Some(info) if self.field_has_getter(info, field) => format!("{rcode}->Get{}()", cap(field)),
-            _ => format!("{rcode}->{field}"),
+        let access = match rty.info.as_ref().and_then(|info| self.field_getter(info, field)) {
+            Some(g) => format!("{rcode}->{g}()"),
+            None => format!("{rcode}->{field}"),
         };
         (format!("({rcode} != NULL ? {access} : 0)"), Ty::default())
+    }
+
+    /// If `target(args)` constructs a parameterized enum variant — a bare
+    /// `Add(1, 2)` or a qualified `Op.Add(1, 2)` — emit the static factory call
+    /// (`Op::Add(1, 2)`). `None` for anything that is not an ADT constructor.
+    fn try_enum_ctor_call(&mut self, target: &Expr, args: &[Expr]) -> Option<(String, Ty)> {
+        let (info, vname) = match target {
+            Expr::Ident(n)
+                if self.lookup_local(n).is_none() && self.class_field(n).is_none() =>
+            {
+                // Find the ADT declaring this variant (the expected type wins).
+                let mut found: Option<TypeInfo> = None;
+                if let Some(i) = self.expected.as_ref().and_then(|t| t.info.as_ref()) {
+                    if self.adt_enum(i).is_some() && self.enum_has_variant(i, n) {
+                        found = Some(i.clone());
+                    }
+                }
+                if found.is_none() {
+                    for i in &self.prog.types {
+                        if self.adt_enum(i).is_some() && self.enum_has_variant(i, n) {
+                            found = Some(i.clone());
+                            break;
+                        }
+                    }
+                }
+                (found?, n.clone())
+            }
+            Expr::Field(recv, n) => {
+                let Expr::Ident(tname) = &**recv else { return None };
+                if self.lookup_local(tname).is_some() || self.class_field(tname).is_some() {
+                    return None;
+                }
+                let info =
+                    self.prog.resolve_type(std::slice::from_ref(tname), self.mi)?.clone();
+                if self.adt_enum(&info).is_none() {
+                    return None;
+                }
+                (info, n.clone())
+            }
+            _ => return None,
+        };
+        let e = self.adt_enum(&info)?;
+        let v = e.variants.iter().find(|v| v.name == vname)?;
+        if v.params.is_empty() {
+            // a paramless variant is referenced bare, never called, in Haxe
+            return None;
+        }
+        let a = self.gen_args(args);
+        let ty = Ty { base: info.name.clone(), info: Some(info.clone()), ..Default::default() };
+        Some((format!("{}({a})", self.enum_value_ctor(&info, &vname)), ty))
     }
 
     fn gen_call(&mut self, target: &Expr, args: &[Expr]) -> (String, Ty) {
@@ -2442,6 +2863,11 @@ impl<'a> BodyGen<'a> {
             }
             let call = format!("{rcode}->{method}({a})");
             return (format!("({rcode} != NULL ? ({call}, 0) : 0)"), Ty::default());
+        }
+        // Parameterized-enum constructor call (`Add(1, 2)` or `Op.Add(1, 2)`) →
+        // the generated static factory (`Op::Add(1, 2)`), a tagged value.
+        if let Some(res) = self.try_enum_ctor_call(target, args) {
+            return res;
         }
         if let Expr::Field(recv, method) = target {
             // Intrinsics on Math / Std / Sys (only when not shadowed by a local).
@@ -2466,6 +2892,9 @@ impl<'a> BodyGen<'a> {
             let (rcode, rty) = self.gen_expr(recv);
             // Haxe container methods → std::vector / std::map equivalents.
             if is_container_ty(&rty) {
+                if is_mutating_container_method(method) {
+                    self.warn_if_param_container_mutated(recv, method);
+                }
                 if let Some(res) = self.container_call(&rcode, &rty, method, args) {
                     return res;
                 }
@@ -3164,7 +3593,7 @@ impl<'a> BodyGen<'a> {
             ("Math", "abs") => {
                 // abs for Int, fabs for Float — choose by inferred argument type
                 let (c, ty) = self.gen_expr(&args[0]);
-                let fname = if ty.base == "float" { "fabs" } else { "abs" };
+                let fname = if matches!(ty.base.as_str(), "float" | "double") { "fabs" } else { "abs" };
                 Some((format!("{fname}({c})"), ty))
             }
             ("Math", "min") => Some((self.min_max("<", args), float_ty())),
@@ -3188,7 +3617,8 @@ impl<'a> BodyGen<'a> {
             }
             ("Std", "parseFloat") => {
                 let s = self.cstr_arg(&args[0]);
-                Some((format!("(float)atof({s})"), float_ty()))
+                // atof already returns double — Haxe `Float`.
+                Some((format!("atof({s})"), float_ty()))
             }
             // `Std.random(x)` → a non-negative int in `[0, x)` (0 when `x <= 0`, as in
             // Haxe). The argument is virtually always pure, so re-using it is safe.
@@ -3282,7 +3712,7 @@ impl<'a> BodyGen<'a> {
                 Some((res, str_ty()))
             }
             ("Sys", "cpuTime") => Some((
-                "((float) clock() / (float) CLOCKS_PER_SEC)".into(),
+                "((double) clock() / (double) CLOCKS_PER_SEC)".into(),
                 float_ty(),
             )),
             // `String.fromCharCode(c)` → a one-char string (low byte only on VC6).
@@ -3812,6 +4242,9 @@ impl<'a> BodyGen<'a> {
         self.owned.pop();
     }
     fn define_local(&mut self, name: &str, ty: Ty) {
+        // A local shadowing a container parameter takes over the name — its
+        // mutations are local copies, not parameter mutations.
+        self.container_params.remove(name);
         self.scopes.last_mut().unwrap().insert(name.to_string(), ty);
     }
     fn lookup_local(&self, name: &str) -> Option<Ty> {
@@ -4039,10 +4472,20 @@ impl<'a> BodyGen<'a> {
             .unwrap_or(false)
     }
 
+    /// Whether `name` is an accessor method *replaced* by a generated one (and so
+    /// must not be emitted as an ordinary method). A custom accessor — `get_x`
+    /// for a `(get, …)` property, or a user-written `set_x` for a `set` property —
+    /// is the user's real implementation: it is emitted, so it is not matched here.
     fn is_accessor_method(&self, name: &str) -> bool {
         self.class.fields.iter().any(|f| {
-            (f.get != PropAccess::Default || f.set != PropAccess::Default)
-                && (format!("get_{}", f.name) == name || format!("set_{}", f.name) == name)
+            if f.get == PropAccess::Default && f.set == PropAccess::Default {
+                return false;
+            }
+            let suppressed_get = f.get != PropAccess::Get && format!("get_{}", f.name) == name;
+            let suppressed_set = format!("set_{}", f.name) == name
+                && !(f.set == PropAccess::Set
+                    && self.class.methods.iter().any(|m| m.name.as_deref() == Some(name)));
+            suppressed_get || suppressed_set
         })
     }
 
@@ -4051,12 +4494,69 @@ impl<'a> BodyGen<'a> {
         m.ret.as_ref().map(|t| self.ty_of(t))
     }
 
-    /// Find a field declaration in another type and whether it exposes a getter.
-    fn field_has_getter(&self, info: &TypeInfo, name: &str) -> bool {
-        self.lookup_field(info, name).map(has_accessor).unwrap_or(false)
+    /// The method an external read of field `name` on `info` routes through, if
+    /// any: the user's `get_x` for a custom `(get, …)` accessor, or the generated
+    /// `GetX` when reads are open but the backing field is private (writes
+    /// restricted or routed). `None` means direct field access.
+    fn field_getter(&self, info: &TypeInfo, name: &str) -> Option<String> {
+        self.lookup_field(info, name).and_then(getter_method)
     }
-    fn field_has_setter(&self, info: &TypeInfo, name: &str) -> bool {
-        self.lookup_field(info, name).map(|f| f.set == PropAccess::Set).unwrap_or(false)
+
+    /// The method a write to field `name` on `info` routes through, if any: the
+    /// user's `set_x` when one is defined (real Haxe `set` access), else the
+    /// generated trivial `SetX`. `None` for non-`set` write access.
+    fn field_setter(&self, info: &TypeInfo, name: &str) -> Option<String> {
+        let Some(Decl::Class(c)) = self.prog.type_decl(info) else { return None };
+        let f = self.find_field(c, name)?;
+        if f.set != PropAccess::Set {
+            return None;
+        }
+        let custom = format!("set_{name}");
+        Some(if self.class_defines_method(c, &custom) {
+            custom
+        } else {
+            format!("Set{}", cap(name))
+        })
+    }
+
+    /// Does `class` (or a base) define a method named `name`?
+    fn class_defines_method(&self, class: &'a Class, name: &str) -> bool {
+        if class.methods.iter().any(|m| m.name.as_deref() == Some(name)) {
+            return true;
+        }
+        if let Some(Type::Named { path, .. }) = &class.extends {
+            if let Some(info) = self.prog.resolve_type(path, self.mi) {
+                if let Some(Decl::Class(bc)) = self.prog.type_decl(info) {
+                    return self.class_defines_method(bc, name);
+                }
+            }
+        }
+        false
+    }
+
+    /// When an **own-field** assignment target must route through a user-written
+    /// setter: the field declares `set` access, a custom `set_x` exists, and we
+    /// are not already inside one of that property's accessors (where access is
+    /// direct, as in Haxe). Fields with only the generated trivial `SetX` keep
+    /// Hatchet's dialect behavior — internal writes stay direct.
+    fn own_field_setter(&self, target: &Expr) -> Option<String> {
+        let name = match target {
+            Expr::Ident(n) if self.lookup_local(n).is_none() => n,
+            Expr::Field(recv, n) if matches!(&**recv, Expr::This) => n,
+            _ => return None,
+        };
+        let f = self.class_field(name)?;
+        if f.set != PropAccess::Set {
+            return None;
+        }
+        let setter = format!("set_{name}");
+        if !self.class_defines_method(self.class, &setter) {
+            return None;
+        }
+        if self.current_fn == setter || self.current_fn == format!("get_{name}") {
+            return None;
+        }
+        Some(name.clone())
     }
 
     fn lookup_field(&self, info: &TypeInfo, name: &str) -> Option<&'a Field> {
@@ -4221,6 +4721,18 @@ impl<'a> BodyGen<'a> {
         }
         for info in order {
             if self.enum_has_variant(info, name) {
+                // ADT: a bare paramless variant in value position constructs the
+                // tagged value through its factory (`Op::Halt()`), not the bare
+                // tag (parameterized variants are constructed via `gen_call`).
+                if let Some(e) = self.adt_enum(info) {
+                    let paramless =
+                        e.variants.iter().any(|v| v.name == name && v.params.is_empty());
+                    let ty =
+                        Ty { base: info.name.clone(), info: Some(info.clone()), ..Default::default() };
+                    let ctor = self.enum_value_ctor(info, name);
+                    let code = if paramless { format!("{ctor}()") } else { ctor };
+                    return Some((code, ty));
+                }
                 // A plain/Int enum member has the enum type; a non-integral
                 // `enum abstract` member has the underlying type (String/Float).
                 let base = if info.kind == TypeKind::EnumAbstract {
@@ -4240,12 +4752,39 @@ impl<'a> BodyGen<'a> {
 
     /// Whether the enum `info` declares a variant named `name`.
     fn enum_has_variant(&self, info: &TypeInfo, name: &str) -> bool {
-        let Some(m) = self.prog.modules.get(info.module_index) else {
-            return false;
-        };
-        m.file.decls.iter().any(|d| {
-            matches!(d, Decl::Enum(e) if e.name == info.name && e.variants.iter().any(|v| v.name == name))
+        self.enum_decl(info)
+            .map(|e| e.variants.iter().any(|v| v.name == name))
+            .unwrap_or(false)
+    }
+
+    /// The `Enum` declaration behind a resolved enum `TypeInfo`.
+    fn enum_decl(&self, info: &TypeInfo) -> Option<&'a Enum> {
+        let m = self.prog.modules.get(info.module_index)?;
+        m.file.decls.iter().find_map(|d| match d {
+            Decl::Enum(e) if e.name == info.name => Some(e),
+            _ => None,
         })
+    }
+
+    /// The algebraic enum behind `info`, if it is one (a plain enum with at
+    /// least one parameterized variant — lowered to the tagged value class).
+    fn adt_enum(&self, info: &TypeInfo) -> Option<&'a Enum> {
+        if info.kind != TypeKind::Enum {
+            return None;
+        }
+        self.enum_decl(info).filter(|e| e.is_adt())
+    }
+
+    /// The namespaced factory spelling for an ADT variant (`demo::Op::Add` —
+    /// the value class, not the `Op_::Add` tag).
+    fn enum_value_ctor(&self, info: &TypeInfo, variant: &str) -> String {
+        let ns = info.cpp_namespace();
+        let prefix = if ns == self.ns || ns.is_empty() {
+            String::new()
+        } else {
+            format!("{}::", ns.join("::"))
+        };
+        format!("{prefix}{}::{variant}", info.cpp_name())
     }
 
     fn enum_constant(&self, info: &TypeInfo, variant: &str) -> String {
@@ -4270,8 +4809,56 @@ fn ty_named_info(prog: &Program, mi: usize, ht: &Type) -> Option<TypeInfo> {
     None
 }
 
-fn has_accessor(f: &Field) -> bool {
-    f.get != PropAccess::Default || f.set != PropAccess::Default
+/// Whether `stmts` contain a `break` that binds to the loop *enclosing* the
+/// switch being generated — i.e. one not nested inside an inner loop (whose
+/// `break` is its own). Recurses into nested switches: their breaks are still
+/// loop-bound in Haxe.
+fn stmts_contain_loop_break(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_contains_loop_break)
+}
+
+fn stmt_contains_loop_break(st: &Stmt) -> bool {
+    match st {
+        Stmt::Break => true,
+        Stmt::If { then, els, .. } => {
+            stmt_contains_loop_break(then)
+                || els.as_deref().map_or(false, stmt_contains_loop_break)
+        }
+        Stmt::Block(b) => stmts_contain_loop_break(b),
+        Stmt::Switch { cases, default, .. } => {
+            cases.iter().any(|c| stmts_contain_loop_break(&c.body))
+                || default.as_ref().map_or(false, |d| stmts_contain_loop_break(d))
+        }
+        Stmt::Try { body, catches, .. } => {
+            stmt_contains_loop_break(body)
+                || catches.iter().any(|c| stmts_contain_loop_break(&c.body))
+        }
+        // a break inside a nested loop binds to that loop, not ours
+        Stmt::For { .. } | Stmt::While { .. } => false,
+        _ => false,
+    }
+}
+
+/// The variant name a destructuring `case` pattern's callee names (`Add(a, b)`
+/// → `Add`; `Op.Add(a, b)` → `Add`).
+fn call_pattern_variant(callee: &Expr) -> String {
+    match callee {
+        Expr::Ident(n) => n.clone(),
+        Expr::Field(_, n) => n.clone(),
+        _ => String::new(),
+    }
+}
+
+/// The method an external read of property `f` routes through (see
+/// [`BodyGen::field_getter`]). Mirrors the header side's `generated_getter`.
+fn getter_method(f: &Field) -> Option<String> {
+    if f.get == PropAccess::Get {
+        return Some(format!("get_{}", f.name));
+    }
+    if f.get == PropAccess::Default && f.set != PropAccess::Default {
+        return Some(format!("Get{}", cap(&f.name)));
+    }
+    None
 }
 
 /// Collect local names that escape a function body — assigned to a field
@@ -4440,6 +5027,7 @@ fn empty_class() -> Class {
         is_extern: false,
         is_final: false,
         is_abstract: false,
+        line: 0,
         meta: Vec::new(),
         fields: Vec::new(),
         methods: Vec::new(),
@@ -4464,17 +5052,24 @@ pub(crate) fn render_final_const(prog: &Program, module_index: usize, g: &Global
 /// `HUGE_VAL`/`M_PI` come from `<math.h>`, which the target already provides.
 fn intrinsic_field(obj: &str, name: &str) -> Option<(String, Ty)> {
     let code = match (obj, name) {
-        ("Math", "POSITIVE_INFINITY") => "((float) HUGE_VAL)",
-        ("Math", "NEGATIVE_INFINITY") => "(-(float) HUGE_VAL)",
-        // `M_PI` is not standard C++98 / portable to VC6 — use the literal.
-        ("Math", "PI") => "((float) 3.141592653589793)",
+        // `HUGE_VAL` is already a double.
+        ("Math", "POSITIVE_INFINITY") => "HUGE_VAL",
+        ("Math", "NEGATIVE_INFINITY") => "(-HUGE_VAL)",
+        // No portable C++98 NaN constant — inf − inf is NaN per IEEE 754, and
+        // old MSVC's `HUGE_VAL` is an extern double (`_HUGE`), so this is runtime
+        // arithmetic, not a compile-time-folded constant.
+        ("Math", "NaN") => "(HUGE_VAL - HUGE_VAL)",
+        // `M_PI` is not standard C++98 / portable to VC6 — use the literal
+        // (a plain double literal, full IEEE-754 double precision).
+        ("Math", "PI") => "3.141592653589793",
         _ => return None,
     };
     Some((code.to_string(), float_ty()))
 }
 
 fn float_ty() -> Ty {
-    Ty { base: "float".into(), ..Default::default() }
+    // Haxe `Float` lowers to C++ `double` (64-bit, matching official targets).
+    Ty { base: "double".into(), ..Default::default() }
 }
 
 fn int_ty() -> Ty {
@@ -4558,6 +5153,15 @@ fn is_container_ty(ty: &Ty) -> bool {
     ty.base.starts_with("std::vector") || ty.base.starts_with("std::map")
 }
 
+/// Container methods that mutate their receiver (the rest — `indexOf`, `copy`,
+/// `filter`, `get`, `keys`, … — read it). Drives the mutated-parameter lint.
+fn is_mutating_container_method(method: &str) -> bool {
+    matches!(
+        method,
+        "push" | "insert" | "pop" | "shift" | "unshift" | "remove" | "reverse" | "sort" | "set"
+    )
+}
+
 fn rcode_is_map(ty: &Ty) -> bool {
     ty.base.starts_with("std::map")
 }
@@ -4585,6 +5189,9 @@ fn binop(op: BinOp) -> &'static str {
         Eq => "==", Ne => "!=", Lt => "<", Gt => ">", Le => "<=", Ge => ">=",
         And => "&&", Or => "||",
         BitAnd => "&", BitOr => "|", BitXor => "^", Shl => "<<", Shr => ">>",
+        // `>>>` is lowered through an unsigned cast before this table is consulted
+        // (see `gen_expr` for `Expr::Binary` / `Expr::Assign`); never emitted bare.
+        UShr => ">>",
     }
 }
 
@@ -4592,8 +5199,26 @@ fn binop_result_ty(op: BinOp, lhs: Ty) -> Ty {
     use BinOp::*;
     match op {
         Eq | Ne | Lt | Gt | Le | Ge | And | Or => Ty { base: "bool".into(), ..Default::default() },
+        UShr => int_ty(),
         _ => lhs,
     }
+}
+
+/// Whether an inferred C++ type is a statically known integer scalar — the
+/// precondition for the Haxe `Int / Int → Float` division lowering. Unknown
+/// (empty) bases stay on the plain C++ operator, conservatively.
+fn is_int_ty(ty: &Ty) -> bool {
+    !ty.is_ptr
+        && matches!(
+            ty.base.as_str(),
+            "int" | "unsigned int" | "uint8_t" | "uint16_t" | "uint32_t" | "char" | "short" | "long"
+        )
+}
+
+/// Whether an inferred C++ type is a floating scalar (Haxe `Float`) — the
+/// trigger for the `%` → `fmod` lowering (C++ `%` is integer-only).
+fn is_float_base(ty: &Ty) -> bool {
+    !ty.is_ptr && matches!(ty.base.as_str(), "float" | "double")
 }
 
 fn unop(op: UnOp) -> &'static str {
@@ -4606,12 +5231,11 @@ fn unop(op: UnOp) -> &'static str {
     }
 }
 
+/// A Haxe `Float` literal as C++. Haxe `Float` lowers to `double`, and an
+/// unsuffixed C++ floating literal *is* a `double` — emit it unchanged (no `f`
+/// suffix, which would truncate it to single precision).
 pub(crate) fn float_lit(s: &str) -> String {
-    if s.ends_with('f') || s.ends_with('F') || s.contains('x') {
-        s.to_string()
-    } else {
-        format!("{s}f")
-    }
+    s.to_string()
 }
 
 pub(crate) fn escape_str(s: &str) -> String {

@@ -169,6 +169,59 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Lower a boolean `#if` condition over flags to its C++ preprocessor
+    /// spelling: each flag becomes `defined(FLAG)`, and `!`, `&&`, `||` and
+    /// parentheses pass through (`(A && !B)` → `(defined(A) && !defined(B))`).
+    /// Anything else — a version comparison, a `-D` value, an arithmetic
+    /// expression — is an error: it has no `defined(…)` mapping.
+    fn pp_condition(&self, cond: &str) -> PResult<String> {
+        let bytes = cond.as_bytes();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            match b {
+                b' ' | b'\t' => {
+                    out.push(b as char);
+                    i += 1;
+                }
+                b'(' | b')' => {
+                    out.push(b as char);
+                    i += 1;
+                }
+                b'!' if i + 1 < bytes.len() && bytes[i + 1] != b'=' => {
+                    out.push('!');
+                    i += 1;
+                }
+                b'&' if i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
+                    out.push_str("&&");
+                    i += 2;
+                }
+                b'|' if i + 1 < bytes.len() && bytes[i + 1] == b'|' => {
+                    out.push_str("||");
+                    i += 2;
+                }
+                b'_' | b'a'..=b'z' | b'A'..=b'Z' => {
+                    let start = i;
+                    while i < bytes.len()
+                        && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric())
+                    {
+                        i += 1;
+                    }
+                    out.push_str(&format!("defined({})", &cond[start..i]));
+                }
+                _ => {
+                    return Err(self.err(&format!(
+                        "only flags combined with `!`, `&&`, `||` and parentheses are \
+                         supported in a `#if` condition (e.g. `#if (DREAMCAST && !DEBUG)`); \
+                         `{cond}` is not"
+                    )));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The next token if it is an identifier (consuming it), else `None`. Used to
     /// pick up the optional name of a skipped declaration for its diagnostic.
     fn opt_ident(&mut self) -> Option<String> {
@@ -489,7 +542,7 @@ impl<'a> Parser<'a> {
                 self.bump(); // abstract
                 Ok(Decl::Enum(self.parse_enum_abstract(meta)?))
             }
-            TokKind::Kw(Kw::Enum) => Ok(Decl::Enum(self.parse_enum(meta)?)),
+            TokKind::Kw(Kw::Enum) => self.parse_enum(meta),
             // A bare `abstract X(Int) { … }` type (the `abstract class` form is
             // handled by the modifier loop above). Skip the body and flag it.
             TokKind::Kw(Kw::Abstract) => {
@@ -498,7 +551,7 @@ impl<'a> Parser<'a> {
                 self.skip_braced_body()?;
                 Ok(Decl::Unsupported { feature: labelled("an `abstract` type", name), line })
             }
-            TokKind::Kw(Kw::Typedef) => Ok(Decl::Typedef(self.parse_typedef(meta)?)),
+            TokKind::Kw(Kw::Typedef) => self.parse_typedef(meta),
             TokKind::Kw(Kw::Function) => {
                 // top-level function, e.g. `extern inline function f(...) {}`
                 let func = self.parse_function(meta, access, modifiers)?;
@@ -536,6 +589,7 @@ impl<'a> Parser<'a> {
         is_final: bool,
         is_abstract: bool,
     ) -> PResult<Class> {
+        let line = self.line();
         self.expect_sym_kw(Kw::Class)?;
         let name = self.expect_ident()?;
         let type_params = self.parse_type_params()?;
@@ -553,6 +607,7 @@ impl<'a> Parser<'a> {
         self.expect_sym(Sym::LBrace)?;
         let mut class = Class {
             name,
+            line,
             type_params,
             extends,
             implements,
@@ -575,6 +630,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_interface(&mut self, meta: Vec<Meta>) -> PResult<Interface> {
+        let line = self.line();
         self.expect_sym_kw(Kw::Interface)?;
         let name = self.expect_ident()?;
         let type_params = self.parse_type_params()?;
@@ -588,6 +644,7 @@ impl<'a> Parser<'a> {
         self.expect_sym(Sym::LBrace)?;
         let mut iface = Interface {
             name,
+            line,
             type_params,
             extends,
             meta,
@@ -598,6 +655,7 @@ impl<'a> Parser<'a> {
             // interface members are method signatures (and rarely fields)
             let mut tmp = Class {
                 name: String::new(),
+                line: 0,
                 type_params: vec![],
                 extends: None,
                 implements: vec![],
@@ -620,9 +678,11 @@ impl<'a> Parser<'a> {
         Ok(iface)
     }
 
-    fn parse_enum(&mut self, meta: Vec<Meta>) -> PResult<Enum> {
+    fn parse_enum(&mut self, meta: Vec<Meta>) -> PResult<Decl> {
+        let line = self.line();
         self.expect_sym_kw(Kw::Enum)?;
         let name = self.expect_ident()?;
+        let type_params = self.parse_type_params()?;
         self.expect_sym(Sym::LBrace)?;
         let mut variants = Vec::new();
         while !self.at_sym(Sym::RBrace) && !self.at_eof() {
@@ -635,7 +695,17 @@ impl<'a> Parser<'a> {
             variants.push(EnumVariant { name: vname, params, value: None });
         }
         self.expect_sym(Sym::RBrace)?;
-        Ok(Enum { name, meta, variants, underlying: None })
+        // Generic enums have no C++98 template lowering (and their variants almost
+        // always carry `T` payloads, which need the tagged-union lowering too). The
+        // body is consumed and discarded so the validation pass reports a clean
+        // `Unsupported` instead of a parse error or unresolved-`T` noise.
+        if !type_params.is_empty() {
+            return Ok(Decl::Unsupported {
+                feature: format!("the generic enum `{name}<{}>`", type_params.join(", ")),
+                line,
+            });
+        }
+        Ok(Decl::Enum(Enum { name, meta, variants, underlying: None }))
     }
 
     /// Parse `enum abstract X(T) { var A [= expr]; ... }`. The leading
@@ -699,10 +769,11 @@ impl<'a> Parser<'a> {
         Ok(Enum { name, meta, variants, underlying: Some(underlying) })
     }
 
-    fn parse_typedef(&mut self, meta: Vec<Meta>) -> PResult<Typedef> {
+    fn parse_typedef(&mut self, meta: Vec<Meta>) -> PResult<Decl> {
+        let line = self.line();
         self.expect_sym_kw(Kw::Typedef)?;
         let name = self.expect_ident()?;
-        self.parse_type_params()?; // discard (supported typedefs are not generic)
+        let type_params = self.parse_type_params()?;
         self.expect_sym(Sym::Assign)?;
         let target = if self.at_sym(Sym::LBrace) {
             TypedefTarget::Struct(self.parse_struct_fields()?)
@@ -710,7 +781,16 @@ impl<'a> Parser<'a> {
             TypedefTarget::Alias(self.parse_type()?)
         };
         self.eat_sym(Sym::Semi);
-        Ok(Typedef { name, meta, target })
+        // Generic typedefs have no C++98 template lowering. The body is parsed (to
+        // consume it) and discarded, so the validation pass reports the typedef as
+        // `Unsupported` instead of flooding it with unresolved-`T` errors.
+        if !type_params.is_empty() {
+            return Ok(Decl::Unsupported {
+                feature: format!("the generic typedef `{name}<{}>`", type_params.join(", ")),
+                line,
+            });
+        }
+        Ok(Decl::Typedef(Typedef { name, meta, target }))
     }
 
     fn parse_global_var(
@@ -864,7 +944,10 @@ impl<'a> Parser<'a> {
         } else {
             Some(self.expect_ident()?)
         };
-        self.parse_type_params()?; // generic methods: discard params
+        // Generic methods have no template lowering; the params are kept so the
+        // validation pass can flag the method as `Unsupported` (and so `T` uses in
+        // its body are not double-reported as unresolved types).
+        let type_params = self.parse_type_params()?;
         let params = self.parse_params()?;
         let ret = if self.eat_sym(Sym::Colon) {
             Some(self.parse_type()?)
@@ -888,6 +971,7 @@ impl<'a> Parser<'a> {
         };
         Ok(Function {
             name,
+            type_params,
             params,
             ret,
             body,
@@ -904,6 +988,9 @@ impl<'a> Parser<'a> {
             return Ok(params);
         }
         loop {
+            // Haxe 4.2 rest parameter (`...vals:Int`): parsed and marked so the
+            // validation pass reports it cleanly instead of a parse error.
+            let rest = self.eat_sym(Sym::DotDotDot);
             let optional = self.eat_sym(Sym::Question);
             let name = self.expect_ident()?;
             let ty = if self.eat_sym(Sym::Colon) {
@@ -921,6 +1008,7 @@ impl<'a> Parser<'a> {
                 ty,
                 optional: optional || default.is_some(),
                 default,
+                rest,
             });
             if self.eat_sym(Sym::Comma) {
                 continue;
@@ -1053,12 +1141,20 @@ impl<'a> Parser<'a> {
                 self.toks[self.pos].kind = TokKind::Sym(Sym::Gt);
                 Ok(())
             }
+            TokKind::Sym(Sym::UShr) => {
+                self.toks[self.pos].kind = TokKind::Sym(Sym::Shr);
+                Ok(())
+            }
             TokKind::Sym(Sym::Ge) => {
                 self.toks[self.pos].kind = TokKind::Sym(Sym::Assign);
                 Ok(())
             }
             TokKind::Sym(Sym::ShrEq) => {
                 self.toks[self.pos].kind = TokKind::Sym(Sym::Ge);
+                Ok(())
+            }
+            TokKind::Sym(Sym::UShrEq) => {
+                self.toks[self.pos].kind = TokKind::Sym(Sym::ShrEq);
                 Ok(())
             }
             other => Err(self.err(&format!("expected '>', found {:?}", other))),
@@ -1206,15 +1302,24 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::Verbatim { code, line })
             }
             // Conditional-compilation directives, repurposed as a front end for
-            // the C++ preprocessor. Only a bare flag is supported (`#if FLAG` →
-            // `#ifdef FLAG`, `#elseif FLAG` → `#elif defined(FLAG)`); negation /
-            // boolean conditions raise an error, per the "raise, do not guess" rule.
-            // C++98 has no `#elifdef`, so `#elseif` lowers via `#elif defined(...)`.
+            // the C++ preprocessor. A bare flag keeps the classic spelling
+            // (`#if FLAG` → `#ifdef FLAG`); a boolean condition over flags
+            // (`!`, `&&`, `||`, parentheses) maps each flag through `defined(…)`
+            // (`#if (A && !B)` → `#if (defined(A) && !defined(B))`). Anything else
+            // (version comparisons, values) raises an error, per the "raise, do
+            // not guess" rule. C++98 has no `#elifdef`, so `#elseif` lowers via
+            // `#elif defined(...)`.
             TokKind::Pp(kind, cond) => {
                 self.bump();
                 let code = match kind {
-                    PpKind::If => format!("#ifdef {}", self.bare_flag(&cond)?),
-                    PpKind::ElseIf => format!("#elif defined({})", self.bare_flag(&cond)?),
+                    PpKind::If => match self.bare_flag(&cond) {
+                        Ok(flag) => format!("#ifdef {flag}"),
+                        Err(_) => format!("#if {}", self.pp_condition(&cond)?),
+                    },
+                    PpKind::ElseIf => match self.bare_flag(&cond) {
+                        Ok(flag) => format!("#elif defined({flag})"),
+                        Err(_) => format!("#elif {}", self.pp_condition(&cond)?),
+                    },
                     PpKind::Else => "#else".to_string(),
                     PpKind::End => "#endif".to_string(),
                 };
@@ -1327,9 +1432,29 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_sym(Sym::Colon)?;
                 let body = self.parse_case_body()?;
-                cases.push(Case { patterns, body });
+                // In pattern position `|` is Haxe's or-pattern — patterns are never
+                // evaluated, so it is not a bitwise OR. Flatten `case A | B:` into
+                // the same alternatives list as `case A, B:`.
+                let patterns: Vec<Expr> =
+                    patterns.into_iter().flat_map(flatten_or_pattern).collect();
+                // `case _:` is Haxe's wildcard — the spelling of `default`.
+                if patterns.iter().any(is_wildcard_pattern) {
+                    if default.is_some() {
+                        return Err(self.err(
+                            "duplicate catch-all: this switch already has a `default:` or `case _:`",
+                        ));
+                    }
+                    default = Some(body);
+                } else {
+                    cases.push(Case { patterns, body });
+                }
             } else if self.eat_kw(Kw::Default) {
                 self.expect_sym(Sym::Colon)?;
+                if default.is_some() {
+                    return Err(self.err(
+                        "duplicate catch-all: this switch already has a `default:` or `case _:`",
+                    ));
+                }
                 default = Some(self.parse_case_body()?);
             } else {
                 return Err(self.err("expected 'case' or 'default' in switch"));
@@ -1379,6 +1504,7 @@ impl<'a> Parser<'a> {
             TokKind::Sym(Sym::CaretEq) => Some(Some(BinOp::BitXor)),
             TokKind::Sym(Sym::ShlEq) => Some(Some(BinOp::Shl)),
             TokKind::Sym(Sym::ShrEq) => Some(Some(BinOp::Shr)),
+            TokKind::Sym(Sym::UShrEq) => Some(Some(BinOp::UShr)),
             TokKind::Sym(Sym::QuestionQuestionEq) => {
                 // x ??= y  → desugars later; model as assign of a coalesce
                 self.bump();
@@ -1478,6 +1604,7 @@ impl<'a> Parser<'a> {
             Sym::Ge => (BinOp::Ge, 7),
             Sym::Shl => (BinOp::Shl, 8),
             Sym::Shr => (BinOp::Shr, 8),
+            Sym::UShr => (BinOp::UShr, 8),
             Sym::Plus => (BinOp::Add, 9),
             Sym::Minus => (BinOp::Sub, 9),
             Sym::Star => (BinOp::Mul, 10),
@@ -1675,6 +1802,7 @@ impl<'a> Parser<'a> {
                             ty: None,
                             optional: false,
                             default: None,
+                            rest: false,
                         }],
                         ret: None,
                         body: Box::new(body),
@@ -1922,6 +2050,24 @@ fn set_access(current: Access, new: Access) -> Access {
     }
 }
 
+/// Split a top-level `|` pattern into its alternatives (recursively, so
+/// `A | B | C` yields all three). Anything else passes through as-is.
+fn flatten_or_pattern(e: Expr) -> Vec<Expr> {
+    match e {
+        Expr::Binary { op: BinOp::BitOr, lhs, rhs } => {
+            let mut out = flatten_or_pattern(*lhs);
+            out.extend(flatten_or_pattern(*rhs));
+            out
+        }
+        other => vec![other],
+    }
+}
+
+/// Is this pattern Haxe's `_` wildcard?
+fn is_wildcard_pattern(e: &Expr) -> bool {
+    matches!(e, Expr::Ident(n) if n == "_")
+}
+
 /// Append a parsed name to an unsupported-feature label, e.g.
 /// `labelled("an `abstract` type", Some("Color"))` → "an `abstract` type (`Color`)".
 fn labelled(base: &str, name: Option<String>) -> String {
@@ -2050,14 +2196,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_bare_conditional_compilation_flags() {
-        // `#ifdef` only takes a single macro name, so boolean conditions error.
-        assert!(parse("package p;\nclass X {\n function f():Void {\n#if !DEBUG\n#end\n }\n}").is_err());
-        assert!(parse("package p;\nclass X {\n function f():Void {\n#if (A && B)\n#end\n }\n}").is_err());
+    fn conditional_compilation_flags_and_boolean_conditions() {
+        // Boolean conditions over flags map each flag through `defined(…)`.
+        assert!(parse("package p;\nclass X {\n function f():Void {\n#if !DEBUG\n#end\n }\n}").is_ok());
+        assert!(parse("package p;\nclass X {\n function f():Void {\n#if (A && B)\n#end\n }\n}").is_ok());
         // A bare `#elseif FLAG` is supported (→ `#elif defined(FLAG)`)...
         assert!(parse("package p;\nclass X {\n function f():Void {\n#if A\n#elseif B\n#end\n }\n}").is_ok());
-        // ...but a non-bare `#elseif` condition is rejected, like `#if`.
-        assert!(parse("package p;\nclass X {\n function f():Void {\n#if A\n#elseif (B && C)\n#end\n }\n}").is_err());
+        // ...as is a boolean `#elseif` condition (→ `#elif defined(B) && …`).
+        assert!(parse("package p;\nclass X {\n function f():Void {\n#if A\n#elseif (B && C)\n#end\n }\n}").is_ok());
+        // Version comparisons / values have no `defined(…)` mapping — rejected.
+        assert!(parse("package p;\nclass X {\n function f():Void {\n#if (haxe_ver >= 4)\n#end\n }\n}").is_err());
     }
 
     #[test]

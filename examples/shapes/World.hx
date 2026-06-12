@@ -42,7 +42,7 @@ class World {
 		return total;
 	}
 
-	// Array comprehension -> a hoisted `std::vector<float>` filled by a loop.
+	// Array comprehension -> a hoisted `std::vector<double>` filled by a loop.
 	public function areas():Array<Float> {
 		return [for (s in shapes) s.area()];
 	}

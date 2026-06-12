@@ -46,7 +46,7 @@ enum abstract Suit(String) {
 	var Spades = "S";
 }
 
-// A Float-backed enum abstract → `static const float`.
+// A Float-backed enum abstract → `static const double`.
 enum abstract Ratio(Float) {
 	var Half = 0.5;
 	var Quarter = 0.25;

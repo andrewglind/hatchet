@@ -208,6 +208,9 @@ pub enum BinOp {
     Eq, Ne, Lt, Gt, Le, Ge,
     And, Or,
     BitAnd, BitOr, BitXor, Shl, Shr,
+    /// Haxe `>>>` (unsigned right shift). C++98 has no `>>>`; codegen lowers it
+    /// through an `unsigned int` cast: `(int)((unsigned int)a >> b)`.
+    UShr,
 }
 
 // ---------------------------------------------------------------------------
@@ -263,10 +266,9 @@ pub enum Stmt {
     Break,
     Continue,
     Throw(Expr, usize),
-    /// A `try { … } catch (e:T) { … }` block. Hatchet does not transpile exception
-    /// handling yet; the structure is parsed (so the validation pass can flag it as
-    /// `Unsupported` with a location, and so a future lowering has the AST it needs)
-    /// but no C++ is emitted for it.
+    /// A `try { … } catch (e:T) { … }` block, lowered to C++ `try`/`catch` (a
+    /// typed catch maps the exception type; an untyped/`Dynamic` catch becomes the
+    /// non-binding `catch (...)`).
     Try { body: Box<Stmt>, catches: Vec<Catch>, line: usize },
     Block(Vec<Stmt>),
     /// Verbatim C++ injected at this point in the body, from `@:cppFileCode('...')`
@@ -301,6 +303,10 @@ pub struct Param {
     pub ty: Option<Type>,
     pub optional: bool,
     pub default: Option<Expr>,
+    /// A Haxe 4.2 rest parameter (`...vals:Int`). Parsed so the validation pass
+    /// can flag it as `Unsupported` (varargs have no C++98 lowering here) instead
+    /// of dying with a parse error.
+    pub rest: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -319,6 +325,10 @@ pub struct FnModifiers {
 pub struct Function {
     /// `None` for the constructor (`new`).
     pub name: Option<String>,
+    /// Generic parameters of a generic method/function (`function first<T>(…)`).
+    /// Hatchet has no template lowering, so a non-empty list is flagged as
+    /// `Unsupported` by the validation pass.
+    pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub ret: Option<Type>,
     pub body: Option<Vec<Stmt>>,
@@ -343,6 +353,11 @@ pub struct Field {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Class {
     pub name: String,
+    /// Source line (1-based) of the `class` keyword, for diagnostics. `0` when
+    /// synthesized rather than parsed.
+    pub line: usize,
+    /// Generic parameters (`class Box<T>`). Hatchet has no template lowering, so a
+    /// non-empty list is flagged as `Unsupported` by the validation pass.
     pub type_params: Vec<String>,
     pub extends: Option<Type>,
     pub implements: Vec<Type>,
@@ -358,6 +373,11 @@ pub struct Class {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Interface {
     pub name: String,
+    /// Source line (1-based) of the `interface` keyword, for diagnostics. `0`
+    /// when synthesized rather than parsed.
+    pub line: usize,
+    /// Generic parameters (`interface I<T>`). Hatchet has no template lowering, so
+    /// a non-empty list is flagged as `Unsupported` by the validation pass.
     pub type_params: Vec<String>,
     pub extends: Vec<Type>,
     pub meta: Vec<Meta>,
@@ -385,6 +405,16 @@ pub struct Enum {
     /// An integral backing lowers to a C++ `enum`; a `String`/`Float` backing
     /// lowers to a `namespace X_ { static const T … }` of typed constants.
     pub underlying: Option<Type>,
+}
+
+impl Enum {
+    /// Whether this is an algebraic enum — a plain `enum` with at least one
+    /// parameterized variant (`Add(a:Int, b:Int)`). ADTs lower to a tagged value
+    /// class (tag + per-variant payload fields + static factory functions)
+    /// instead of a bare C++ enum.
+    pub fn is_adt(&self) -> bool {
+        self.underlying.is_none() && self.variants.iter().any(|v| !v.params.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

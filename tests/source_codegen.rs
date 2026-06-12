@@ -175,10 +175,10 @@ class Atlas {
     let _ = std::fs::remove_dir_all(&dir);
 
     // Scalar final → static const (not a #define); struct finals → aggregate const.
-    assert!(out.contains("static const float SCALE = 2.0f;"), "scalar final → static const:\n{out}");
+    assert!(out.contains("static const double SCALE = 2.0;"), "scalar final → static const:\n{out}");
     assert!(!out.contains("#define SCALE"), "scalar final must not be a #define:\n{out}");
-    assert!(out.contains("static const Coord ORIGIN = { 0.0f, 0.0f };"), "struct final → aggregate const:\n{out}");
-    assert!(out.contains("static const Coord CORNER = { 16.0f, 32.0f };"), "struct final aggregate in field order:\n{out}");
+    assert!(out.contains("static const Coord ORIGIN = { 0.0, 0.0 };"), "struct final → aggregate const:\n{out}");
+    assert!(out.contains("static const Coord CORNER = { 16.0, 32.0 };"), "struct final aggregate in field order:\n{out}");
     // Array final → builder helper + const vector object (stays a vector).
     assert!(out.contains("_init_TABLE() {"), "array final → builder helper:\n{out}");
     assert!(out.contains("v;") && out.contains("v.push_back(ORIGIN);") && out.contains("v.push_back(CORNER);"), "builder declares v and push_backs elements:\n{out}");
@@ -768,7 +768,7 @@ class M {}
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
-        body.contains("float Cross(const Vec& a, const Vec& b)"),
+        body.contains("double Cross(const Vec& a, const Vec& b)"),
         "untyped arrow params take their type from the function annotation:\n{body}"
     );
     assert!(!body.contains("int a"), "params must not default to int:\n{body}");
@@ -1254,19 +1254,19 @@ class M {
     let _ = std::fs::remove_dir_all(&dir);
 
     for needle in [
-        "sin(1.0f)",
-        "pow(2.0f, 8.0f)",
-        "atan2(1.0f, 2.0f)",
-        "floor(2.7f)",                       // Math.ffloor → float floor
-        "((int)floor(2.7f))",                // Math.floor → int
-        "((int)floor((2.5f) + 0.5))",        // Math.round → int
+        "sin(1.0)",
+        "pow(2.0, 8.0)",
+        "atan2(1.0, 2.0)",
+        "floor(2.7)",                        // Math.ffloor → Float (double) floor
+        "((int)floor(2.7))",                // Math.floor → int
+        "((int)floor((2.5) + 0.5))",        // Math.round → int
         "(rand() / (RAND_MAX + 1.0))",       // Math.random ∈ [0,1)
-        "((float) 3.141592653589793)",       // Math.PI literal (no M_PI)
+        "3.141592653589793",                 // Math.PI literal (no M_PI), double precision
     ] {
         assert!(out.contains(needle), "missing `{needle}` in:\n{out}");
     }
     // min is NaN-propagating inline (no helper), and no shim names leak in.
-    assert!(out.contains("== (1.0f) ? (2.0f) : (1.0f)"), "min NaN-aware inline:\n{out}");
+    assert!(out.contains("== (1.0) ? (2.0) : (1.0)"), "min NaN-aware inline:\n{out}");
     assert!(!out.contains("haxe_min") && !out.contains("haxe_"), "no helper shims:\n{out}");
 }
 
@@ -1309,7 +1309,7 @@ class S {
     // parseInt (hex-aware) and parseFloat — a bare string literal is a const char*,
     // so no invalid `.c_str()` is appended.
     assert!(out.contains("(int)strtol(\"0x1F\", NULL, 0)"), "Std.parseInt → strtol base 0:\n{out}");
-    assert!(out.contains("(float)atof(\"3.14\")"), "Std.parseFloat → atof:\n{out}");
+    assert!(out.contains("atof(\"3.14\")"), "Std.parseFloat → atof:\n{out}");
     assert!(!out.contains("\".c_str()") && !out.contains("\"0x1F\".c_str()"),
         "no .c_str() on a string literal:\n{out}");
     // No custom runtime helpers.
@@ -1636,4 +1636,358 @@ fn untyped_catch_ignoring_its_value_is_a_plain_catch_all() {
         "Tci",
     );
     assert!(out.contains("catch (...)"), "untyped catch ignoring the value → catch(...):\n{out}");
+}
+
+#[test]
+fn unsigned_shift_lowers_through_an_unsigned_cast() {
+    // Haxe `>>>` (and `>>>=`) have no C++ spelling — both shift through
+    // `unsigned int` and come back to `int`, matching Haxe's 32-bit semantics.
+    let src = "\
+class Bits {
+  public function new() {}
+  public function run(a:Int, n:Int):Int {
+    var x:Int = a >>> n;
+    x >>>= 1;
+    return x >> 1;
+  }
+}
+";
+    let out = gen_one(src, "Bits");
+    assert!(
+        out.contains("((int)((unsigned int)(a) >> n))"),
+        "`>>>` must shift through unsigned int:\n{out}"
+    );
+    assert!(
+        out.contains("x = (int)((unsigned int)(x) >> 1)"),
+        "`>>>=` must expand through unsigned int:\n{out}"
+    );
+    assert!(out.contains("x >> 1"), "plain `>>` stays a signed shift:\n{out}");
+}
+
+#[test]
+fn int_division_yields_float() {
+    // Haxe `/` always yields Float, even for Int operands; C++ `/` would
+    // truncate. Known-integer operands force a double division, and
+    // `Std.int(a / b)` still truncates back, matching Haxe.
+    let src = "\
+class Ratio {
+  public function new() {}
+  public function half(a:Int, b:Int):Float {
+    return a / b;
+  }
+  public function idiv(a:Int, b:Int):Int {
+    return Std.int(a / b);
+  }
+  public function fdiv(a:Float, b:Float):Float {
+    return a / b;
+  }
+}
+";
+    let out = gen_one(src, "Ratio");
+    assert!(
+        out.contains("((double)(a) / b)"),
+        "Int / Int must divide as double:\n{out}"
+    );
+    assert!(
+        out.contains("(int)(((double)(a) / b))"),
+        "Std.int(a / b) must truncate the double division:\n{out}"
+    );
+    assert!(
+        out.contains("return a / b;"),
+        "Float / Float stays a plain division:\n{out}"
+    );
+}
+
+#[test]
+fn float_modulo_lowers_to_fmod() {
+    // Haxe `%` works on Floats; C++ `%` is integer-only, so a float operand
+    // lowers to `fmod` (C89 <math.h>, portable to VC6). Int % Int stays `%`.
+    let src = "\
+class Wrap {
+  public function new() {}
+  public function angle(a:Float, b:Float):Float {
+    var r:Float = a % b;
+    r %= 1.5;
+    return r;
+  }
+  public function parity(a:Int, b:Int):Int {
+    return a % b;
+  }
+}
+";
+    let out = gen_one(src, "Wrap");
+    assert!(out.contains("fmod(a, b)"), "Float % Float must lower to fmod:\n{out}");
+    assert!(out.contains("r = fmod(r, 1.5)"), "`%=` with a float target must lower to fmod:\n{out}");
+    assert!(out.contains("return a % b;"), "Int % Int stays the plain operator:\n{out}");
+}
+
+#[test]
+fn switch_wildcard_and_or_patterns_lower() {
+    // `case _:` is Haxe's wildcard — it lowers to C++ `default:` (never a literal
+    // `case _:` label). In pattern position `|` is the or-pattern (patterns are
+    // not evaluated), so `case 1 | 2:` yields two case labels, like `case 1, 2:`.
+    let src = "\
+class SwWild {
+  public function new() {}
+  public function describe(n:Int):String {
+    switch (n) {
+      case 0: return \"zero\";
+      case 1 | 2: return \"few\";
+      case _: return \"many\";
+    }
+  }
+}
+";
+    let out = gen_one(src, "SwWild");
+    assert!(!out.contains("case _"), "`case _:` must not leak as a C++ label:\n{out}");
+    assert!(out.contains("default:"), "`case _:` lowers to default:\n{out}");
+    assert!(
+        out.contains("case 1:") && out.contains("case 2:") && !out.contains("case 1 | 2"),
+        "`case 1 | 2:` is the or-pattern, two labels — not a bitwise OR:\n{out}"
+    );
+}
+
+#[test]
+fn math_nan_is_a_portable_double_nan() {
+    let src = "\
+class N {
+  public function new() {}
+  public function nan():Float { return Math.NaN; }
+}
+";
+    let out = gen_one(src, "N");
+    assert!(
+        out.contains("(HUGE_VAL - HUGE_VAL)"),
+        "Math.NaN → inf - inf (portable C++98 NaN):\n{out}"
+    );
+}
+
+#[test]
+fn custom_getter_routing_breaks_recursion_and_bypasses_writes() {
+    // Reads of a `(get, null)` property route through `get_x()` — except inside
+    // `get_x` itself (else infinite recursion) — and assignment targets are
+    // direct physical stores (`null` write access within the class).
+    let src = "\
+class Counter {
+  public var count(get, null):Int;
+  public function new() { count = 0; }
+  function get_count():Int {
+    return count;
+  }
+  public function bump():Void {
+    count = count + 1;
+  }
+  public function peek(other:Counter):Int {
+    return other.count;
+  }
+}
+";
+    let out = gen_one(src, "Counter");
+    // inside get_count: direct backing-field read, no self-call
+    assert!(
+        out.contains("\treturn this->count;"),
+        "get_count reads its backing field directly:\n{out}"
+    );
+    // bump: write target direct, read side routed through the getter
+    assert!(
+        out.contains("this->count = this->get_count() + 1;"),
+        "write is a direct store, read routes through get_count():\n{out}"
+    );
+    // external read routes through the getter
+    assert!(
+        out.contains("other->get_count()"),
+        "external read routes through get_count():\n{out}"
+    );
+}
+
+#[test]
+fn custom_setter_routes_all_writes() {
+    // A `(default, set)` property with a user-written `set_x`: real Haxe
+    // semantics — ctor writes, plain writes, compound writes and `++` all route
+    // through `set_x`; inside `set_x` itself the store is direct.
+    let src = "\
+class Gauge {
+  public var level(default, set):Int;
+  public function new() { level = 50; }
+  function set_level(v:Int):Int {
+    level = v < 0 ? 0 : (v > 100 ? 100 : v);
+    return level;
+  }
+  public function adjust():Void {
+    level = 250;
+    level += 10;
+    level++;
+  }
+  public function tune(other:Gauge):Void {
+    other.level = 1;
+    other.level += 2;
+  }
+}
+";
+    let out = gen_one(src, "Gauge");
+    assert!(out.contains("this->set_level(50)"), "ctor write routes:\n{out}");
+    assert!(out.contains("this->set_level(250)"), "internal write routes:\n{out}");
+    assert!(
+        out.contains("this->set_level(this->level + 10)"),
+        "compound write desugars through the setter:\n{out}"
+    );
+    assert!(
+        out.contains("this->set_level(this->level + 1)"),
+        "`++` desugars through the setter:\n{out}"
+    );
+    assert!(
+        out.contains("this->level = v < 0 ? 0 : (v > 100 ? 100 : v);"),
+        "inside set_level the store is direct:\n{out}"
+    );
+    assert!(out.contains("other->set_level(1)"), "external write routes:\n{out}");
+    assert!(
+        out.contains("other->set_level(other->GetLevel() + 2)"),
+        "external compound reads via the getter, writes via the setter:\n{out}"
+    );
+    assert!(!out.contains("SetLevel"), "no trivial setter generated when set_level exists:\n{out}");
+}
+
+#[test]
+fn custom_setter_fields_follow_the_conservative_ownership_bias() {
+    // A Haxe setter returns the assigned value (`return buf;`), which the escape
+    // analysis reads as the field being handed back out of the object — so a
+    // custom-setter field leans *borrowed*: never freed on reassignment, never
+    // NULL-deleted behind the caller's back (leak over double-free, the
+    // documented bias; `@owned` opts the destructor in). What must hold: all
+    // writes route through `set_buf`, and no `delete` is emitted anywhere a
+    // routed caller could double-free.
+    let src = "\
+class Thing {
+  public var id:Int;
+  public function new(id:Int) { this.id = id; }
+}
+
+class Pool {
+  public var buf(default, set):Thing;
+  public function new() { buf = new Thing(0); }
+  function set_buf(v:Thing):Thing {
+    buf = new Thing(v.id + 1);
+    return buf;
+  }
+  public function bump():Void {
+    buf = new Thing(5);
+  }
+}
+";
+    let out = gen_one(src, "Pool");
+    assert!(out.contains("this->set_buf(new Thing(0))"), "ctor write routes:\n{out}");
+    assert!(out.contains("this->set_buf(new Thing(5))"), "bump write routes:\n{out}");
+    assert!(
+        out.contains("this->buf = new Thing(v->id + 1);"),
+        "inside set_buf the store is direct:\n{out}"
+    );
+    assert!(
+        !out.contains("delete this->buf"),
+        "no caller-side delete may race the setter funnel:\n{out}"
+    );
+}
+#[test]
+fn float32_lowers_to_c_float_and_setter_return_type_is_inferred() {
+    // `cpp.Float32` / `Single` target genuine C++ `float` (Haxe `Float` is
+    // `double`), and a custom accessor whose signature omits its return type
+    // (`function set_x(x:Float) { return this.x = x; }`) returns the property's
+    // type — defaulting to void would emit a value `return` from a void function.
+    let src = "\
+class Particle {
+  public var x(default, set):Float;
+  public var vx:cpp.Float32;
+  public var mass:Single;
+  public function new() {
+    x = 0.0;
+    vx = 1.5;
+    mass = 1.0;
+  }
+  public function set_x(x:Float) {
+    return this.x = x;
+  }
+  public function step(dt:cpp.Float32):Float {
+    x += vx * dt;
+    return x;
+  }
+}
+";
+    let out = gen_one(src, "Particle");
+    assert!(
+        out.contains("double Particle::set_x(double x)"),
+        "omitted accessor return type is the property's type, not void:\n{out}"
+    );
+    assert!(
+        out.contains("return this->x = x;"),
+        "the `return this.x = x` setter shape lowers as a value return:\n{out}"
+    );
+    assert!(
+        out.contains("double Particle::step(float dt)"),
+        "cpp.Float32 parameter lowers to C++ float:\n{out}"
+    );
+    assert!(
+        out.contains("this->set_x(this->x + this->vx * dt)"),
+        "compound write still routes through the setter:\n{out}"
+    );
+}
+
+#[test]
+fn mutating_a_container_parameter_is_warned() {
+    // Haxe Arrays/Maps are shared by reference — mutating one inside a function
+    // is visible to the caller. Hatchet passes containers by value (`const&`),
+    // so a mutation through a parameter is linted at the Haxe line (ahead of
+    // the C++ const error). Reads, copies, fields, locals, and shadowing
+    // locals must stay silent.
+    let src = "\
+class MutWarn {
+  var roster:Array<Int>;
+  public function new() { roster = []; }
+  public function fill(items:Array<Int>, tags:Map<String,Int>):Void {
+    items.push(42);
+    items[0] = 7;
+    tags.set(\"a\", 1);
+    tags[\"b\"] = 2;
+  }
+  public function fine(items:Array<Int>):Int {
+    var copy = items.copy();
+    copy.push(42);
+    var n = items.indexOf(3);
+    roster.push(n);
+    for (i in items) n += i;
+    return n + copy.length;
+  }
+  public function shadowed(items:Array<Int>):Void {
+    var items = [9];
+    items.push(1);
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_mutwarn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("MutWarn.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("MutWarn"))
+        .unwrap();
+    let (_, warnings, _) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let expect = [
+        (5, "`push` mutates `items`, an Array parameter"),
+        (6, "`[i] = …` mutates `items`, an Array parameter"),
+        (7, "`set` mutates `tags`, a Map parameter"),
+        (8, "`[k] = …` mutates `tags`, a Map parameter"),
+    ];
+    for (line, needle) in expect {
+        assert!(
+            warnings.iter().any(|(l, w)| *l == line && w.contains(needle)),
+            "expected `{needle}` on line {line}, got: {warnings:?}"
+        );
+    }
+    assert_eq!(
+        warnings.len(),
+        expect.len(),
+        "reads/copies/fields/locals/shadowing must not warn: {warnings:?}"
+    );
 }

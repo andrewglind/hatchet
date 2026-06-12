@@ -24,15 +24,38 @@ to a running legacy binary. Hatchet has additionally been validated against a la
 
 Supported today, end to end:
 
-- **Declarations** — classes, interfaces (pure-virtual), enums (pre-C++11 `struct E_ { enum … }`),
+- **Declarations** — classes, interfaces (pure-virtual), enums (pre-C++11 `struct E_ { enum … }`;
+  a **parameterized enum** — `Add(a:Int, b:Int)` — lowers to the tagged-value idiom: the same tag
+  enum plus a copyable value class with per-variant payload fields and inline static factories,
+  `Op::Add(1, 2)`, so ADT values construct, pass, and store by value with no heap or union, plus
+  **structural `==`/`!=`** — same tag, equal payload, with pointer payloads compared by address
+  (Haxe compares enum values by constructor + arguments via `Type.enumEq`); a
+  *recursive* payload is flagged — a by-value class cannot contain itself),
   `enum abstract` (an `Int` backing reuses the enum idiom with explicit member values, including
   sibling-referencing bit-flag expressions like `AB = A | B`; a `String`/`Float` backing becomes a
   namespace of typed `static const` constants, `namespace X_ { static const std::string A = "…"; }`,
   with the type mapping straight to its underlying C++ type), typedef structs and aliases, the
   fixed-width `UInt8/16/32` shims, and `@:native` interop wiring (which emits no code of its own,
   only the includes it contributes).
-- **Members & access** — `(default,set)` / `(default,null)` property accessors (`GetX`/`SetX`, with
-  the value-vs-pointer `const` rule), `@:protected`, `@:readOnly` (const-return), `@:decl` (DLL-export
+- **Members & access** — property accessors: every pair of `default`/`null`/`never` (pure access
+  control — lowered to direct field access, with C++ `private` approximating the Haxe rule, e.g.
+  `(default,null)`'s backing field is private behind a generated `GetX`); **custom accessors with
+  real Haxe routing** — a user-written `get_x`/`set_x` is emitted as a real method and **every
+  access routes through it**, external and internal alike, except inside the property's own
+  accessors (Haxe's recursion rule): reads become `get_x()`, writes become `set_x(v)` —
+  including constructor writes, and compound writes/`++`/`--`, which desugar exactly as Haxe does
+  (`x += v` → `set_x(read + v)`, with a side-effecting receiver hoisted so it evaluates once); an
+  accessor whose signature omits its return type gets the property's type, as Haxe infers it
+  (so `function set_x(x:Float) { return this.x = x; }` is a `double`-returning function, not a
+  value `return` from void);
+  per Haxe physicality, a non-`@:isVar` `(get,never)` emits no backing field at all. A `set`
+  property *without* a `set_x` keeps the Hatchet dialect: an auto-generated trivial `SetX` (with
+  the value-vs-pointer `const` rule) and direct internal writes. For owned pointer fields behind a
+  custom setter, the setter's direct store is the single delete-before-overwrite site (routed
+  callers never also free), and a setter that `return`s the field reads to the escape analysis as
+  the value being handed out — the field then leans borrowed (leak over double-free, the standard
+  bias; `@owned` opts the destructor in). `(get, default)` and `dynamic` access remain flagged as
+  unsupported. Also `@:protected`, `@:readOnly` (const-return), `@:decl` (DLL-export
   class), `@:overload(...)` (a call is resolved to the matching C++ overload by argument type, else a
   hard error), `extern inline` (`extern "C"` export via a portable macro), `abstract class` and
   `abstract function` (an abstract method becomes a pure virtual `virtual T f() = 0;`, declared and
@@ -45,7 +68,10 @@ Supported today, end to end:
   `contains`/`remove`/`reverse`/`concat`/`slice`/`copy`/`join`/`filter`/`sort` (the last two take a
   lambda: `filter` builds a kept-elements vector, `sort` is an in-place insertion sort driven by the
   comparator) and Map `get`/`exists`/`set`/`remove`/`keys` (each an inline loop/expression, no
-  `<algorithm>` dependency); Haxe's **auto-extending array
+  `<algorithm>` dependency); containers are **value types** in the generated C++ — Haxe's are
+  shared by reference, and mutating an `Array`/`Map` *parameter* is linted at the Haxe line (see
+  **Container semantics** below for the full divergence and the idiomatic patterns); Haxe's
+  **auto-extending array
   writes** — `a[i] = v` past the end grows
   the vector first (an inline `resize`), matching Haxe rather than letting C++ `operator[]` run off
   the end; `for` over a range, an array, an anonymous array literal
@@ -66,7 +92,20 @@ Supported today, end to end:
   NULL-guarded `?.`; `cast` (C-style cast for `cast(expr, T)`, passthrough for `cast expr`); the
   `(expr : Type)` type ascription (a compile-time hint that drives inference, e.g. `([] : Array<Int>)`);
   `switch` (on an integer/enum subject → a C++ `switch`; on a `String` subject → an `if`/`else if`
-  chain, since C++ case labels must be integral) and its enum constants — including a `switch` used
+  chain, since C++ case labels must be integral) with **constant patterns** — literals, negated
+  numeric literals, and enum constants (bare or `EnumType.Member`-qualified), with the wildcard
+  `case _:` lowering to `default:`, comma alternatives (`case A, B:`), and the or-pattern
+  (`case 1 | 2:` — in pattern position `|` means *or*, exactly as in Haxe, and lowers to two case
+  labels), and **destructuring of parameterized enums** — `case Add(a, b):` switches on the tag and
+  binds one typed local per non-`_` capture from the variant's payload fields, with a
+  side-effecting subject hoisted so it evaluates once (a destructuring pattern must be its case's
+  only alternative, payload positions take only plain captures or `_`, and a bare capture pattern
+  `case x:` stays flagged rather than emitted as a broken label). **Haxe's `break` semantics are
+  preserved**: Haxe `switch` has no break of its own, so a `break` in a case body exits the
+  enclosing *loop* — inside a generated C++ `switch` it routes through a hoisted flag checked
+  after the switch (`f = true; break;` … `if (f) break;`), chaining through nested switches, while
+  a `break` in a loop nested *within* a case body stays bound to that inner loop (`continue`
+  needs no help — C++ gets it right natively) — including a `switch` used
   in **value position** (`var x = switch (e) { … }`), which desugars to a hidden temporary assigned
   inside a statement `switch`; `trace(...)` (with `--no-traces` to strip it); `throw` / `try` / `catch`
   exception handling (a thrown `String` is coerced to `std::string`; a typed `catch (e:T)` maps the
@@ -76,14 +115,25 @@ Supported today, end to end:
   `Sys` intrinsics (`Std.int`/`Std.string`/`Std.parseInt`/`Std.parseFloat`/`Std.random` → inline
   `(int)`/`sprintf`/`strtol`/`atof`/`rand()`).
 - **Conditional compilation & escape hatches** — Haxe `#if FLAG` / `#elseif FLAG` / `#else` / `#end`
-  map to the C++ preprocessor (`#ifdef` / `#elif defined(FLAG)` / `#else` / `#endif`); `untyped
+  map to the C++ preprocessor (`#ifdef` / `#elif defined(FLAG)` / `#else` / `#endif`), and **boolean
+  conditions over flags** map each flag through `defined(…)` (`#if (DREAMCAST && !DEBUG)` →
+  `#if (defined(DREAMCAST) && !defined(DEBUG))`; version comparisons like `haxe_ver >= 4` have no
+  `defined(…)` mapping and stay a hard error); `untyped
   <expr>` passes an expression through to C++
   verbatim; a statement-level `@:include("…")` emits an `#include` at that point; and
   `@:cppFileCode('…')` injects verbatim C++ in a body.
-- **Types & nullability** — `Null<T>` and optional value-structs lower uniformly to `T*` (with
-  matching heap-allocation at call sites); `Map.get(k)` lowers to an iterator with an existence
-  check; `final` constants lower to namespace-scoped `static const` (no `#define`), namespace-
-  qualified across boundaries.
+- **Types & nullability** — `Float` lowers to C++ `double` (64-bit, matching Haxe's `Float` on every
+  official target — never `float`, which would silently halve the precision); genuine
+  single-precision is available as `Single` or hxcpp's `cpp.Float32` → C++ `float` (and
+  `cpp.Float64` → `double`), and Haxe's division
+  semantics are preserved: `/` always yields `Float`, so two statically-known-integer operands divide
+  as `double` (`a / b` → `((double)(a) / b)`; `Std.int(a / b)` truncates back, as in Haxe); `%` with
+  a float operand lowers to `fmod` (C89 `<math.h>`, portable to VC6 — C++ `%` is integer-only); the
+  full shift set including the unsigned `>>>` / `>>>=` (no C++ spelling — lowered through an
+  `unsigned int` cast, `(int)((unsigned int)a >> b)`); `Null<T>` and optional value-structs lower
+  uniformly to `T*` (with matching heap-allocation at call sites); `Map.get(k)` lowers to an iterator
+  with an existence check; `final` constants lower to namespace-scoped `static const` (no `#define`),
+  namespace-qualified across boundaries.
 - **Memory ownership** — a whole-program **escape/ownership analysis** decides what each class frees,
   erring toward a leak (safe) over a double-free: destructors free what a class `new`ed (and the typed
   pointer handed to a base's `void*` field); short-lived heap locals are freed at scope close, and
@@ -108,6 +158,59 @@ Supported today, end to end:
 Hatchet **fails loudly rather than guessing** — an unresolvable type or an unsupported idiom is a
 hard error that skips that module and fails the run (see *Diagnostics*) — and it **always generates
 the `StdAfx.h` prelude**, so a standalone project compiles with no boilerplate.
+
+## Container semantics: `Array` and `Map` are value types
+
+This is Hatchet's **largest deliberate divergence from Haxe**, so it gets its own section. In Haxe,
+`Array` and `Map` are objects — every binding is a *reference* to one shared container, so a
+mutation made through any of them is visible through all of them. Hatchet lowers them to
+`std::vector` / `std::map` **by value**: assignment and parameter passing **copy** the container.
+There is no shared-container runtime to lean on (that is the point of targeting bare C++98), so the
+divergence shows up in four places:
+
+1. **Parameters.** Containers are passed `const&`. Mutating a parameter (`items.push(x)`,
+   `items[i] = v`, `tags.set(k, v)`, `tags.remove(k)`, in-place `sort`/`reverse`/…) is the
+   classic Haxe idiom for filling a caller's list — and it is exactly what the value lowering
+   cannot express. Hatchet **lints every such mutation** at the Haxe line, ahead of the C++
+   `const` error:
+
+   ```text
+   warning: World.hx:31: fill: `push` mutates `items`, an Array parameter — Haxe containers
+   are shared by reference (the caller would see this change), but Hatchet passes containers
+   by value (`const&`), so the mutation is lost and the generated C++ will not compile; …
+   ```
+
+2. **Local aliases.** `var b = a; b.push(x);` copies in Hatchet — `a` is unchanged, where Haxe
+   would mutate the one shared array. This is *not* linted (a local working copy is usually the
+   intent in retro-target code, and Hatchet's `copy()`-free spelling of it is idiomatic here);
+   write `var b = a.copy();` if you want the copy to be visible in the Haxe semantics too.
+
+3. **Fields.** `this.items = items;` stores a copy into the field, where Haxe would store a
+   reference to the caller's container. Later mutations of the field are the class's own; later
+   mutations of the original do not reach the field.
+
+4. **Returns.** Returning a container returns a copy. Mutating a returned container does not
+   affect the one the function read from.
+
+The idiomatic Hatchet patterns, in preference order:
+
+- **Hold the container in a class and pass the object.** Classes *are* reference types (objects
+  are pointers), so a `Roster` class owning an `Array<Unit>` gives you Haxe-style shared mutation
+  through the object — `squad.add(u)` works from anywhere, one container, no copies:
+
+  ```haxe
+  class Roster {
+      public var units(default, null):Array<Unit>;
+      public function new() { units = []; }
+      public function add(u:Unit):Void { units.push(u); }
+  }
+  ```
+
+- **Return the result** instead of mutating an argument: `function doubled(xs:Array<Int>):Array<Int>`.
+- **Mutate a local copy** when a working copy is genuinely what you want.
+
+A future evolution may pass mutated container parameters by non-const reference (restoring Haxe
+semantics at the parameter boundary); until then, the lint is the contract.
 
 ## Requirements
 
@@ -211,9 +314,21 @@ This distinguishes "your input is wrong" (fix the Haxe) from "Hatchet doesn't do
 PR). Currently flagged as unsupported: a **lambda** used outside a top-level `final` binding or an
 `Array.map(...)` argument; **Haxe macros** (a `macro` function, or the macro AST type `Expr`);
 **regular expressions** (both the `~/pattern/flags` literal and the `EReg` type); **`using` static
-extensions**; **parameterized enum variants** (a variant with constructor parameters, e.g.
-`Move(dx:Int, dy:Int)`, which would need a tagged-union lowering); the **`is`** runtime type-check
-operator (Haxe 4.2); and ordinary **`abstract` types** (the `abstract X(T)` newtype form — distinct
+extensions**; **function types as values** (`var cb:Int->Int` in a field, parameter, return, or
+typedef — first-class function values have no C++98 lowering; the one lowered position is a
+top-level `final` lambda binding, which becomes a free function); **rest parameters**
+(`...vals:Int` and the `haxe.Rest` type, Haxe 4.2 varargs); **recursive enum payloads**
+(`Node(child:Tree)` — a by-value tagged class cannot contain itself); the **`is`** runtime type-check
+operator (Haxe 4.2); **generics** (a type-parameterized `class Box<T>`, `interface I<T>`,
+`enum Tree<T>`, generic method `first<T>(…)`, or `typedef Pair<T>` — type parameters have no C++98
+template lowering, so each is flagged rather than emitted with `T` as a bare unknown type);
+**non-constant `switch` patterns** (a capture `case x:`, a literal or nested payload sub-pattern in
+`case Add(0, b):`, or a destructuring pattern combined with other alternatives in one case);
+**`(get, default)` properties and `dynamic`
+access** (every other accessor pair is lowered — see *Members & access* above — and a stray
+`get_x`/`set_x` whose field does not declare the matching access kind is flagged rather than
+silently dropped); and ordinary **`abstract` types** (the
+`abstract X(T)` newtype form — distinct
 from `enum abstract`, which *is* supported, and from an `abstract class`, also supported). These are
 parsed but not transpiled, so they are reported with a clean diagnostic rather than a parse error.
 Relatedly, a `for` loop over anything other than a range,

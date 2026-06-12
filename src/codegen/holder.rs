@@ -30,7 +30,7 @@ pub(crate) struct Holder<'a> {
     pub base_list: String,
     /// Index of the `super(...)` statement within the constructor body.
     pub super_idx: usize,
-    /// Member declarations for the struct, e.g. `["float scaledX;", ...]`.
+    /// Member declarations for the struct, e.g. `["double scaledX;", ...]`.
     pub member_decls: Vec<String>,
     /// Names of pre-`super` locals that are stored as members (assigned via
     /// `this->name = ...` instead of being declared as locals).

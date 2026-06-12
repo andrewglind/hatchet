@@ -202,6 +202,11 @@ impl<'a> HeaderGen<'a> {
                 return self.emit_enum_abstract(e, u, ind);
             }
         }
+        // An algebraic enum (parameterized variants) lowers to a tagged value
+        // class instead of a bare C++ enum.
+        if e.is_adt() {
+            return self.emit_enum_adt(e, ind);
+        }
         let t = tabs(ind);
         let mut s = String::new();
         let _ = writeln!(s, "{t}struct {}_ {{", e.name);
@@ -221,6 +226,106 @@ impl<'a> HeaderGen<'a> {
         let _ = writeln!(s, "{t}\t}};");
         let _ = writeln!(s, "{t}}};");
         let _ = writeln!(s, "{t}typedef {}_::Enum {};", e.name, e.name);
+        s
+    }
+
+    /// An algebraic enum (`enum Op { Halt; Add(a:Int, b:Int); }`) → the C++98
+    /// tagged-value idiom: the usual tag enum (`struct Op_ { enum Enum { … } };`,
+    /// so `case` labels keep the `Op_::Add` spelling shared with plain enums)
+    /// plus a copyable value class named after the enum, holding the tag and one
+    /// set of payload fields per parameterized variant (`int Add_a;` — a plain
+    /// struct, not a union, which C++98 would forbid for non-POD payloads like
+    /// `std::string`), with an inline static factory per variant
+    /// (`Op::Add(1, 2)`) so construction reads like the Haxe. Values are passed
+    /// and stored **by value** (like every other Haxe enum here): payload
+    /// pointers are borrowed, never owned. A *recursive* payload (`Node(next:Op)`)
+    /// would need an indirection C++ cannot express by value — the C++ compiler
+    /// rejects the incomplete-type member, which is the loud backstop.
+    fn emit_enum_adt(&self, e: &Enum, ind: usize) -> String {
+        let t = tabs(ind);
+        let mut s = String::new();
+        // tag (identical to the plain-enum emission, minus the typedef — the
+        // value class below takes the enum's name)
+        let _ = writeln!(s, "{t}struct {}_ {{", e.name);
+        let _ = writeln!(s, "{t}\tenum Enum {{");
+        let names: Vec<String> =
+            e.variants.iter().map(|v| format!("{t}\t\t{}", v.name)).collect();
+        s.push_str(&names.join(",\n"));
+        s.push('\n');
+        let _ = writeln!(s, "{t}\t}};");
+        let _ = writeln!(s, "{t}}};");
+        // value class: tag + per-variant payload fields + inline static factories
+        let _ = writeln!(s, "{t}class {} {{", e.name);
+        let _ = writeln!(s, "{t}public:");
+        let _ = writeln!(s, "{t}\t{}_::Enum kind;", e.name);
+        for v in &e.variants {
+            for p in &v.params {
+                let cpp = p
+                    .ty
+                    .as_ref()
+                    .map(|ty| self.prog.map_type_use(ty, self.mi, &self.ns))
+                    .unwrap_or_else(|| "int".to_string());
+                let _ = writeln!(s, "{t}\t{cpp} {}_{};", v.name, p.name);
+            }
+        }
+        for v in &e.variants {
+            let params: Vec<String> = v
+                .params
+                .iter()
+                .map(|p| {
+                    let cpp = p
+                        .ty
+                        .as_ref()
+                        .map(|ty| self.prog.map_type_use(ty, self.mi, &self.ns))
+                        .unwrap_or_else(|| "int".to_string());
+                    format!("{cpp} {}", p.name)
+                })
+                .collect();
+            let mut body = format!("{} e; e.kind = {}_::{};", e.name, e.name, v.name);
+            for p in &v.params {
+                body.push_str(&format!(" e.{}_{n} = {n};", v.name, n = p.name));
+            }
+            let _ = writeln!(
+                s,
+                "{t}\tstatic {} {}({}) {{ {body} return e; }}",
+                e.name,
+                v.name,
+                params.join(", ")
+            );
+        }
+        // Structural equality: same tag, equal payload (Haxe compares enum
+        // values by constructor + arguments via `Type.enumEq`; with a by-value
+        // lowering this is the only meaningful `==` — pointer payloads compare
+        // by address, preserving the reference flavour where it matters). An
+        // if-chain rather than a switch, so every path visibly returns (no
+        // C4715-style warnings on old compilers).
+        let _ = writeln!(s, "{t}\tbool operator==(const {}& o) const {{", e.name);
+        let _ = writeln!(s, "{t}\t\tif (kind != o.kind) return false;");
+        for v in &e.variants {
+            if v.params.is_empty() {
+                continue;
+            }
+            let cmp: Vec<String> = v
+                .params
+                .iter()
+                .map(|p| format!("{v}_{p} == o.{v}_{p}", v = v.name, p = p.name))
+                .collect();
+            let _ = writeln!(
+                s,
+                "{t}\t\tif (kind == {}_::{}) return {};",
+                e.name,
+                v.name,
+                cmp.join(" && ")
+            );
+        }
+        let _ = writeln!(s, "{t}\t\treturn true;");
+        let _ = writeln!(s, "{t}\t}}");
+        let _ = writeln!(
+            s,
+            "{t}\tbool operator!=(const {}& o) const {{ return !(*this == o); }}",
+            e.name
+        );
+        let _ = writeln!(s, "{t}}};");
         s
     }
 
@@ -317,13 +422,20 @@ impl<'a> HeaderGen<'a> {
             .map(|p| p.name.clone())
             .collect();
 
-        // Property-accessor methods (`get_x`/`set_x`) are represented by the
-        // generated getters/setters, not emitted as ordinary methods.
+        // Property-accessor methods replaced by *generated* getters/setters are
+        // suppressed from the ordinary method list. A custom accessor — the
+        // user's `get_x` for `(get, …)`, or a user-written `set_x` for a `set`
+        // property — is the opposite: it IS the implementation, declared and
+        // emitted like any other method.
         let mut accessor_methods: BTreeSet<String> = BTreeSet::new();
         for f in &c.fields {
             if has_accessor(f) {
-                accessor_methods.insert(format!("get_{}", f.name));
-                accessor_methods.insert(format!("set_{}", f.name));
+                if f.get != PropAccess::Get {
+                    accessor_methods.insert(format!("get_{}", f.name));
+                }
+                if !custom_setter(c, f) {
+                    accessor_methods.insert(format!("set_{}", f.name));
+                }
             }
         }
 
@@ -371,6 +483,15 @@ impl<'a> HeaderGen<'a> {
             if accessor_methods.contains(name) {
                 continue;
             }
+            // A custom accessor with an omitted return type returns the
+            // property's type in Haxe — never void.
+            let patched: Function;
+            let m = if m.ret.is_none() && accessor_ret_type(c, name).is_some() {
+                patched = Function { ret: accessor_ret_type(c, name), ..m.clone() };
+                &patched
+            } else {
+                m
+            };
             let sig = self.method_signature(m, false);
             // Haxe methods are virtual by default. Emit `virtual` when this method
             // either overrides a base (the derived side) or is itself overridden by
@@ -403,15 +524,30 @@ impl<'a> HeaderGen<'a> {
 
         // generated getters/setters (always public)
         for f in &c.fields {
-            if has_accessor(f) {
+            if generated_getter(f) || (f.set == PropAccess::Set && !custom_setter(c, f)) {
                 public.push_str(&self.emit_accessors(c, f, &nullable, ind));
             }
         }
 
-        // fields, grouped by access
+        // fields, grouped by access. A property's backing field is private when
+        // its writes are restricted (`null`/`never`) or routed (`set`) — the C++
+        // compiler then enforces the Haxe access rule — or when a custom getter
+        // backs it. A write-open property (`(null, default)`/`(never, default)`)
+        // stays a directly-writable field in its declared access group.
         for f in &c.fields {
+            // Haxe physicality: a `(get, never)` property without `@:isVar` is
+            // purely computed — it has no backing field at all (`(get, null)`
+            // keeps one: `null` write access is a physical store within the class).
+            if f.get == PropAccess::Get
+                && f.set == PropAccess::Never
+                && !has_meta(&f.meta, "isVar")
+            {
+                continue;
+            }
             let line = format!("{t}\t{} {};\n", self.field_type(c, f, &nullable), f.name);
-            if has_accessor(f) {
+            let private_backing =
+                has_accessor(f) && (f.set != PropAccess::Default || f.get == PropAccess::Get);
+            if private_backing {
                 private.push_str(&line); // backing field
             } else {
                 match f.access {
@@ -454,11 +590,13 @@ impl<'a> HeaderGen<'a> {
         let t = tabs(ind);
         let fty = self.field_type(_c, f, nullable);
         let is_ptr = fty.ends_with('*');
-        let getter = format!("Get{}", cap(&f.name));
-        let constness = if is_ptr { "" } else { "const " };
         let mut s = String::new();
-        let _ = writeln!(s, "{t}\t{constness}{fty} {getter}() {{ return {}; }}", f.name);
-        if f.set == PropAccess::Set {
+        if generated_getter(f) {
+            let getter = format!("Get{}", cap(&f.name));
+            let constness = if is_ptr { "" } else { "const " };
+            let _ = writeln!(s, "{t}\t{constness}{fty} {getter}() {{ return {}; }}", f.name);
+        }
+        if f.set == PropAccess::Set && !custom_setter(_c, f) {
             let setter = format!("Set{}", cap(&f.name));
             let _ = writeln!(
                 s,
@@ -518,7 +656,8 @@ impl<'a> HeaderGen<'a> {
         let ret_cpp = match ret {
             Some(t) => self.prog.map_type_use(t, self.mi, &self.ns),
             // A function-type annotation on the binding (`Sq:(Int,Int)->Int = …`)
-            // supplies the return type; else a `cast(…, T)` body; else `float`.
+            // supplies the return type; else a `cast(…, T)` body; else `double`
+            // (Haxe `Float`).
             None if matches!(&g.ty, Some(Type::Func { .. })) => {
                 let Some(Type::Func { ret, .. }) = &g.ty else { unreachable!() };
                 self.prog.map_type_use(ret, self.mi, &self.ns)
@@ -527,7 +666,7 @@ impl<'a> HeaderGen<'a> {
                 LambdaBody::Expr(Expr::Cast { ty: Some(t), .. }) => {
                     self.prog.map_type_use(t, self.mi, &self.ns)
                 }
-                _ => "float".to_string(),
+                _ => "double".to_string(),
             },
         };
         Some(format!("{ret_cpp} {}({})", g.name, self.params(params)))
@@ -670,7 +809,7 @@ fn param_default(prog: &Program, mi: usize, ns: &[String], p: &Param) -> String 
         }
     }
     match p.ty.as_ref().and_then(|t| t.base_name()) {
-        Some("Float") => "0.0f".to_string(),
+        Some("Float") => "0.0".to_string(),
         Some("Bool") => "false".to_string(),
         Some("String") => "\"\"".to_string(),
         _ => p
@@ -706,7 +845,7 @@ fn default_value(prog: &Program, mi: usize, ns: &[String], ty: &Type) -> Option<
         Some("Int") | Some("UInt") | Some("UInt8") | Some("UInt16") | Some("UInt32") => {
             Some("0".to_string())
         }
-        Some("Float") => Some("0.0f".to_string()),
+        Some("Float") => Some("0.0".to_string()),
         Some("Bool") => Some("false".to_string()),
         _ => enum_default(prog, mi, ns, ty),
     }
@@ -784,6 +923,14 @@ fn enum_default(prog: &Program, mi: usize, ns: &[String], ty: &Type) -> Option<S
     } else {
         format!("{}::", tns.join("::"))
     };
+    // An ADT value defaults to its first variant via the factory — only
+    // meaningful when that variant carries no payload.
+    if e.is_adt() {
+        if !first.params.is_empty() {
+            return None;
+        }
+        return Some(format!("{prefix}{}::{}()", ti.cpp_name(), first.name));
+    }
     Some(format!("{prefix}{}_::{}", ti.cpp_name(), first.name))
 }
 
@@ -791,6 +938,39 @@ fn enum_default(prog: &Program, mi: usize, ns: &[String], ty: &Type) -> Option<S
 
 fn has_accessor(f: &Field) -> bool {
     f.get != PropAccess::Default || f.set != PropAccess::Default
+}
+
+/// Whether codegen synthesizes a trivial `GetX` for this property: reads are
+/// open (`default`) but the backing field is private because writes are
+/// restricted (`null`/`never`) or routed (`set`). A custom `(get, …)` accessor
+/// uses the user's `get_x` method instead; a read-restricted property
+/// (`(null, …)`/`(never, …)`) has no external reads to serve.
+fn generated_getter(f: &Field) -> bool {
+    f.get == PropAccess::Default && f.set != PropAccess::Default
+}
+
+/// Whether a `set`-access property has a user-written `set_x` (real Haxe
+/// semantics: every write routes through it). Without one, Hatchet's dialect
+/// generates the trivial `SetX` instead.
+fn custom_setter(c: &Class, f: &Field) -> bool {
+    f.set == PropAccess::Set
+        && c.methods.iter().any(|m| m.name.as_deref() == Some(&format!("set_{}", f.name)))
+}
+
+/// The return type Haxe infers for a property accessor whose signature omits
+/// it: `get_x` and `set_x` both return the property's type (the common shape
+/// `function set_x(v:T) { return this.x = v; }` relies on this — defaulting to
+/// `void` would emit a value `return` from a void C++ function). `None` when
+/// `method` is not an accessor of a matching declared property.
+pub(crate) fn accessor_ret_type(c: &Class, method: &str) -> Option<Type> {
+    let field = method.strip_prefix("get_").or_else(|| method.strip_prefix("set_"))?;
+    let f = c.fields.iter().find(|f| f.name == field)?;
+    let matches_kind = (method.starts_with("get_") && f.get == PropAccess::Get)
+        || (method.starts_with("set_") && f.set == PropAccess::Set);
+    if !matches_kind {
+        return None;
+    }
+    f.ty.clone()
 }
 
 fn tabs(n: usize) -> String {
@@ -829,13 +1009,11 @@ pub(crate) fn render_scalar_literal(e: &Expr) -> Option<String> {
     })
 }
 
-/// Ensure a Haxe float literal has a C++ `f` suffix (`50.0` → `50.0f`).
+/// A Haxe `Float` literal as C++. `Float` lowers to `double`, and an unsuffixed
+/// C++ floating literal *is* a `double` — emit it unchanged (an `f` suffix would
+/// truncate it to single precision).
 fn float_lit(s: &str) -> String {
-    if s.ends_with('f') || s.ends_with('F') {
-        s.to_string()
-    } else {
-        format!("{s}f")
-    }
+    s.to_string()
 }
 
 // Re-export for the driver: produce StdAfx output too.
