@@ -1,0 +1,5 @@
+# Generated transpiler output and built binaries — reproduce with the commands
+# in README.md.
+out/
+*.exe
+shapes

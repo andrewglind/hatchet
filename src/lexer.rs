@@ -21,8 +21,26 @@ pub enum TokKind {
     Str { raw: String, interpolated: bool },
     /// `@:name` or `@name` — the leading `@`/`@:` is stripped, name retained.
     Meta(String),
+    /// A regular-expression literal `~/pattern/flags` — the raw pattern and flag
+    /// letters, slashes stripped. Hatchet does not transpile regex (it is flagged
+    /// `Unsupported`), but it is lexed so the diagnostic is clean.
+    Regex { pattern: String, flags: String },
+    /// A Haxe conditional-compilation directive. Hatchet only targets C++, so
+    /// these are not used for *Haxe* conditional compilation; instead they are
+    /// repurposed as a clean front end for the C++ preprocessor (`#if FLAG` →
+    /// `#ifdef FLAG`, `#else`, `#end` → `#endif`). `If`/`ElseIf` carry the raw
+    /// condition text; `Else`/`End` carry an empty string.
+    Pp(PpKind, String),
     Sym(Sym),
     Eof,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PpKind {
+    If,
+    ElseIf,
+    Else,
+    End,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +71,7 @@ pub enum Sym {
     Amp, Pipe, Caret, Tilde, Shl, Shr,
     AmpEq, PipeEq, CaretEq, ShlEq, ShrEq,
     At,
+    Dollar,     // $ — only appears in Haxe macro reification, which is unsupported
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,11 +147,9 @@ impl<'a> Lexer<'a> {
             let start = self.i;
             let c = self.bytes[self.i];
             let kind = match c {
-                b'#' => {
-                    // Haxe conditional compilation (#if/#else/#end). Not used by the
-                    // target corpus; treat the directive token as an identifier-like
-                    // marker so the parser can reject it loudly if it ever appears.
-                    return Err(self.err("conditional compilation (#...) is not supported"));
+                b'#' => self.lex_directive()?,
+                b'~' if self.i + 1 < self.bytes.len() && self.bytes[self.i + 1] == b'/' => {
+                    self.lex_regex()?
                 }
                 b'"' | b'\'' => self.lex_string(c)?,
                 b'@' => self.lex_meta()?,
@@ -218,6 +235,65 @@ impl<'a> Lexer<'a> {
             self.i += 1;
         }
         Err(self.err("unterminated string literal"))
+    }
+
+    /// Lex a conditional-compilation directive (`#if`/`#elseif`/`#else`/`#end`).
+    /// For `#if`/`#elseif` the remainder of the line (sans any `//` comment) is
+    /// captured raw as the condition; the parser validates and translates it.
+    fn lex_directive(&mut self) -> Result<TokKind, LexError> {
+        self.i += 1; // '#'
+        let name_start = self.i;
+        while self.i < self.bytes.len() && is_ident_continue(self.bytes[self.i]) {
+            self.i += 1;
+        }
+        let name = self.slice(name_start);
+        let kind = match name.as_str() {
+            "if" => PpKind::If,
+            "elseif" => PpKind::ElseIf,
+            "else" => return Ok(TokKind::Pp(PpKind::Else, String::new())),
+            "end" => return Ok(TokKind::Pp(PpKind::End, String::new())),
+            "" => return Err(self.err("expected a directive name after '#'")),
+            other => {
+                return Err(self.err(&format!(
+                    "unsupported conditional-compilation directive '#{other}'"
+                )))
+            }
+        };
+        let cond_start = self.i;
+        while self.i < self.bytes.len() && self.bytes[self.i] != b'\n' {
+            self.i += 1;
+        }
+        let raw = self.slice(cond_start);
+        let cond = raw.split("//").next().unwrap_or("").trim().to_string();
+        Ok(TokKind::Pp(kind, cond))
+    }
+
+    /// Lex a regular-expression literal `~/pattern/flags`. The pattern runs to the
+    /// next unescaped `/` (a `\/` is an escaped slash, kept); flags are the trailing
+    /// ASCII letters. Slashes are stripped from both captured parts.
+    fn lex_regex(&mut self) -> Result<TokKind, LexError> {
+        let n = self.bytes.len();
+        self.i += 2; // skip `~/`
+        let pat_start = self.i;
+        loop {
+            if self.i >= n {
+                return Err(self.err("unterminated regular-expression literal"));
+            }
+            match self.bytes[self.i] {
+                b'\\' if self.i + 1 < n => self.i += 2, // escaped char (e.g. `\/`)
+                b'\n' => return Err(self.err("unterminated regular-expression literal")),
+                b'/' => break,
+                _ => self.i += 1,
+            }
+        }
+        let pattern = self.slice(pat_start);
+        self.i += 1; // closing `/`
+        let flag_start = self.i;
+        while self.i < n && self.bytes[self.i].is_ascii_alphabetic() {
+            self.i += 1;
+        }
+        let flags = self.slice(flag_start);
+        Ok(TokKind::Regex { pattern, flags })
     }
 
     fn lex_meta(&mut self) -> Result<TokKind, LexError> {
@@ -361,6 +437,7 @@ impl<'a> Lexer<'a> {
             b'=' => Assign, b'<' => Lt, b'>' => Gt,
             b'+' => Plus, b'-' => Minus, b'*' => Star, b'/' => Slash, b'%' => Percent,
             b'!' => Bang, b'&' => Amp, b'|' => Pipe, b'^' => Caret, b'~' => Tilde,
+            b'$' => Dollar,
             _ => return Err(self.err(&format!("unexpected character '{}'", c as char))),
         };
         self.i += 1;
@@ -422,6 +499,22 @@ mod tests {
     fn hex_and_exponent() {
         assert_eq!(kinds("0xFFDDDDDD"), vec![TokKind::Int("0xFFDDDDDD".into())]);
         assert_eq!(kinds("1e3"), vec![TokKind::Float("1e3".into())]);
+    }
+
+    #[test]
+    fn regex_literal_tokenization() {
+        // `~/pattern/flags` → one Regex token; slashes stripped, flags captured.
+        assert_eq!(
+            kinds("~/haxe/i"),
+            vec![TokKind::Regex { pattern: "haxe".into(), flags: "i".into() }]
+        );
+        // An escaped slash `\/` stays part of the pattern; no flags is fine.
+        assert_eq!(
+            kinds(r"~/a\/b/"),
+            vec![TokKind::Regex { pattern: r"a\/b".into(), flags: "".into() }]
+        );
+        // A bare `~` is still bitwise-not when not followed by `/`.
+        assert_eq!(kinds("~x"), vec![TokKind::Sym(Sym::Tilde), TokKind::Ident("x".into())]);
     }
 
     #[test]

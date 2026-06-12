@@ -1,317 +1,25 @@
-//! Milestone-5 checks: the core `.cpp` body transpilations against the corpus —
-//! `super(...)` → init list, `this->`, inherited-field pointer access, anonymous
-//! struct → named temp (with pointer deref), and external accessor rewrites.
-//! Skipped when the corpus is absent.
-
-use std::path::PathBuf;
+//! Body (`.cpp`) transpilation checks against small self-contained programs
+//! built in a temp directory (no external dependencies): `super(...)` → init
+//! list, `this->`, anonymous struct → named temp, ownership, the Std/Math/String
+//! intrinsics, and the sugar lowerings.
 
 use hatchet::codegen::{generate_source, generate_source_diagnostics};
 use hatchet::sema::Program;
 
-/// A sibling corpus repo: `$env` if set, else `../<name>` next to this crate.
-fn repo_root(env: &str, name: &str) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var(env) {
-        let p = PathBuf::from(p);
-        return p.is_dir().then_some(p);
-    }
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let sibling = manifest.parent()?.join(name);
-    sibling.is_dir().then_some(sibling)
-}
-
-/// The `Modules` corpus (`modules/*.hx` + `mucus/Mucus.hx`).
-fn modules_root() -> Option<PathBuf> {
-    repo_root("HATCHET_CORPUS", "Modules")
-}
-
-/// The `Game` corpus (`game/*.hx` + native binding stubs).
-fn game_root() -> Option<PathBuf> {
-    repo_root("HATCHET_GAME_CORPUS", "Game")
-}
-
-fn source(prog: &Program, stem: &str) -> String {
+/// Transpile a single synthetic `.hx` source and return class `stem`'s generated `.cpp`.
+fn gen_one(src: &str, stem: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("hatchet_t_{stem}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{stem}.hx")), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
     let idx = prog
         .modules
         .iter()
         .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some(stem))
-        .unwrap_or_else(|| panic!("module {stem} not found"));
-    generate_source(prog, idx).unwrap_or_else(|| panic!("no source for {stem}"))
-}
-
-#[test]
-fn body_transpilation_core() {
-    let Some(root) = modules_root() else {
-        eprintln!("skipping: Modules corpus not found (set HATCHET_CORPUS)");
-        return;
-    };
-    let prog = Program::from_src_dir(&root).expect("build program");
-
-    let vertex = source(&prog, "Vertex");
-    // super(engine) becomes a base initialiser list
-    assert!(vertex.contains(": Module(engine)"), "super → init list");
-    // this. → this->
-    assert!(vertex.contains("this->x = x;"));
-    // anonymous struct return → named temp of the native return type, with
-    // value-typed struct fields copied directly.
-    assert!(vertex.contains("mucus::Vertex _ret"));
-    assert!(vertex.contains(".effects = this->effects;"), "value struct field copy");
-    // inherited pointer field accessed with -> and chained calls
-    assert!(vertex.contains("this->engine->GetRenderer()->PushVertex(vertex());"));
-
-    // Anonymous struct passed as an argument is hoisted to a typed temporary.
-    let line = source(&prog, "Line");
-    assert!(line.contains("mucus::Line _anon1;"), "anon arg hoisted to native type");
-    assert!(line.contains("PushLine(_anon1)"));
-
-    // External property access uses generated getters/setters.
-    let quad = source(&prog, "Quad");
-    assert!(quad.contains("->SetX("), "external (default,set) write → SetX");
-    assert!(quad.contains("->GetX()"), "external (default,set) read → GetX");
-    // Enum value access is namespace + `_::` qualified.
-    assert!(quad.contains("mucus::EffectType_::"), "enum constant qualified");
-}
-
-#[test]
-fn statement_and_expression_forms() {
-    let (Some(mroot), Some(groot)) = (modules_root(), game_root()) else {
-        eprintln!("skipping: Modules/Game corpora not found (set HATCHET_CORPUS / HATCHET_GAME_CORPUS)");
-        return;
-    };
-    let prog = Program::from_src_dir(&mroot).expect("build Modules program");
-    let game = Program::from_src_dir(&groot).expect("build Game program");
-
-    // `new Array<T>()` → value-constructed container; `?.` method → guarded call.
-    let backdrop = source(&prog, "Backdrop");
-    assert!(
-        backdrop.contains("std::vector<std::vector<Tile*> >()"),
-        "new Array<Array<Tile>>() → value container"
-    );
-    assert!(
-        backdrop.contains("!= NULL ? (") && backdrop.contains("->AddLighting"),
-        "safe-navigation method call is NULL-guarded"
-    );
-
-    // Untyped object literal → local anonymous struct.
-    let camera = source(&prog, "Camera");
-    assert!(camera.contains("struct { int x; int y; }"), "untyped object → anon struct");
-
-    // Non-empty array literal (here as a return) → vector + push_backs;
-    // `Math.POSITIVE_INFINITY` → a portable large float.
-    let graph = source(&prog, "Graph");
-    assert!(graph.contains(".push_back(startIndex);"), "array literal → push_back");
-    assert!(graph.contains("HUGE_VAL"), "Math.POSITIVE_INFINITY intrinsic");
-
-    // Map `.get(k)` → an iterator alias: `find(k)`, a null check on the result is
-    // the existence check (`it == map.end()`), and value/member use is `it->second`.
-    let animation = source(&prog, "Animation");
-    assert!(
-        animation.contains("std::map<std::string, AnimationSequence>::iterator")
-            && animation.contains(".sequences.find(name)"),
-        "Map.get → iterator via find():\n{animation}"
-    );
-    assert!(
-        animation.contains("== this->animationData.sequences.end()"),
-        "null check on a Map.get result → iterator existence check:\n{animation}"
-    );
-    assert!(animation.contains("->second.frames"), "member use of the get result → it->second:\n{animation}");
-    assert!(!animation.contains(".sequences[name]"), "Map.get must not lower to operator[]:\n{animation}");
-
-    // String interpolation → sprintf into a stack buffer.
-    let tile = source(&prog, "Tile");
-    assert!(tile.contains("sprintf("), "string interpolation → sprintf");
-
-    // Array comprehension → hoisted vector populated by a loop.
-    let text = source(&prog, "Text");
-    assert!(
-        text.contains("std::vector<mucus::Quad > _compr"),
-        "array comprehension → hoisted vector"
-    );
-
-    // Base-from-member idiom: the Holder ctor runs the pre-super logic and stores
-    // the hoisted `new` arguments; the class ctor chains through both bases.
-    let tile = source(&prog, "Tile");
-    assert!(tile.contains("TileHolder::TileHolder("), "Holder ctor defined");
-    assert!(tile.contains("this->_super1 = new Quad("), "hoisted super arg stored");
-    assert!(
-        tile.contains(": TileHolder(engine, tilesetId, x, y, textureName), TexturedQuad(engine, _super1, _super2)"),
-        "class ctor chains Holder then base"
-    );
-    // A local that would shadow a parameter is renamed.
-    assert!(tile.contains("textureName_2"), "shadowing local renamed");
-
-    // Nullable value types (`Null<T>`) lower to pointers: the return type is a
-    // pointer, a value result is heap-allocated, `null` becomes NULL, and
-    // comparisons use NULL.
-    let graph = source(&prog, "Graph");
-    assert!(graph.contains("Edge* Graph::GetEdge("), "Null<Edge> return → Edge*");
-    assert!(graph.contains("return new Edge("), "value result heap-allocated");
-    assert!(graph.contains("== NULL"), "`== null` → `== NULL` on the pointer");
-    assert!(graph.contains("std::vector<int>* Graph::FindPath("), "Null<Array<Int>> → vector*");
-    // An aliased import (`Distance as Heuristic`) is called by its real name.
-    assert!(graph.contains("Distance(this->nodes["), "import alias resolved to real name");
-
-    // Top-level `final NAME = function/lambda` → namespace free functions
-    // (public defined plainly, file-local ones `static`).
-    let utilities = source(&prog, "Utilities");
-    assert!(utilities.contains("float Distance(const Vector& a, const Vector& b) {"), "public free fn");
-    assert!(utilities.contains("static float CrossProduct("), "private free fn is static");
-    // Statement-level `@:cppFileCode('...')` injects verbatim C++ at column 0 so
-    // preprocessor directives stay valid, interleaved with transpiled statements.
-    assert!(utilities.contains("\n#ifdef DREAMCAST\n"), "@:cppFileCode injected at column 0");
-    assert!(utilities.contains("\n#else\n") && utilities.contains("\n#endif\n"), "verbatim #else/#endif");
-    assert!(utilities.contains("ret = sqrt(dx * dx + dy * dy);"), "#else branch is transpiled");
-
-    // SceneFactory (game): `extern inline function` → an `extern "C"` export
-    // DEFINED at global scope (no namespace), body fully qualified, `null` → `NULL`.
-    let factory = source(&game, "SceneFactory");
-    assert!(
-        factory.contains("HATCHET_EXPORT mucus::IScene* HATCHET_CALL MCreateScene(mucus::IEngine* engine, int sceneId) {"),
-        "extern \"C\" definition at global scope:\n{factory}"
-    );
-    assert!(factory.contains("new game::AlienBeach(engine)"), "body types fully qualified:\n{factory}");
-    assert!(!factory.contains("namespace game"), "definition is not wrapped in a namespace:\n{factory}");
-
-    // A value argument passed to a `Null<T>` parameter is heap-allocated so the
-    // callee can own it (FogEffect takes `Null<FogEffectData>`). (game)
-    let alien = source(&game, "AlienBeach");
-    assert!(
-        alien.contains("new modules::FogEffect(engine, new mucus::FogEffectData(fogEffectData))"),
-        "value arg to Null<T> param → heap-allocated"
-    );
-
-    // Method-scope ownership: fresh `new`s bound to non-escaping locals (including
-    // hoisted `new` arguments and a nullable result) are freed at scope close.
-    let actor = source(&prog, "Actor");
-    assert!(actor.contains("Vertex* _v"), "new arguments hoisted to owned locals");
-    assert!(
-        actor.contains("delete line;") && actor.contains("delete _v"),
-        "scope-owned locals freed at the end of the loop"
-    );
-    assert!(actor.contains("delete path;"), "nullable result freed at scope close");
-
-    // A `new` forwarded into a base initialiser list stays inline (the base owns
-    // it) — it is never hoisted into the constructor body or scope-deleted.
-    let sprite = source(&prog, "Sprite");
-    assert!(
-        sprite.contains(": TexturedQuad(engine, new Quad(engine, new Vertex("),
-        "super-call `new` args stay inline in the initialiser list"
-    );
-    assert!(!sprite.contains("delete _v"), "base-owned args are not scope-deleted");
-
-    // Owned pointer fields are NULL-initialised in the constructor and the prior
-    // value is freed before reassignment (delete-before-overwrite).
-    let dialog = source(&prog, "DialogBox");
-    assert!(dialog.contains(": Module(engine), text(NULL)"), "owned field NULL-initialised");
-    assert!(
-        dialog.contains("delete this->text;\n\tthis->text = new ShadowText("),
-        "delete-before-overwrite on field reassignment"
-    );
-
-    // Walkbox: `Array.map(lambda)` → a hoisted vector filled by a loop (the
-    // Map-comprehension + Lambda composition).
-    let walkbox = source(&prog, "Walkbox");
-    // Case 1: object-literal body expands into the element struct via the
-    // contextual (assignment-target) element type, not an anonymous struct.
-    assert!(
-        walkbox.contains("std::vector<Vector > _map")
-            && walkbox.contains("for (size_t")
-            && walkbox.contains(".push_back("),
-        "map → hoisted vector + loop + push_back:\n{walkbox}"
-    );
-    assert!(
-        walkbox.contains("Vector v = this->polygon.vertices[")
-            && walkbox.contains(".x = (v.x * scaleFactor);"),
-        "map lambda body (object literal) expanded into the element struct:\n{walkbox}"
-    );
-    // Case 2: the receiver is a `Null<Array<Int>>` pointer — iterate the pointee.
-    assert!(
-        walkbox.contains("for (size_t _i") && walkbox.contains("< (*indices).size();"),
-        "map over a nullable container dereferences the pointer:\n{walkbox}"
-    );
-    // The nullable container's `.length` also dereferences (no `.size()` on a ptr).
-    assert!(
-        walkbox.contains("(*indices).size() > 0"),
-        ".length on a Null<Array<T>> dereferences:\n{walkbox}"
-    );
-}
-
-#[test]
-fn corpus_nullable_warnings_are_only_the_known_buried_calls() {
-    // The corpus is free of nullable *misuse* (a `Null<T>` value flowing into a
-    // non-`Null<T>` `var`/assignment) and of discarded nullable results (those are
-    // auto-extracted). The only remaining warnings are two *buried* nullable
-    // calls in `Graph.AddEdge` — `if (GetEdge(edge) == null)` / `if (GetEdge(test)
-    // == null)` — where the heap `Edge` the call returns has nowhere to be freed.
-    // They are flagged, not auto-fixed: the fix belongs in the Haxe (extract the
-    // call to a `Null<Edge>` local). This test pins that known set so a new buried
-    // nullable elsewhere is caught as a regression.
-    let (Some(mroot), Some(groot)) = (modules_root(), game_root()) else {
-        eprintln!("skipping: Modules/Game corpora not found (set HATCHET_CORPUS / HATCHET_GAME_CORPUS)");
-        return;
-    };
-    // Sweep both standalone repos: the whole corpus must be free of nullable misuse
-    // bar the two known buried calls in `Modules`' Graph.AddEdge.
-    let mut all = Vec::new();
-    for root in [&mroot, &groot] {
-        let prog = Program::from_src_dir(root).expect("build program");
-        for i in 0..prog.modules.len() {
-            if let Some((_, w, _)) = generate_source_diagnostics(&prog, i, 1) {
-                all.extend(w);
-            }
-        }
-    }
-    // Every warning is a buried-nullable one from Graph.AddEdge at lines 34 / 39.
-    let buried = "used inside a larger expression";
-    assert!(
-        all.iter().all(|(line, w)| {
-            w.starts_with("AddEdge:") && w.contains(buried) && (*line == 34 || *line == 39)
-        }),
-        "unexpected nullable warnings (only the two known Graph.AddEdge buried calls are allowed): {all:?}"
-    );
-    assert_eq!(all.len(), 2, "expected exactly the two known buried calls, got: {all:?}");
-}
-
-#[test]
-fn depth_two_auto_extracts_the_graph_buried_calls() {
-    // With `--depth 2`, the two depth-2 buried `GetEdge(...)` calls in
-    // `Graph.AddEdge` (the `if (GetEdge(e) == null)` checks) are no longer warned
-    // about: each is hoisted into an owned `Edge*` local that is freed at scope
-    // close, so the warning set is empty and the locals appear in the output.
-    let Some(root) = modules_root() else {
-        eprintln!("skipping: Modules corpus not found (set HATCHET_CORPUS)");
-        return;
-    };
-    let prog = Program::from_src_dir(&root).expect("build program");
-    let idx = prog
-        .modules
-        .iter()
-        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Graph"))
         .unwrap();
-    let (source, warnings, _) = generate_source_diagnostics(&prog, idx, 2).unwrap();
-    assert!(
-        warnings.is_empty(),
-        "depth 2 should auto-extract the buried Graph calls, leaving no warnings: {warnings:?}"
-    );
-    // Each buried `GetEdge(...)` is hoisted into an owned local that is freed at
-    // scope close — two of them, so two `= GetEdge(` hoists and two deletes.
-    // (Indices are not pinned: the `tmp` counter is shared across the class's
-    // methods.)
-    assert_eq!(
-        source.matches("= GetEdge(").count(),
-        2,
-        "both buried calls should be hoisted into locals, got:\n{source}"
-    );
-    assert_eq!(
-        source.matches("delete _null").count(),
-        2,
-        "both hoisted locals should be freed, got:\n{source}"
-    );
-    // The conditions now compare a hoisted local against NULL rather than calling
-    // GetEdge inline inside the `if`.
-    assert!(
-        source.contains("_null") && source.contains("== NULL"),
-        "hoisted locals should be compared against NULL, got:\n{source}"
-    );
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    out
 }
 
 #[test]
@@ -320,7 +28,6 @@ fn nullable_misuse_is_warned() {
     let src = "\
 typedef Pt = { var x:Int; var y:Int; }
 
-@:expose
 class Probe {
   public function new() {}
   public function find():Null<Pt> { return null; }
@@ -338,12 +45,12 @@ class Probe {
         .iter()
         .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Probe"))
         .unwrap();
-    let (_, warnings, _) = generate_source_diagnostics(&prog, idx, 1).unwrap();
+    let (_, warnings, _) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-    // The misuse is the `var p:Pt = this.find();` on line 8 of `src`.
+    // The misuse is the `var p:Pt = this.find();` on line 7 of `src`.
     assert!(
-        warnings.iter().any(|(line, w)| *line == 8 && w.contains("Null<T>")),
-        "expected a nullable warning on line 8, got: {warnings:?}"
+        warnings.iter().any(|(line, w)| *line == 7 && w.contains("Null<T>")),
+        "expected a nullable warning on line 7, got: {warnings:?}"
     );
 }
 
@@ -355,7 +62,6 @@ fn discarded_nullable_call_is_extracted_to_a_local() {
     let src = "\
 typedef Pt = { var x:Int; var y:Int; }
 
-@:expose
 class Probe {
   public function new() {}
   public function find():Null<Pt> { return null; }
@@ -373,7 +79,7 @@ class Probe {
         .iter()
         .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Probe"))
         .unwrap();
-    let (source, warnings, _) = generate_source_diagnostics(&prog, idx, 1).unwrap();
+    let (source, warnings, _) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
     // The discarded result is bound to a Pt* local and deleted before the
@@ -408,7 +114,6 @@ interface IProps {
   public function GetOr(k:String, d:Dynamic):Dynamic;
 }
 
-@:expose
 class C {
   var props:IProps;
   public function new() {}
@@ -452,7 +157,6 @@ private final ORIGIN:Coord = { u: 0.0, v: 0.0 };
 private final CORNER:Coord = { u: 16.0, v: 32.0 };
 private final TABLE:Array<Coord> = [ ORIGIN, CORNER ];
 
-@:expose
 class Atlas {
   public function new() {}
   public function At(i:Int):Coord { return TABLE[i]; }
@@ -476,11 +180,11 @@ class Atlas {
     assert!(out.contains("static const Coord ORIGIN = { 0.0f, 0.0f };"), "struct final → aggregate const:\n{out}");
     assert!(out.contains("static const Coord CORNER = { 16.0f, 32.0f };"), "struct final aggregate in field order:\n{out}");
     // Array final → builder helper + const vector object (stays a vector).
-    assert!(out.contains("_hatchet_init_TABLE() {"), "array final → builder helper:\n{out}");
+    assert!(out.contains("_init_TABLE() {"), "array final → builder helper:\n{out}");
     assert!(out.contains("v;") && out.contains("v.push_back(ORIGIN);") && out.contains("v.push_back(CORNER);"), "builder declares v and push_backs elements:\n{out}");
     assert!(out.contains("return v;"), "builder returns the vector:\n{out}");
     assert!(
-        out.contains("TABLE = _hatchet_init_TABLE();") && out.contains("static const std::vector<Coord"),
+        out.contains("TABLE = _init_TABLE();") && out.contains("static const std::vector<Coord"),
         "array final → const vector object:\n{out}"
     );
     // Call site is unchanged — it indexes the vector object directly.
@@ -489,31 +193,142 @@ class Atlas {
 }
 
 #[test]
+fn array_pop_removes_and_returns_the_last_element() {
+    // `Array.pop()` must both read the last element AND shrink the vector — a bare
+    // `back()` (the prior lowering) never removed it.
+    let out = gen_one(
+        "class Q {\n  public var items(default, null):Array<Int>;\n  public function new() { this.items = []; }\n  public function take():Int { return this.items.pop(); }\n}\n",
+        "Q",
+    );
+    assert!(out.contains(".back()"), "reads the last element:\n{out}");
+    assert!(out.contains(".pop_back()"), "and removes it (the fix):\n{out}");
+}
+
+#[test]
+fn string_concat_with_int_operands() {
+    // `x + "," + y` with Int operands is string concatenation, not `int + const char*`
+    // pointer arithmetic. The ints are formatted and the chain is a `std::string`.
+    let out = gen_one(
+        "class S {\n  public function new() {}\n  public function label(x:Int, y:Int):String { return x + \",\" + y; }\n}\n",
+        "S",
+    );
+    assert!(out.contains("sprintf("), "int operands are formatted to text:\n{out}");
+    assert!(out.contains("std::string(") && out.contains(" + "), "result is a std::string concatenation:\n{out}");
+    assert!(!out.contains("x + \",\""), "must not emit raw `int + const char*` pointer math:\n{out}");
+}
+
+#[test]
+fn cpp_qualified_fixed_width_uints_map_to_uint_aliases() {
+    // hxcpp's built-in `cpp.UInt8/16/32` (qualified) map to the fixed-width C++ aliases
+    // by their last path segment — in params, return types, and Array elements — so a
+    // project can use the idiomatic `cpp.*` types instead of a homegrown `UInt` shim.
+    let out = gen_one(
+        "package demo;\nclass W {\n  public function new() {}\n  public function f(a:cpp.UInt8, b:cpp.UInt16, t:Array<cpp.UInt32>):cpp.UInt32 { return b; }\n}\n",
+        "W",
+    );
+    assert!(out.contains("uint8_t a"), "cpp.UInt8 param → uint8_t:\n{out}");
+    assert!(out.contains("uint16_t b"), "cpp.UInt16 param → uint16_t:\n{out}");
+    assert!(out.contains("std::vector<uint32_t"), "Array<cpp.UInt32> → std::vector<uint32_t>:\n{out}");
+    assert!(out.contains("uint32_t W::f"), "cpp.UInt32 return → uint32_t:\n{out}");
+}
+
+#[test]
+fn interpolation_builds_incrementally_without_a_guessed_buffer() {
+    // A string operand is appended directly (`s += part`), so an arbitrarily long value
+    // can never overflow a fixed buffer; a numeric operand is formatted into a buffer
+    // sized by its TYPE (not guessed from the value).
+    let out = gen_one(
+        "class G {\n  public function new() {}\n  public function f(s:String, n:Int):String { return 'a${s}b${n}c'; }\n}\n",
+        "G",
+    );
+    assert!(out.contains("std::string "), "builds a std::string accumulator:\n{out}");
+    assert!(out.contains("+= s"), "the string operand is appended directly (unbounded-safe):\n{out}");
+    // No single value-guessed buffer (the old `char buf[n*50+lit]` form).
+    assert!(!out.contains("[50]") && !out.contains("* 50"), "no guessed buffer size:\n{out}");
+    // The numeric operand still gets a type-bounded buffer.
+    assert!(out.contains("char ") && out.contains("sprintf(") && out.contains("[24]"), "int → type-bounded buffer:\n{out}");
+}
+
+#[test]
+fn range_loop_variables_are_unique_per_loop() {
+    // VC6 uses the pre-standard `for` scope: a `for (int i ...)` init variable
+    // leaks into the enclosing block, so reusing the same Haxe loop name across
+    // several range loops/comprehensions in one function would redeclare it
+    // (error C2374). Each generated `for`-init must get a distinct name even when
+    // the Haxe source reuses `i`.
+    let out = gen_one(
+        "\
+         class G {\n\
+         \tpublic function new() {}\n\
+         \tpublic function f(n:Int):Int {\n\
+         \t\tvar a:Array<Int> = [for (i in 0...n) -1];\n\
+         \t\tvar b:Array<Int> = [for (i in 0...n) 0];\n\
+         \t\tvar total:Int = 0;\n\
+         \t\tfor (i in 0...n) total += i;\n\
+         \t\tfor (i in 0...n) total += i;\n\
+         \t\treturn total + a.length + b.length;\n\
+         \t}\n\
+         }\n",
+        "G",
+    );
+    // No two `for`-inits may share a control-variable name. Collect every
+    // `for (int <name> = ` declaration and assert they are all distinct.
+    let mut names = Vec::new();
+    for piece in out.split("for (int ").skip(1) {
+        let name: String = piece.chars().take_while(|c| *c != ' ').collect();
+        names.push(name);
+    }
+    assert!(names.len() >= 4, "expected four range loops, found {}:\n{out}", names.len());
+    let mut sorted = names.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), names.len(), "range loop control variables must be unique: {names:?}\n{out}");
+    // And the user's bare `i` must not survive as a raw for-init (it was renamed).
+    assert!(!out.contains("for (int i ="), "the reused Haxe `i` must be renamed:\n{out}");
+}
+
+#[test]
+fn bare_enum_constant_is_qualified_in_expression_position() {
+    // Returning (or assigning) a bare enum variant must qualify it with the
+    // enum's `struct E_` scope — the raw `Red` is undeclared in C++.
+    let out = gen_one(
+        "\
+         enum Color { Red; Green; }\n\
+         \
+         class Paint {\n\
+         \tpublic function new() {}\n\
+         \tpublic function pick():Color { return Green; }\n\
+         }\n",
+        "Paint",
+    );
+    assert!(out.contains("return Color_::Green;"), "bare enum variant must be scoped:\n{out}");
+    assert!(!out.contains("return Green;"), "unqualified variant must not leak:\n{out}");
+}
+
+#[test]
 fn final_constant_references_are_namespace_qualified() {
     // A `@:native final` (provided by the C++ engine, not emitted) is referenced
-    // with its native namespace (`mucus::MAX_CHARS`). A public `final` is a
+    // with its native namespace (`native::MAX_CHARS`). A public `final` is a
     // `static const` inside its namespace, so a reference from a *different*
     // namespace — here a global-scope `extern "C"` export — is qualified too
     // (`game::SCENE_ID`), while a reference from within the same namespace stays
     // bare.
     let native = "\
-package mucus;
+package native;
 @:native @:include(\"engine.h\")
 final MAX_CHARS:Int = 100;
 ";
     let scenes = "\
 package game;
-import mucus.Mucus;
+import native.Native;
 final SCENE_ID:Int = 7;
 
-@:expose
 class Scene {
   public function new() {}
-  public function cap():Int { return MAX_CHARS; }        // native const → mucus::
+  public function cap():Int { return MAX_CHARS; }        // native const → native::
   public function id():Int { return SCENE_ID; }          // same ns → bare
 }
 
-@:expose
 extern inline function Pick(n:Int):Int {
   switch (n) {
     case SCENE_ID: return 1;                              // global scope → game::
@@ -522,9 +337,9 @@ extern inline function Pick(n:Int):Int {
 }
 ";
     let dir = std::env::temp_dir().join(format!("hatchet_finalref_{}", std::process::id()));
-    std::fs::create_dir_all(dir.join("mucus")).unwrap();
+    std::fs::create_dir_all(dir.join("native")).unwrap();
     std::fs::create_dir_all(dir.join("game")).unwrap();
-    std::fs::write(dir.join("mucus").join("Mucus.hx"), native).unwrap();
+    std::fs::write(dir.join("native").join("Native.hx"), native).unwrap();
     std::fs::write(dir.join("game").join("Game.hx"), scenes).unwrap();
     let prog = Program::from_src_dir(&dir).expect("build program");
     let idx = prog
@@ -535,7 +350,7 @@ extern inline function Pick(n:Int):Int {
     let out = generate_source(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("return mucus::MAX_CHARS;"), "native const → native namespace:\n{out}");
+    assert!(out.contains("return native::MAX_CHARS;"), "native const → native namespace:\n{out}");
     assert!(out.contains("return SCENE_ID;"), "same-namespace ref stays bare:\n{out}");
     assert!(out.contains("case game::SCENE_ID:"), "global-scope ref → namespace-qualified:\n{out}");
 }
@@ -549,7 +364,6 @@ fn map_get_lowers_to_iterator_with_existence_check() {
     let src = "\
 typedef Entry = { var count:Int; }
 
-@:expose
 class Store {
   private var entries:Map<String, Entry>;
   public function new() { this.entries = []; }
@@ -585,16 +399,172 @@ class Store {
 }
 
 #[test]
+fn for_over_anonymous_array_literal_hoists_the_vector_before_the_loop() {
+    // `for (i in [1,2,3])` builds a `std::vector` temporary, emitted *before* the
+    // loop (in scope), then iterates it by index.
+    let src = "\
+class Summer {
+  public function new() {}
+  public function total():Int {
+    var sum:Int = 0;
+    for (i in [1, 2, 3]) {
+      sum += i;
+    }
+    return sum;
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_anoniter_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Summer.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Summer"))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The vector temp and its push_backs are emitted before the for header.
+    assert!(out.contains("std::vector<int "), "array temp is a std::vector<int>:\n{out}");
+    assert!(out.contains(".push_back(1)") && out.contains(".push_back(3)"), "literal elements pushed:\n{out}");
+    let push_pos = out.find(".push_back(1)").unwrap_or_else(|| panic!("element push expected:\n{out}"));
+    let for_pos = out.find("for (size_t").unwrap_or_else(|| panic!("index loop expected:\n{out}"));
+    assert!(push_pos < for_pos, "the vector must be built before the loop:\n{out}");
+    assert!(out.contains("int i = "), "loop binds element by value:\n{out}");
+    assert!(out.contains(".size(); ++"), "index loop over .size():\n{out}");
+}
+
+#[test]
+fn trace_lowers_to_printf_with_file_and_line_and_no_trace_strips_it() {
+    // `trace(...)` prints `file:line: ` followed by the comma-separated args via a
+    // single printf (reusing the interpolation type→spec mapping). `--no-trace`
+    // strips the call (and its argument evaluation) to a no-op.
+    let src = "\
+class Tracer {
+  public function new() {}
+  public function go(count:Int):Void {
+    trace(\"hello\");
+    trace(\"count\", count);
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_trace_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Tracer.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Tracer"))
+        .unwrap();
+
+    // Default: trace → printf with the file:line prefix.
+    let out = generate_source_diagnostics(&prog, idx, 1, false).unwrap().0;
+    assert!(
+        out.contains(r#"printf("Tracer.hx:4: %s\n", "hello")"#),
+        "string-literal trace → printf with file:line, no .c_str():\n{out}"
+    );
+    assert!(
+        out.contains(r#"printf("Tracer.hx:5: %s, %d\n", "count", count)"#),
+        "multi-arg trace → comma-separated specs:\n{out}"
+    );
+
+    // --no-traces: the calls are stripped to no-ops.
+    let stripped = generate_source_diagnostics(&prog, idx, 1, true).unwrap().0;
+    assert!(!stripped.contains("printf("), "no-traces must emit no printf:\n{stripped}");
+    assert!(stripped.contains("((void)0);"), "no-traces lowers trace to a no-op:\n{stripped}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn conditional_compilation_and_untyped_lower_to_preprocessor_and_verbatim() {
+    // `#if FLAG`/`#else`/`#end` become `#ifdef`/`#else`/`#endif`; a statement-level
+    // `@:include` becomes an `#include` at that point; `untyped` hands the rest of
+    // the statement to C++ verbatim (here `fsqrtf`, which Haxe cannot see).
+    let src = "\
+class Maths {
+  public function new() {}
+  public function Dist(dx:Float, dy:Float):Float {
+#if DREAMCAST
+    @:include(\"<dc/fmath.h>\");
+    return untyped fsqrtf(dx * dx + dy * dy);
+#else
+    return Math.sqrt(dx * dx + dy * dy);
+#end
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_ppcond_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Maths.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Maths"))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(out.contains("#ifdef DREAMCAST"), "`#if FLAG` → `#ifdef FLAG`:\n{out}");
+    assert!(out.contains("#else"), "`#else` preserved:\n{out}");
+    assert!(out.contains("#endif"), "`#end` → `#endif`:\n{out}");
+    assert!(out.contains("#include <dc/fmath.h>"), "stmt `@:include` → `#include`:\n{out}");
+    assert!(
+        out.contains("return fsqrtf(dx * dx + dy * dy);"),
+        "`untyped` operand emitted verbatim:\n{out}"
+    );
+    assert!(!out.contains("untyped"), "the `untyped` keyword must not survive:\n{out}");
+    // Preprocessor directives sit at column 0 so they are valid.
+    assert!(out.contains("\n#ifdef DREAMCAST"), "directive at column 0:\n{out}");
+    // The #else branch is transpiled normally.
+    assert!(out.contains("sqrt("), "Math.sqrt → sqrt in the else branch:\n{out}");
+}
+
+#[test]
+fn plain_dollar_interpolation_is_supported() {
+    // `'$name'` shorthand interpolates the identifier, exactly like `'${name}'`.
+    // A `$` not followed by an identifier (here `$5`) stays a literal dollar.
+    let src = "\
+class Greeter {
+  public function new() {}
+  public function Greet(name:String):String {
+    return 'hi $name costs $5';
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_dollar_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Greeter.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Greeter"))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Built incrementally: a `std::string` accumulator with the string operand appended
+    // directly (no fixed-size buffer — unbounded-safe), the `$5` staying literal.
+    assert!(out.contains("std::string"), "interpolation builds a std::string accumulator:\n{out}");
+    assert!(out.contains("+= name"), "the string operand is appended directly:\n{out}");
+    assert!(!out.contains("sprintf"), "a string interpolation needs no fixed-size buffer:\n{out}");
+    assert!(out.contains("$5"), "a `$` not before an identifier stays a literal:\n{out}");
+}
+
+#[test]
 fn early_return_frees_owned_locals() {
     // A scope-owned heap local (a `new` that does not escape) is freed at scope
     // close — but an early `return` skips that close. Hatchet must `delete` the owned
     // local before EVERY return, while never double-freeing: a tail return frees it
     // and emits no trailing (dead) delete.
     let src = "\
-@:expose
 class Helper { public function new() {} }
 
-@:expose
 class Runner {
   public function new() {}
   public function run(early:Bool):Null<Helper> {
@@ -646,7 +616,6 @@ interface IProps {
   public function GetOr(k:String, d:Dynamic):Dynamic;
 }
 
-@:expose
 class C {
   var props:IProps;
   public function new() {}
@@ -664,7 +633,7 @@ class C {
         .iter()
         .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("P"))
         .unwrap();
-    let (_, _, errors) = generate_source_diagnostics(&prog, idx, 1).unwrap();
+    let (_, _, errors) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
@@ -681,12 +650,10 @@ fn new_pushed_into_owned_container_is_not_scope_deleted() {
     // double-frees). Covers a direct field push AND a local that flows into a
     // field (the bare-`field` form, with `this.` omitted, must be recognised too).
     let src = "\
-@:expose
 class Tile {
   public function new(v:Int) {}
 }
 
-@:expose
 class Grid {
   private var tiles:Array<Tile>;
   private var rows:Array<Array<Tile>>;
@@ -723,6 +690,275 @@ class Grid {
 }
 
 #[test]
+fn bare_field_assigned_new_behaves_like_qualified() {
+    // `field = new X(new Y())` with `this.` omitted must be treated the same as
+    // `this.field = new X(...)`: the field owns the allocation, so the nested
+    // `new` is emitted inline (NOT hoisted into a scope-owned local that the
+    // constructor frees, which would leave `field` dangling), the field is
+    // NULL-initialised, and the destructor deletes it.
+    let src = "\
+class Leaf {
+  public function new(n:Int) {}
+}
+
+class Holder {
+  public function new(a:Leaf) {}
+}
+
+class Owner {
+  var h:Holder;
+  public function new() {
+    h = new Holder(new Leaf(1));
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_barefield_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("O.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("O"))
+        .unwrap();
+    let body = generate_source(&prog, idx).unwrap();
+    let header = hatchet::codegen::generate_header(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        body.contains("this->h = new Holder(new Leaf(1));"),
+        "bare field assign must qualify and keep the nested new inline:\n{body}"
+    );
+    assert!(
+        body.contains(": h(NULL)") || body.contains(", h(NULL)") || body.contains("h(NULL)"),
+        "the owned field must be NULL-initialised:\n{body}"
+    );
+    assert!(
+        !body.contains("delete "),
+        "the constructor must not free the escaped nested new:\n{body}"
+    );
+    assert!(header.contains("delete this->h;"), "destructor must free the owned field:\n{header}");
+}
+
+#[test]
+fn untyped_lambda_params_typed_from_function_annotation() {
+    // `Cross:(Vec, Vec) -> Float = (a, b) -> …` — the arrow params are
+    // unannotated; their types come from the binding's function-type annotation.
+    // Without propagating them they default to `int` and `a.x` is invalid C++.
+    let src = "\
+typedef Vec = {
+  var x:Float;
+  var y:Float;
+}
+
+final Cross:(Vec, Vec) -> Float = (a, b) -> a.x * b.y - a.y * b.x;
+
+class M {}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_lambdaty_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("M.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("M"))
+        .unwrap();
+    let body = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        body.contains("float Cross(const Vec& a, const Vec& b)"),
+        "untyped arrow params take their type from the function annotation:\n{body}"
+    );
+    assert!(!body.contains("int a"), "params must not default to int:\n{body}");
+    assert!(body.contains("return a.x * b.y - a.y * b.x;"), "body uses the typed params:\n{body}");
+}
+
+#[test]
+fn new_passed_to_an_owning_ctor_param_is_inline_not_double_freed() {
+    // `var o = new Owner(new Child())` where Owner `@owned`s the child: the child
+    // is freed by `~Owner`, so it must be emitted inline — NOT hoisted into a
+    // scope-owned local that the scope also deletes (a double-free once `o`'s
+    // destructor runs). A *borrowing* ctor param keeps the hoist (the scope must
+    // free the fresh `new`, since the borrower never will).
+    let src = "\
+class Child {
+  public function new() {}
+}
+
+class Owner {
+  @owned var c:Child;
+  public function new(c:Child) { this.c = c; }
+}
+
+class Borrower {
+  var c:Child;
+  public function new(c:Child) { this.c = c; }
+}
+
+class User {
+  public function new() {}
+  public function owns():Void {
+    var o:Owner = new Owner(new Child());
+  }
+  public function borrows():Void {
+    var b:Borrower = new Borrower(new Child());
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_ownarg_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("U.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("U"))
+        .unwrap();
+    let body = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Owned param: the child is inline, and the only delete is `delete o`.
+    assert!(
+        body.contains("new Owner(new Child())"),
+        "a `new` into an @owned ctor param must be inline:\n{body}"
+    );
+    let owns = &body[body.find("User::owns").unwrap()..body.find("User::borrows").unwrap()];
+    assert!(owns.contains("delete o;"), "the scope frees the owner:\n{owns}");
+    assert!(
+        !owns.contains("delete _v"),
+        "the owned child must not be separately scope-deleted (double-free):\n{owns}"
+    );
+    // Borrowed param: the fresh `new` is hoisted and freed by the scope.
+    let borrows = &body[body.find("User::borrows").unwrap()..];
+    assert!(
+        borrows.contains("delete _v") || borrows.contains("Child* _v"),
+        "a `new` into a borrowing param is hoisted to a scope-owned local:\n{borrows}"
+    );
+}
+
+#[test]
+fn delete_tag_forces_a_scope_free() {
+    // `@delete var t = make()` frees `t` at scope close even though the analysis
+    // would leak a returned pointer. `@delete` is the local-scope override.
+    let src = "\
+class Thing {
+  public function new() {}
+}
+
+class C {
+  public function new() {}
+  public function make():Thing { return new Thing(); }
+  public function run():Void {
+    @delete var t:Thing = make();
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_deltag_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("D.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("D"))
+        .unwrap();
+    let body = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(body.contains("delete t;"), "@delete forces a scope-close free of the local:\n{body}");
+}
+
+#[test]
+fn array_index_write_grows_the_vector() {
+    // Haxe auto-extends an array on an out-of-range write (`a[i] = v` past the end
+    // grows it); C++ `std::vector::operator[]` would be out-of-bounds UB. The write
+    // must be preceded by a grow-guard. A map write (`std::map::operator[]` inserts)
+    // must NOT be guarded.
+    let src = "\
+class G {
+  public function new() {}
+  public function fill(n:Int):Array<Int> {
+    var a:Array<Int> = [];
+    for (i in 0...n) {
+      a[i] = -1;
+    }
+    return a;
+  }
+  public function put(m:Map<String,Int>):Void {
+    m[\"x\"] = 1;
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_arrgrow_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("G.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("G"))
+        .unwrap();
+    let body = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(body.contains(".resize("), "array index write must grow the vector first:\n{body}");
+    assert!(
+        body.contains(">= a.size()) a.resize("),
+        "the grow-guard resizes when the index is past the end:\n{body}"
+    );
+    // The map write inserts on its own — it must not be wrapped in a resize-guard.
+    assert!(
+        body.contains("m[\"x\"] = 1") && !body.contains("m.resize("),
+        "map index writes are not guarded:\n{body}"
+    );
+}
+
+#[test]
+fn owned_marker_deletes_injected_pointers() {
+    // `@owned` is the tie-breaker for injected pointers the automatic rules can't
+    // tell from a borrow: a ctor parameter stored into a field. A scalar pointer
+    // field gets a plain `delete`; a container field is freed element-wise (never
+    // a flat `delete` on the std::vector).
+    let src = "\
+class Dep {
+  public function new() {}
+}
+
+class Widget {
+  @owned var dep:Dep;
+  @owned var kids:Array<Dep>;
+  public function new(dep:Dep, kids:Array<Dep>) {
+    this.dep = dep;
+    this.kids = kids;
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_owned_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("W.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("W"))
+        .unwrap();
+    let header = hatchet::codegen::generate_header(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(header.contains("delete this->dep;"), "@owned scalar pointer → plain delete:\n{header}");
+    assert!(
+        header.contains("delete this->kids[_i0];"),
+        "@owned container → element-wise delete loop:\n{header}"
+    );
+    assert!(
+        !header.contains("delete this->kids;"),
+        "@owned container must not flat-delete the std::vector:\n{header}"
+    );
+}
+
+#[test]
 fn optional_value_struct_param_is_a_pointer_consistently() {
     // Option 1 (optional/nullable unification): an *optional* value-struct param
     // `?b:Coords` lowers to `Coords* b = NULL` — the same pointer shape as a
@@ -735,13 +971,11 @@ typedef Coords = {
   var v:Float;
 }
 
-@:expose
 class Quad {
   public function new() {}
   public function set(a:Coords, ?b:Coords):Void {}
 }
 
-@:expose
 class User {
   var q:Quad;
   public function new() {}
@@ -798,13 +1032,11 @@ fn property_access_on_new_hoists_to_a_local() {
     // local and reads the property off it. The temporary is not freed (only the
     // property value escapes; the object's dtor would free it).
     let src = "\
-@:expose
 class Cell {
   public var value(default, null):Int;
   public function new(v:Int) { this.value = v; }
 }
 
-@:expose
 class Grid {
   private var values:Array<Int>;
   public function new() {
@@ -845,7 +1077,6 @@ fn string_null_check_lowers_to_empty() {
     // comparison cannot stay `s == NULL`. Optional `String` params default to `""`,
     // so "null" ≡ empty: `s == null` → `s.empty()`, `s != null` → `!s.empty()`.
     let src = "\
-@:expose
 class S {
   public function new() {}
   public function run(?palette:String):Void {
@@ -876,7 +1107,6 @@ class S {
 fn string_tier1_methods_map_to_std_string() {
     // Tier-1 Haxe `String` API → single C++98 `std::string` expressions.
     let src = "\
-@:expose
 class S {
   public function new() {}
   public function run():Void {
@@ -925,10 +1155,80 @@ class S {
 }
 
 #[test]
+fn type_ascription_honors_the_ascribed_type() {
+    // `(expr : Type)` is a compile-time hint with no runtime effect; the ascribed
+    // type drives inference where the inner expression's own type is uninformative
+    // (a class-typed `null`, an empty array literal).
+    let src = "\
+class Widget { public function new() {} }
+
+class A {
+  public function new() {}
+  public function run():Void {
+    var w = (null : Widget);
+    var xs = ([] : Array<Int>);
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_ascr_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("A.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("A"))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The ascription gives `null` a pointer type and `[]` an element type.
+    assert!(out.contains("Widget* w = NULL;"), "class-typed null follows the ascription:\n{out}");
+    assert!(out.contains("std::vector<int> xs"), "empty array literal follows the ascription:\n{out}");
+}
+
+#[test]
+fn string_tier2_case_and_split() {
+    // toUpperCase/toLowerCase (ASCII, in-place on a copy) and split → vector, all
+    // self-contained C++98 (no <cctype>/<algorithm>).
+    let src = "\
+class S {
+  public function new() {}
+  public function run():Void {
+    var s:String = \"Hello\";
+    var u:String = s.toUpperCase();
+    var l:String = s.toLowerCase();
+    var parts:Array<String> = \"a,b,c\".split(\",\");
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_str2_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("S.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("S"))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Case mapping is an ASCII range check + offset (no toupper/tolower).
+    assert!(out.contains(">= 'a' && ") && out.contains("- 'a' + 'A'"), "toUpperCase ASCII map:\n{out}");
+    assert!(out.contains(">= 'A' && ") && out.contains("- 'A' + 'a'"), "toLowerCase ASCII map:\n{out}");
+    assert!(!out.contains("toupper") && !out.contains("tolower"), "no <cctype> dependency:\n{out}");
+    // split builds a vector via find/substr (npos sentinel), no <algorithm>.
+    assert!(out.contains("std::vector<std::string >"), "split returns a vector:\n{out}");
+    assert!(out.contains(".find(") && out.contains(".substr(") && out.contains("std::string::npos"),
+        "split tokenizes with find/substr:\n{out}");
+    assert!(!out.contains("std::find"), "no <algorithm> dependency:\n{out}");
+}
+
+#[test]
 fn math_intrinsics_map_inline() {
     // Math API → inline C++98 expressions (no helper functions / shims).
     let src = "\
-@:expose
 class M {
   public function new() {}
   public function run():Void {
@@ -971,10 +1271,178 @@ class M {
 }
 
 #[test]
+fn std_intrinsics_map_to_c_stdlib() {
+    // Std.string/parseInt/parseFloat → inline C++98 (sprintf / strtol / atof), no
+    // custom runtime helpers.
+    let src = "\
+class S {
+  public function new() {}
+  public function run():Void {
+    var n:Int = 42;
+    var s1:String = Std.string(n);
+    var s2:String = Std.string(\"hi\");
+    var s3:String = Std.string(true);
+    var i:Int = Std.parseInt(\"0x1F\");
+    var f:Float = Std.parseFloat(\"3.14\");
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_std_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("S.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("S"))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Std.string(int) → sprintf %d into a buffer, returned as std::string.
+    assert!(out.contains("sprintf(") && out.contains("\"%d\""), "Std.string(int) via sprintf:\n{out}");
+    assert!(out.contains("std::string("), "Std.string returns a std::string:\n{out}");
+    // Std.string of a literal and a bool.
+    assert!(out.contains("std::string(\"hi\")"), "Std.string(literal):\n{out}");
+    assert!(out.contains("std::string(\"true\")") && out.contains("std::string(\"false\")"),
+        "Std.string(bool) maps to \"true\"/\"false\":\n{out}");
+    // parseInt (hex-aware) and parseFloat — a bare string literal is a const char*,
+    // so no invalid `.c_str()` is appended.
+    assert!(out.contains("(int)strtol(\"0x1F\", NULL, 0)"), "Std.parseInt → strtol base 0:\n{out}");
+    assert!(out.contains("(float)atof(\"3.14\")"), "Std.parseFloat → atof:\n{out}");
+    assert!(!out.contains("\".c_str()") && !out.contains("\"0x1F\".c_str()"),
+        "no .c_str() on a string literal:\n{out}");
+    // No custom runtime helpers.
+    assert!(!out.contains("haxe_"), "no helper shims:\n{out}");
+}
+
+#[test]
+fn array_and_map_methods_lower_to_inline_cpp() {
+    // Array indexOf/contains/remove/reverse/copy/join and Map set/remove/keys →
+    // self-contained C++98 (explicit loops; no <algorithm>, no runtime helpers).
+    let src = "\
+class C {
+  public function new() {}
+  public function run():Void {
+    var xs:Array<Int> = [1, 2, 3];
+    var has:Bool = xs.contains(2);
+    var i:Int = xs.indexOf(3);
+    var r:Bool = xs.remove(1);
+    xs.reverse();
+    var ys:Array<Int> = xs.copy();
+    var ji:String = xs.join(\"-\");
+    var names:Array<String> = [\"a\", \"b\"];
+    var j:String = names.join(\", \");
+    var m:Map<String, Int> = new Map<String, Int>();
+    m.set(\"k\", 7);
+    var rm:Bool = m.remove(\"k\");
+    var ks:Array<String> = m.keys();
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_containers_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("C.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("C"))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Array methods.
+    assert!(out.contains("== 2)") && out.contains("= true; break;"), "contains scan:\n{out}");
+    assert!(out.contains("int ") && out.contains("= -1;") && out.contains("== 3)"), "indexOf scan:\n{out}");
+    assert!(out.contains(".erase(") && out.contains(".begin() +"), "remove erases by index:\n{out}");
+    assert!(out.contains(".size() / 2"), "reverse swap loop:\n{out}");
+    assert!(out.contains("std::vector<int>(xs)"), "copy via copy-constructor:\n{out}");
+    assert!(out.contains("sprintf(") && out.contains("\"%d\""), "numeric join via sprintf:\n{out}");
+    // Map methods.
+    assert!(out.contains("[\"k\"] = 7"), "Map.set → m[k]=v:\n{out}");
+    assert!(out.contains(".erase(\"k\") != 0"), "Map.remove → erase != 0:\n{out}");
+    assert!(out.contains("->first") && out.contains("std::vector<std::string >"), "Map.keys → vector of keys:\n{out}");
+    // No <algorithm>-only names or runtime helpers leak in.
+    assert!(!out.contains("std::find") && !out.contains("std::reverse"), "no <algorithm> dependency:\n{out}");
+    assert!(!out.contains("haxe_"), "no helper shims:\n{out}");
+}
+
+#[test]
+fn map_iteration_lowers_to_a_std_map_iterator() {
+    // `for (v in map)` iterates values; `for (k => v in map)` binds key and value.
+    // Both lower to a std::map iterator loop (not the index path).
+    let src = "\
+class M {
+  public function new() {}
+  public function run():Void {
+    var m:Map<String, Int> = new Map<String, Int>();
+    m.set(\"a\", 1);
+    var total:Int = 0;
+    for (v in m) { total += v; }
+    for (k => val in m) { total += val; }
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_mapiter_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("M.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("M"))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(out.contains("std::map<std::string, int>::iterator"), "map iterator type:\n{out}");
+    assert!(out.contains(".begin();") && out.contains(".end();"), "iterator bounds:\n{out}");
+    // `for (v in m)` binds the value only.
+    assert!(out.contains("int v = ") && out.contains("->second;"), "value binding:\n{out}");
+    // `for (k => val in m)` binds key and value.
+    assert!(out.contains("std::string k = ") && out.contains("->first;"), "key binding:\n{out}");
+    assert!(out.contains("int val = ") && out.contains("->second;"), "key/value value binding:\n{out}");
+    // The map must NOT be iterated with the index path.
+    assert!(!out.contains("m.size()") && !out.contains("m[_i"), "map must not use index iteration:\n{out}");
+}
+
+#[test]
+fn for_over_a_non_container_is_an_error() {
+    // Hatchet has no general Iterator/Iterable protocol; iterating something that is
+    // not a range, Array, or Map must fail loudly rather than emit invalid C++.
+    let src = "\
+class B {
+  public function new() {}
+  public function run():Void {
+    var n:Int = 5;
+    for (x in n) { }
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_baditer_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("B.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("B"))
+        .unwrap();
+    let (_, _, errors) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        errors.iter().any(|(_, e)| e.contains("cannot iterate") && e.contains("only ranges, Array, and Map")),
+        "expected a non-container iteration error, got: {errors:?}"
+    );
+}
+
+#[test]
 fn lambda_return_type_from_function_type_annotation() {
     // A lambda with no `cast`/`:T` hint takes its return type from the binding's
     // function-type annotation `(Int, Int) -> Int` (the second of the two hint
-    // forms in SKILL.md).
+    // forms; see `resolve_lambda_ret`).
     let src = "\
 package p;
 final Square:(Int, Int) -> Int = (a:Int, b:Int) -> a * b;
@@ -996,4 +1464,176 @@ final Square:(Int, Int) -> Int = (a:Int, b:Int) -> a * b;
         "return type taken from the (Int,Int)->Int annotation:\n{out}"
     );
     assert!(out.contains("return a * b;"), "lambda body transpiled:\n{out}");
+}
+
+#[test]
+fn elseif_conditional_compilation_maps_to_elif_defined() {
+    // `#elseif FLAG` lowers to `#elif defined(FLAG)` (C++98 has no `#elifdef`);
+    // `#if`/`#else`/`#end` keep their established mappings.
+    let out = gen_one(
+        "class Cond {\n  public function new() {}\n  public function pick():Int {\n    #if WIN98\n    return 1;\n    #elseif DREAMCAST\n    return 2;\n    #else\n    return 3;\n    #end\n  }\n}\n",
+        "Cond",
+    );
+    assert!(out.contains("#ifdef WIN98"), "#if → #ifdef:\n{out}");
+    assert!(out.contains("#elif defined(DREAMCAST)"), "#elseif → #elif defined(...):\n{out}");
+    assert!(out.contains("#else"), "#else preserved:\n{out}");
+    assert!(out.contains("#endif"), "#end → #endif:\n{out}");
+}
+
+#[test]
+fn stringbuf_lowers_to_a_string_accumulator() {
+    // `new StringBuf()` → `std::string()`; `add`/`addChar` → `+=`; `toString()` → it.
+    let out = gen_one(
+        "class B {\n  public function new() {}\n  public function build():String {\n    var b = new StringBuf();\n    b.add(\"n=\");\n    b.add(7);\n    b.addChar(33);\n    return b.toString();\n  }\n}\n",
+        "B",
+    );
+    assert!(out.contains("std::string"), "StringBuf declared as std::string:\n{out}");
+    assert!(out.contains("+= "), "add/addChar append with +=:\n{out}");
+    assert!(!out.contains("new StringBuf"), "StringBuf is not heap-allocated:\n{out}");
+}
+
+#[test]
+fn std_random_lowers_to_guarded_rand_modulo() {
+    let out = gen_one(
+        "class R {\n  public function new() {}\n  public function roll():Int {\n    return Std.random(6);\n  }\n}\n",
+        "R",
+    );
+    assert!(out.contains("rand() %"), "Std.random → rand() %:\n{out}");
+}
+
+#[test]
+fn stringtools_statics_lower_without_using() {
+    // `StringTools.x(...)` is a plain static call — no `using` needed.
+    let out = gen_one(
+        "class Stools {\n  public function new() {}\n  public function clean(s:String):String {\n    return StringTools.replace(StringTools.trim(s), \"a\", \"b\");\n  }\n}\n",
+        "Stools",
+    );
+    assert!(out.contains(".replace("), "StringTools.replace → std::string::replace loop:\n{out}");
+    assert!(out.contains(".substr("), "StringTools.trim → substr of the trimmed range:\n{out}");
+}
+
+#[test]
+fn int_enum_abstract_members_qualify_in_bodies() {
+    // An `Int`-backed `enum abstract` member is a C++ enumerator: a bare member in
+    // a `switch` case or expression position qualifies to `X_::Member`, exactly
+    // like a plain enum constant — the enum machinery is reused wholesale.
+    let out = gen_one(
+        "enum abstract Dir(Int) { var North; var South; }\nclass Nav {\n  public function new() {}\n  public function code(d:Dir):Int {\n    switch (d) {\n      case North: return 0;\n      case South: return 1;\n    }\n    return -1;\n  }\n  public function home():Dir { return South; }\n}\n",
+        "Nav",
+    );
+    assert!(out.contains("case Dir_::North:"), "switch case qualifies the member:\n{out}");
+    assert!(out.contains("return Dir_::South;"), "bare member in return qualifies:\n{out}");
+}
+
+#[test]
+fn string_subject_switch_lowers_to_an_if_else_chain() {
+    // A `switch` on a `String` cannot use a C++ `switch` (case labels must be
+    // integral), so it lowers to an `if`/`else if`/`else` chain: the subject is
+    // hoisted into one `std::string`, multi-pattern cases become OR-ed equality
+    // tests, and `default` becomes the trailing `else`.
+    let out = gen_one(
+        "class Sw {\n  public function new() {}\n  public function f(s:String):Int {\n    switch (s) {\n      case \"one\": return 1;\n      case \"two\", \"deux\": return 2;\n      default: return -1;\n    }\n  }\n}\n",
+        "Sw",
+    );
+    assert!(!out.contains("switch ("), "no C++ switch on a string:\n{out}");
+    assert!(out.contains("std::string") && out.contains(" = s;"), "subject hoisted once:\n{out}");
+    assert!(out.contains("== \"one\""), "first pattern compared:\n{out}");
+    assert!(
+        out.contains("== \"two\" || ") && out.contains("== \"deux\""),
+        "multi-pattern case is OR-ed:\n{out}"
+    );
+    assert!(out.contains("} else {"), "default becomes the trailing else:\n{out}");
+}
+
+#[test]
+fn switch_expression_lowers_to_a_hoisted_temp() {
+    // A `switch` in value position desugars to a temporary declared before a
+    // statement `switch`, whose arms assign their trailing value to the temp; the
+    // expression then evaluates to that temp.
+    let out = gen_one(
+        "class E {\n  public function new() {}\n  public function pick(n:Int):String {\n    var s = switch (n) {\n      case 0: \"zero\";\n      default: \"other\";\n    }\n    return s;\n  }\n}\n",
+        "E",
+    );
+    // A hoisted std::string temp, assigned inside the switch, then bound to `s`.
+    assert!(out.contains("std::string _swx"), "result temp is declared:\n{out}");
+    assert!(out.contains("switch ("), "desugars to a statement switch:\n{out}");
+    assert!(out.contains("= \"zero\";") && out.contains("= \"other\";"), "arms assign the temp:\n{out}");
+    assert!(out.contains("std::string s = _swx"), "expression evaluates to the temp:\n{out}");
+}
+
+#[test]
+fn array_filter_lowers_to_a_predicate_loop() {
+    // `xs.filter(p)` → a fresh vector of the kept elements (same element type),
+    // the predicate lambda inlined with its parameter bound to each element.
+    let out = gen_one(
+        "class Flt {\n  public function new() {}\n  public function f(xs:Array<Int>):Array<Int> {\n    return xs.filter(n -> n > 2);\n  }\n}\n",
+        "Flt",
+    );
+    assert!(out.contains("std::vector<int >"), "result is a vector of the element type:\n{out}");
+    assert!(out.contains("int n = "), "predicate param bound to the element:\n{out}");
+    assert!(out.contains("if (n > 2)") && out.contains(".push_back(n)"), "predicate guards the push:\n{out}");
+}
+
+#[test]
+fn array_sort_lowers_to_an_inline_insertion_sort() {
+    // `xs.sort(cmp)` → an in-place insertion sort with no `<algorithm>` dependency;
+    // the comparator lambda's two params are bound to the compared elements.
+    let out = gen_one(
+        "class Srt {\n  public function new() {}\n  public function s():Void {\n    var xs = [3, 1, 2];\n    xs.sort((a, b) -> a - b);\n  }\n}\n",
+        "Srt",
+    );
+    assert!(!out.contains("std::sort") && !out.contains("<algorithm>"), "no <algorithm>:\n{out}");
+    assert!(out.contains("while (") && out.contains("break;"), "insertion-sort shift loop:\n{out}");
+    assert!(out.contains("int _cmp") && out.contains("= a - b;"), "comparator inlined over a/b:\n{out}");
+}
+
+#[test]
+fn try_catch_lowers_to_cpp_exception_handling() {
+    // `try { … } catch (e:T) { … }` → a C++ try/catch. A thrown String is coerced
+    // to `std::string` (so a `catch (e:String)` matches it), a typed catch maps the
+    // exception type via the parameter rules, and an untyped/`Dynamic` catch becomes
+    // the non-binding `catch (...)`.
+    let out = gen_one(
+        "class T {\n  public function new() {}\n  public function f(b:Bool):String {\n    try {\n      if (b) throw \"x\";\n      return \"ok\";\n    } catch (e:String) {\n      return e;\n    } catch (e:Dynamic) {\n      return \"any\";\n    }\n  }\n}\n",
+        "Tc",
+    );
+    assert!(out.contains("try {"), "emits a C++ try block:\n{out}");
+    assert!(out.contains("throw std::string(\"x\")"), "String throw is coerced:\n{out}");
+    assert!(out.contains("catch (const std::string& e)"), "typed catch maps the exception type:\n{out}");
+    assert!(out.contains("catch (...)"), "Dynamic catch is the non-binding catch-all:\n{out}");
+}
+
+#[test]
+fn untyped_catch_using_its_value_is_an_error() {
+    // An untyped/`Dynamic` catch lowers to the non-binding C++ `catch (...)`, which
+    // cannot bind the exception. Referencing the caught name in the body is a hard
+    // error rather than silently emitting an undeclared identifier.
+    let src = "class Tcc {\n  public function new() {}\n  public function run():Void {\n    try {} catch (e) { trace(e); }\n  }\n}\n";
+    let dir = std::env::temp_dir().join(format!("hatchet_catchval_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Tcc.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Tcc"))
+        .unwrap();
+    let (_, _, errors) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        errors.iter().any(|(_, e)| e.contains("untyped") && e.contains("catch")),
+        "expected an error for using an untyped catch's value, got: {errors:?}"
+    );
+}
+
+#[test]
+fn untyped_catch_ignoring_its_value_is_a_plain_catch_all() {
+    // The same untyped catch that does NOT reference the value is fine: it is the
+    // non-binding `catch (...)`, with no error.
+    let out = gen_one(
+        "class Tci {\n  public function new() {}\n  public function run():Void {\n    try {} catch (e) { trace(\"oops\"); }\n  }\n}\n",
+        "Tci",
+    );
+    assert!(out.contains("catch (...)"), "untyped catch ignoring the value → catch(...):\n{out}");
 }

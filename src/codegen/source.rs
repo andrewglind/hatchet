@@ -4,9 +4,9 @@
 //! generator carries a small amount of type information so it can choose between
 //! `.` and `->` for member access, rewrite property-accessor access to
 //! `GetX()`/`SetX()`, qualify enum constants, and desugar the Haxe constructs
-//! described in `SKILL.md`.
+//! described in `README.md`.
 //!
-//! The validation gate is *compilation*, not byte-equality with the goldens, so
+//! The validation gate is *compilation*, not byte-equality with a reference, so
 //! the output favours correct, compilable C++ over matching a specific layout.
 
 use std::collections::HashMap;
@@ -18,8 +18,12 @@ use crate::sema::{Program, TypeInfo, TypeKind};
 /// Generate the `.cpp` for a module, or `None` if it has no class to implement.
 /// Uses the default buried-`Null<T>` extraction depth (1).
 pub fn generate_source(prog: &Program, module_index: usize) -> Option<String> {
-    generate_source_diagnostics(prog, module_index, 1).map(|(text, _, _)| text)
+    generate_source_diagnostics(prog, module_index, 1, false).map(|(text, _, _)| text)
 }
+
+/// Generated `.cpp` text plus the `(warnings, errors)` collected during body
+/// generation — each diagnostic paired with its source line.
+pub type SourceOutput = (String, Vec<(usize, String)>, Vec<(usize, String)>);
 
 /// Like [`generate_source`], but also returns `(warnings, errors)` for the driver
 /// to surface. Warnings are lint-level (currently nullable `Null<T>` handling);
@@ -31,7 +35,8 @@ pub fn generate_source_diagnostics(
     prog: &Program,
     module_index: usize,
     extract_depth: usize,
-) -> Option<(String, Vec<(usize, String)>, Vec<(usize, String)>)> {
+    no_trace: bool,
+) -> Option<SourceOutput> {
     let m = &prog.modules[module_index];
     if m.is_stdafx || !prog.generates_header(m) {
         return None;
@@ -60,7 +65,25 @@ pub fn generate_source_diagnostics(
             _ => None,
         })
         .collect();
-    if !has_class && free_fns.is_empty() && extern_fns.is_empty() {
+    // Plain module-level `function name(...) {...}` → namespace free functions
+    // (unlike the lambda form, these have a real signature and body).
+    let plain_fns: Vec<&Function> = m
+        .file
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Function(f)
+                if !f.modifiers.is_extern
+                    && !f.modifiers.is_macro
+                    && !has_meta(&f.meta, "native")
+                    && f.body.is_some() =>
+            {
+                Some(f)
+            }
+            _ => None,
+        })
+        .collect();
+    if !has_class && free_fns.is_empty() && extern_fns.is_empty() && plain_fns.is_empty() {
         return None; // headers-only (enums/typedefs/interfaces)
     }
 
@@ -72,7 +95,7 @@ pub fn generate_source_diagnostics(
     // The namespace wraps classes and `final`-lambda free functions. A file whose
     // only output is an `extern "C"` export has no namespace block at all (the
     // export lives at global scope, below).
-    let has_ns_body = has_class || !free_fns.is_empty();
+    let has_ns_body = has_class || !free_fns.is_empty() || !plain_fns.is_empty();
     if has_ns_body {
         for part in &m.package {
             let _ = writeln!(out, "namespace {part} {{");
@@ -110,7 +133,7 @@ pub fn generate_source_diagnostics(
             .collect();
         if !file_finals.is_empty() {
             let empty = empty_class();
-            let mut bg = BodyGen::new(prog, module_index, &empty, extract_depth);
+            let mut bg = BodyGen::new(prog, module_index, &empty, extract_depth, no_trace);
             for g in &file_finals {
                 if let Some(text) = bg.file_scope_const(g) {
                     out.push_str(&text);
@@ -130,7 +153,7 @@ pub fn generate_source_diagnostics(
         let mut fwd = String::new();
         for g in &free_fns {
             if g.access == Access::Private {
-                let mut bg = BodyGen::new(prog, module_index, &empty, extract_depth);
+                let mut bg = BodyGen::new(prog, module_index, &empty, extract_depth, no_trace);
                 if let Some(sig) = bg.free_fn_signature(g, true) {
                     let _ = writeln!(fwd, "\tstatic {sig};");
                 }
@@ -141,8 +164,35 @@ pub fn generate_source_diagnostics(
             out.push('\n');
         }
         for g in &free_fns {
-            let mut bg = BodyGen::new(prog, module_index, &empty, extract_depth);
+            let mut bg = BodyGen::new(prog, module_index, &empty, extract_depth, no_trace);
             out.push_str(&bg.free_fn_def(g));
+            warnings.append(&mut bg.warnings);
+            errors.append(&mut bg.errors);
+            out.push('\n');
+        }
+    }
+
+    // Plain module-level `function`s become namespace free functions. As with the
+    // lambda form, file-local (`private`) ones get a forward declaration so they can
+    // be called regardless of definition order; public ones are declared in the header.
+    if !plain_fns.is_empty() {
+        let empty = empty_class();
+        let mut fwd = String::new();
+        for f in &plain_fns {
+            if f.access == Access::Private {
+                let mut bg = BodyGen::new(prog, module_index, &empty, extract_depth, no_trace);
+                if let Some(sig) = bg.plain_fn_signature(f, false) {
+                    let _ = writeln!(fwd, "\tstatic {sig};");
+                }
+            }
+        }
+        if !fwd.is_empty() {
+            out.push_str(&fwd);
+            out.push('\n');
+        }
+        for f in &plain_fns {
+            let mut bg = BodyGen::new(prog, module_index, &empty, extract_depth, no_trace);
+            out.push_str(&bg.plain_fn_def(f));
             warnings.append(&mut bg.warnings);
             errors.append(&mut bg.errors);
             out.push('\n');
@@ -154,16 +204,20 @@ pub fn generate_source_diagnostics(
             if has_meta(&c.meta, "native") {
                 continue;
             }
-            let mut g = BodyGen::new(prog, module_index, c, extract_depth);
+            let mut g = BodyGen::new(prog, module_index, c, extract_depth, no_trace);
             out.push_str(&g.class_impl());
             warnings.append(&mut g.warnings);
             errors.append(&mut g.errors);
+            // Advisory diagnostics for `@owned`/`@delete` overrides that look unsound to
+            // the escape analysis (the tags are still obeyed; this only flags a likely
+            // double-free / use-after-free).
+            warnings.extend(crate::sema::escape::advisory_warnings(prog, module_index, c));
         }
     }
 
     if has_ns_body {
-        for part in m.package.iter().rev() {
-            let _ = writeln!(out, "}} // namespace {part}");
+        for _ in m.package.iter().rev() {
+            let _ = writeln!(out, "}}");
         }
     }
 
@@ -176,7 +230,7 @@ pub fn generate_source_diagnostics(
             if has_ns_body {
                 out.push('\n');
             }
-            let mut bg = BodyGen::new(prog, module_index, &empty, extract_depth);
+            let mut bg = BodyGen::new(prog, module_index, &empty, extract_depth, no_trace);
             bg.ns = Vec::new();
             out.push_str(&bg.extern_fn_def(f));
             warnings.append(&mut bg.warnings);
@@ -276,13 +330,44 @@ struct BodyGen<'a> {
     /// `Array.map` whose lambda body is an object literal (the element type comes
     /// from the assignment/declaration target). Consumed (taken) when used.
     expected: Option<Ty>,
+    /// When set (`--no-traces`), `trace(...)` calls are stripped entirely (lowered
+    /// to a no-op, arguments not evaluated), mirroring hxcpp's `-D no-traces`.
+    no_trace: bool,
+    /// Catch-variable names bound by an enclosing **non-binding** catch
+    /// (`catch (...)`, from an untyped or `Dynamic` catch). C++ `catch (...)` cannot
+    /// bind the value, so a reference to one of these names is a hard error (rather
+    /// than silently emitting an undeclared identifier).
+    nonbinding_catch_vars: Vec<String>,
 }
 
 impl<'a> BodyGen<'a> {
-    fn new(prog: &'a Program, mi: usize, class: &'a Class, max_extract_depth: usize) -> Self {
+    fn new(
+        prog: &'a Program,
+        mi: usize,
+        class: &'a Class,
+        max_extract_depth: usize,
+        no_trace: bool,
+    ) -> Self {
         let ns = prog.modules[mi].package.clone();
-        let owned_containers =
-            crate::codegen::ownership::escaping_new_receivers(prog, mi, &ns, class);
+        // M5 cutover (consumer #2): the container receiver names into which a pushed
+        // `new` escapes to class-level storage (so it is emitted inline, not hoisted).
+        let owned_containers: std::collections::HashSet<String> =
+            crate::sema::escape::escaping_push_receivers(prog, mi, class).into_iter().collect();
+        // M5 cutover (consumer #3): the scalar pointer fields this object owns —
+        // NULL-initialised in the constructor and freed before reassignment. Sourced
+        // from the escape analysis (destructor-owned set), then filtered to the same
+        // shape the prior `owned_pointer_fields` heuristic produced: scalar pointers
+        // only (containers are value vectors, not NULL-initialised), and excluding
+        // `@owned` injected fields (always assigned, never NULL-initialised here).
+        let class_owned = crate::sema::escape::analyze_class(prog, mi, class).owned_fields;
+        let owned_fields: std::collections::HashSet<String> = class
+            .fields
+            .iter()
+            .filter(|f| class_owned.contains(&f.name))
+            .filter(|f| !f.meta.iter().any(|m| m.name == "owned"))
+            .filter(|f| f.ty.as_ref().is_some_and(|t| prog.map_type_use(t, mi, &ns).ends_with('*')))
+            .map(|f| f.name.clone())
+            .collect();
         BodyGen {
             prog,
             mi,
@@ -303,9 +388,11 @@ impl<'a> BodyGen<'a> {
             owned: vec![Vec::new()],
             escaping: std::collections::HashSet::new(),
             new_args_escape: false,
-            owned_fields: crate::codegen::ownership::owned_pointer_fields(class),
+            owned_fields,
             owned_containers,
             expected: None,
+            no_trace,
+            nonbinding_catch_vars: Vec::new(),
         }
     }
 
@@ -366,7 +453,9 @@ impl<'a> BodyGen<'a> {
     /// Start a function body: reset the escape set for its statements.
     fn begin_fn_body(&mut self, body: &[Stmt]) {
         self.escaping.clear();
-        collect_escaping(body, &mut self.escaping);
+        let fields: std::collections::HashSet<String> =
+            self.class.fields.iter().map(|f| f.name.clone()).collect();
+        collect_escaping(body, &fields, &mut self.escaping);
     }
 
     fn warn(&mut self, msg: String) {
@@ -597,8 +686,9 @@ impl<'a> BodyGen<'a> {
     /// keeps any ` = default` suffixes (for the declaration only).
     fn free_fn_signature(&mut self, g: &GlobalVar, with_defaults: bool) -> Option<String> {
         let (params, ret, body) = lambda_parts(g)?;
+        let params = effective_lambda_params(params, g.ty.as_ref());
         self.push_scope();
-        self.bind_params(params);
+        self.bind_params(&params);
         let ret_ty = self.resolve_lambda_ret(ret, body, g.ty.as_ref());
         let ret_cpp = self.decl_spelling(&ret_ty);
         let plist = if with_defaults {
@@ -608,7 +698,7 @@ impl<'a> BodyGen<'a> {
                 .collect::<Vec<_>>()
                 .join(", ")
         } else {
-            self.header_params(params)
+            self.header_params(&params)
         };
         self.pop_scope();
         Some(format!("{ret_cpp} {}({plist})", g.name))
@@ -617,13 +707,14 @@ impl<'a> BodyGen<'a> {
     /// Full definition of a top-level free function (`static` when file-local).
     fn free_fn_def(&mut self, g: &GlobalVar) -> String {
         let Some((params, ret, body)) = lambda_parts(g) else { return String::new() };
+        let params = effective_lambda_params(params, g.ty.as_ref());
         self.current_fn = g.name.clone();
         self.push_scope();
-        self.bind_params(params);
+        self.bind_params(&params);
         let ret_ty = self.resolve_lambda_ret(ret, body, g.ty.as_ref());
         self.current_ret = ret_ty.clone();
         let ret_cpp = self.decl_spelling(&ret_ty);
-        let plist = self.header_params(params);
+        let plist = self.header_params(&params);
         let prefix = if g.access == Access::Private { "static " } else { "" };
 
         let mut body_buf = String::new();
@@ -682,12 +773,65 @@ impl<'a> BodyGen<'a> {
         format!("{prefix}_EXPORT {ret_cpp} {prefix}_CALL {name}({plist}) {{\n{body_buf}}}\n")
     }
 
+    /// Signature (`ret name(params)`) for a plain module-level free function;
+    /// `with_defaults` keeps any ` = default` suffixes (the header declaration).
+    fn plain_fn_signature(&mut self, f: &Function, with_defaults: bool) -> Option<String> {
+        let name = f.name.clone()?;
+        self.push_scope();
+        self.bind_params(&f.params);
+        let ret_ty = match &f.ret {
+            Some(t) => self.ty_of(t),
+            None => Ty { base: "void".to_string(), ..Default::default() },
+        };
+        let ret_cpp = self.decl_spelling(&ret_ty);
+        let plist = if with_defaults {
+            f.params
+                .iter()
+                .map(|p| crate::codegen::param_decl(self.prog, self.mi, &self.ns, p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            self.header_params(&f.params)
+        };
+        self.pop_scope();
+        Some(format!("{ret_cpp} {name}({plist})"))
+    }
+
+    /// Full definition of a plain module-level `function name(...) {...}` as a
+    /// namespace free function (`static` when file-local). Unlike the lambda form,
+    /// this has a real signature and statement body.
+    fn plain_fn_def(&mut self, f: &Function) -> String {
+        let Some(name) = f.name.clone() else { return String::new() };
+        self.current_fn = name.clone();
+        self.push_scope();
+        self.bind_params(&f.params);
+        let ret_ty = match &f.ret {
+            Some(t) => self.ty_of(t),
+            None => Ty { base: "void".to_string(), ..Default::default() },
+        };
+        self.current_ret = ret_ty.clone();
+        let ret_cpp = self.decl_spelling(&ret_ty);
+        let plist = self.header_params(&f.params);
+        let prefix = if f.access == Access::Private { "static " } else { "" };
+
+        let mut body_buf = String::new();
+        if let Some(stmts) = &f.body {
+            self.begin_fn_body(stmts);
+            for st in stmts {
+                self.gen_stmt(st, 1, &mut body_buf);
+            }
+            self.emit_owned_deletes(&mut body_buf, 1);
+        }
+        self.pop_scope();
+        format!("\t{prefix}{ret_cpp} {name}({plist}) {{\n{body_buf}\t}}\n")
+    }
+
     /// Resolve a lambda's C++ return type from, in priority order: (1) the lambda's
     /// own explicit `:T` return annotation, (2) the **function-type annotation on
     /// the binding** — `Square:(Int, Int) -> Int = (a, b) -> a * b` — whose `-> R`
-    /// gives the return type, (3) a `cast(expr, T)` arrow body. Per `SKILL.md`, a
-    /// developer hints the return type via (2) or (3); absent any hint it falls back
-    /// to `float` (the numeric helpers in the corpus). `decl_ty` is the binding's
+    /// gives the return type, (3) a `cast(expr, T)` arrow body. A developer hints
+    /// the return type via (2) or (3); absent any hint it falls back
+    /// to `float` (the common case for numeric helpers). `decl_ty` is the binding's
     /// declared type, if any.
     fn resolve_lambda_ret(
         &self,
@@ -766,7 +910,7 @@ impl<'a> BodyGen<'a> {
         // escapes (then the receiver owns the arguments).
         self.new_args_escape = false;
         match st {
-            Stmt::Var { name, ty, init, is_final: _, line } => {
+            Stmt::Var { name, ty, init, is_final: _, delete, line } => {
                 self.current_line = *line;
                 // A local that escapes (assigned to a field / returned later) is
                 // owned elsewhere, so its `new` arguments are too.
@@ -810,8 +954,8 @@ impl<'a> BodyGen<'a> {
                 if let Some(Expr::MapLit(pairs)) = init {
                     if !pairs.is_empty() {
                         let map_ty = declared.clone().unwrap_or_default();
-                        let (kty, vty) = self.map_kv_ast_ty(ty.as_ref());
-                        self.expand_map_into_local(name, &map_ty, &kty, &vty, pairs, ind, out);
+                        let (_, vty) = self.map_kv_ast_ty(ty.as_ref());
+                        self.expand_map_into_local(name, &map_ty, &vty, pairs, ind, out);
                         self.define_local(name, map_ty);
                         return;
                     }
@@ -848,11 +992,17 @@ impl<'a> BodyGen<'a> {
                     Some(code) => { let _ = writeln!(out, "{t}{cpp} {emit} = {code};"); }
                     None => { let _ = writeln!(out, "{t}{cpp} {emit};"); }
                 }
+                let is_ptr = var_ty.is_ptr;
                 self.define_local(name, var_ty);
                 // A non-escaping local holding a fresh `new` / nullable heap result
-                // is owned by this scope and deleted when it closes.
+                // is owned by this scope and deleted when it closes. `@delete` is the
+                // developer's explicit override: free this pointer at scope close
+                // regardless of what the analysis would infer (e.g. a returned
+                // pointer the scope would otherwise leak). Pointer-only — `delete`ing
+                // a value local is meaningless.
                 let owns_heap = is_heap_new_init(init) || nullable_init;
-                if owns_heap && !self.escaping.contains(name) {
+                let forced = *delete && is_ptr;
+                if forced || (owns_heap && !self.escaping.contains(name)) {
                     self.register_owned(&emit);
                 }
             }
@@ -866,17 +1016,22 @@ impl<'a> BodyGen<'a> {
                     self.new_args_escape = true;
                 }
                 // Assigning into a field stores the value long-term, so its `new`
-                // arguments are owned by the receiver, not this scope.
+                // arguments are owned by the receiver, not this scope. This holds
+                // whether the field is written `this.field` or bare `field` (Haxe
+                // lets you omit `this.`) — the bare form must not be treated as a
+                // scope-local, or its `new` args would be wrongly freed at scope
+                // close, leaving the field dangling.
                 if let Expr::Assign { op: None, target, .. } = e {
-                    if matches!(&**target, Expr::Field(..)) {
+                    let own_field = self.assigned_own_field(target);
+                    if matches!(&**target, Expr::Field(..)) || own_field.is_some() {
                         self.new_args_escape = true;
                     }
                     // Delete-before-overwrite: reassigning an owned pointer field
                     // (outside the constructor, where it is NULL-initialised) frees
                     // the prior value first.
                     if self.current_fn != "new" {
-                        if let Expr::Field(recv, field) = &**target {
-                            if matches!(**recv, Expr::This) && self.owned_fields.contains(field) {
+                        if let Some(field) = &own_field {
+                            if self.owned_fields.contains(field) {
                                 let _ = writeln!(out, "{t}delete this->{field};");
                             }
                         }
@@ -975,9 +1130,9 @@ impl<'a> BodyGen<'a> {
                     let _ = writeln!(out, "{t}}}");
                 }
             }
-            Stmt::For { var, iter, body, line } => {
+            Stmt::For { var, value_var, iter, body, line } => {
                 self.current_line = *line;
-                self.gen_for(var, iter, body, ind, out)
+                self.gen_for(var, value_var.as_deref(), iter, body, ind, out)
             }
             Stmt::Switch { subject, cases, default, line } => {
                 self.current_line = *line;
@@ -1002,9 +1157,16 @@ impl<'a> BodyGen<'a> {
             Stmt::Throw(e, line) => {
                 self.current_line = *line;
                 self.prelude_ind = ind;
-                let (c, _) = self.gen_expr(e);
+                let (c, ty) = self.gen_expr(e);
                 self.flush(out);
-                let _ = writeln!(out, "{t}throw {c};");
+                // Coerce a thrown `String` to `std::string`, so it matches a
+                // `catch (e:String)` (a bare literal would otherwise throw a
+                // `const char*`, which that catch would not catch).
+                if ty.base == "std::string" {
+                    let _ = writeln!(out, "{t}throw std::string({c});");
+                } else {
+                    let _ = writeln!(out, "{t}throw {c};");
+                }
             }
             Stmt::Verbatim { code, line } => {
                 self.current_line = *line;
@@ -1015,7 +1177,73 @@ impl<'a> BodyGen<'a> {
                 let code = code.replace("\r\n", "\n").replace('\r', "\n");
                 let _ = writeln!(out, "{code}");
             }
+            // `try { … } catch (e:T) { … }` → a C++ try/catch. Each block carries
+            // its normal scope, so owned locals are freed at the *normal* close of
+            // the block. On an exception the unwind skips those frees — a deliberate
+            // **conservative leak** (never a double-free/UAF); the developer frees in
+            // the catch if it matters. Haxe has no `finally`, so there is none to
+            // emulate. Requires exceptions enabled on the target (VC6 `/GX`).
+            Stmt::Try { body, catches, line } => {
+                self.current_line = *line;
+                let _ = writeln!(out, "{t}try {{");
+                self.push_scope();
+                match &**body {
+                    Stmt::Block(stmts) => {
+                        for s in stmts {
+                            self.gen_stmt(s, ind + 1, out);
+                        }
+                    }
+                    other => self.gen_stmt(other, ind + 1, out),
+                }
+                self.emit_owned_deletes(out, ind + 1);
+                self.pop_scope();
+                for c in catches {
+                    let (header, binds) = self.catch_header(c);
+                    let _ = writeln!(out, "{t}}} {header} {{");
+                    self.push_scope();
+                    // Bind the caught value's name for a typed catch; an untyped /
+                    // `Dynamic` catch is `catch (...)`, which binds nothing — mark the
+                    // name so any use of it in the body is a hard error.
+                    if binds {
+                        if let Some(ht) = &c.ty {
+                            let ty = self.ty_of(ht);
+                            self.define_local(&c.name, ty);
+                        }
+                    } else {
+                        self.nonbinding_catch_vars.push(c.name.clone());
+                    }
+                    for s in &c.body {
+                        self.gen_stmt(s, ind + 1, out);
+                    }
+                    self.emit_owned_deletes(out, ind + 1);
+                    self.pop_scope();
+                    if !binds {
+                        self.nonbinding_catch_vars.pop();
+                    }
+                }
+                let _ = writeln!(out, "{t}}}");
+            }
         }
+    }
+
+    /// The C++ `catch (...)` header for a Haxe catch clause, plus whether it binds a
+    /// local. A typed catch maps via `param_decl` (`catch (Foo* e)` / `catch (const
+    /// std::string& e)`); an untyped or `Dynamic`/`Any` catch is the non-binding
+    /// catch-all `catch (...)` (so referencing its name in the body will not compile
+    /// — by design, the developer should catch a concrete type to use the value).
+    fn catch_header(&self, c: &Catch) -> (String, bool) {
+        let dynamic = match &c.ty {
+            None => true,
+            Some(Type::Named { path, .. }) => {
+                matches!(path.last().map(|s| s.as_str()), Some("Dynamic") | Some("Any"))
+            }
+            Some(_) => false,
+        };
+        if dynamic {
+            return ("catch (...)".to_string(), false);
+        }
+        let p = Param { name: c.name.clone(), ty: c.ty.clone(), optional: false, default: None };
+        (format!("catch ({})", super::param_decl(self.prog, self.mi, &self.ns, &p)), true)
     }
 
     fn gen_block(&mut self, st: &Stmt, ind: usize, out: &mut String) {
@@ -1032,36 +1260,90 @@ impl<'a> BodyGen<'a> {
         self.pop_scope();
     }
 
-    fn gen_for(&mut self, var: &str, iter: &Iterable, body: &Stmt, ind: usize, out: &mut String) {
+    fn gen_for(
+        &mut self,
+        var: &str,
+        value_var: Option<&str>,
+        iter: &Iterable,
+        body: &Stmt,
+        ind: usize,
+        out: &mut String,
+    ) {
         let t = "\t".repeat(ind);
         self.push_scope();
+        // The iterable may hoist a prelude (e.g. an anonymous array literal
+        // `for (i in [1,2,3])` builds a `std::vector` temporary); emit it just
+        // before the loop so the temporary is in scope.
+        self.prelude_ind = ind;
         match iter {
             Iterable::Range(start, end) => {
                 let (s, _) = self.gen_expr(start);
                 let (e, _) = self.gen_expr(end);
+                self.flush(out);
                 self.define_local(var, Ty { base: "int".into(), ..Default::default() });
-                let _ = writeln!(out, "{t}for (int {var} = {s}; {var} < {e}; ++{var}) {{");
+                let lv = self.loop_var(var);
+                let _ = writeln!(out, "{t}for (int {lv} = {s}; {lv} < {e}; ++{lv}) {{");
                 self.gen_block_inner(body, ind + 1, out);
                 self.emit_owned_deletes(out, ind + 1);
                 let _ = writeln!(out, "{t}}}");
             }
             Iterable::Coll(coll) => {
-                // for (item in collection) → index loop with element binding
                 let (c, cty) = self.gen_expr(coll);
+                self.flush(out);
                 // A nullable container is a pointer — dereference it to iterate.
                 let access = if cty.is_ptr { format!("(*{c})") } else { c };
-                let idx = self.fresh("i");
-                let elem_ty = self.element_ty(&cty);
-                let elem_spell = self.decl_spelling(&elem_ty);
-                self.define_local(var, elem_ty);
-                let _ = writeln!(
-                    out,
-                    "{t}for (size_t {idx} = 0; {idx} < {access}.size(); ++{idx}) {{"
-                );
-                let _ = writeln!(out, "{t}\t{elem_spell} {var} = {access}[{idx}];");
-                self.gen_block_inner(body, ind + 1, out);
-                self.emit_owned_deletes(out, ind + 1);
-                let _ = writeln!(out, "{t}}}");
+                if rcode_is_map(&cty) {
+                    // Map iteration via a std::map iterator. `for (k => v in m)`
+                    // binds both; `for (v in m)` binds the value (Haxe iterates a
+                    // map's values, not its keys).
+                    let it = self.fresh("it");
+                    let kty = self.map_key_ty(&cty);
+                    let vty = self.map_value_ty(&cty);
+                    let kspell = self.decl_spelling(&kty);
+                    let vspell = self.decl_spelling(&vty);
+                    let _ = writeln!(
+                        out,
+                        "{t}for ({}::iterator {it} = {access}.begin(); {it} != {access}.end(); ++{it}) {{",
+                        cty.base
+                    );
+                    if let Some(vv) = value_var {
+                        self.define_local(var, kty);
+                        self.define_local(vv, vty);
+                        let _ = writeln!(out, "{t}\t{kspell} {var} = {it}->first;");
+                        let _ = writeln!(out, "{t}\t{vspell} {vv} = {it}->second;");
+                    } else {
+                        self.define_local(var, vty);
+                        let _ = writeln!(out, "{t}\t{vspell} {var} = {it}->second;");
+                    }
+                    self.gen_block_inner(body, ind + 1, out);
+                    self.emit_owned_deletes(out, ind + 1);
+                    let _ = writeln!(out, "{t}}}");
+                } else if is_container_ty(&cty) {
+                    // for (item in array) → index loop with element binding.
+                    if value_var.is_some() {
+                        self.err("`for (key => value in ...)` is only valid over a Map".into());
+                    }
+                    let idx = self.fresh("i");
+                    let elem_ty = self.element_ty(&cty);
+                    let elem_spell = self.decl_spelling(&elem_ty);
+                    self.define_local(var, elem_ty);
+                    let _ = writeln!(
+                        out,
+                        "{t}for (size_t {idx} = 0; {idx} < {access}.size(); ++{idx}) {{"
+                    );
+                    let _ = writeln!(out, "{t}\t{elem_spell} {var} = {access}[{idx}];");
+                    self.gen_block_inner(body, ind + 1, out);
+                    self.emit_owned_deletes(out, ind + 1);
+                    let _ = writeln!(out, "{t}}}");
+                } else {
+                    // Not a range, vector, or map: Hatchet has no general iterator
+                    // protocol, so this would otherwise emit invalid `.size()`/`[]`
+                    // access. Fail loudly instead of guessing.
+                    self.err(format!(
+                        "cannot iterate `for ({var} in ...)` over `{}`: only ranges, Array, and Map are iterable (a custom Iterator/Iterable is unsupported)",
+                        if cty.base.is_empty() { "an unknown type" } else { &cty.base }
+                    ));
+                }
             }
         }
         self.pop_scope();
@@ -1088,8 +1370,9 @@ impl<'a> BodyGen<'a> {
                 let (s, _) = self.gen_expr(start);
                 let (e, _) = self.gen_expr(end);
                 self.define_local(var, int_ty());
+                let lv = self.loop_var(var);
                 (
-                    format!("{t}for (int {var} = {s}; {var} < {e}; ++{var}) {{\n"),
+                    format!("{t}for (int {lv} = {s}; {lv} < {e}; ++{lv}) {{\n"),
                     format!("{t}}}\n"),
                 )
             }
@@ -1130,7 +1413,7 @@ impl<'a> BodyGen<'a> {
         };
         let body_prelude = std::mem::replace(&mut self.prelude, saved);
 
-        let _ = write!(buf, "{t}{container} {tmp};\n");
+        let _ = writeln!(buf, "{t}{container} {tmp};");
         buf.push_str(&header);
         buf.push_str(&body_prelude);
         if let Some(g) = guard {
@@ -1192,7 +1475,7 @@ impl<'a> BodyGen<'a> {
                 let _ = writeln!(push_block, "{t}\t{tmp}.push_back({bcode});");
                 bty
             }
-            // Block-bodied map lambdas are not used by the corpus.
+            // Block-bodied map lambdas are not supported.
             LambdaBody::Block(_) => Ty::default(),
         };
         let body_prelude = std::mem::replace(&mut self.prelude, saved);
@@ -1223,6 +1506,116 @@ impl<'a> BodyGen<'a> {
         (tmp, vec_ty)
     }
 
+    /// `Array.filter(p)` → a hoisted `std::vector<T>` (same element type as the
+    /// receiver) holding the elements for which the predicate is true. Mirrors
+    /// `gen_array_map`'s lambda inlining, but the body is a `bool` guard.
+    fn gen_array_filter(
+        &mut self,
+        rcode: &str,
+        rty: &Ty,
+        params: &[Param],
+        body: &LambdaBody,
+    ) -> (String, Ty) {
+        let ind = self.prelude_ind;
+        let t = "\t".repeat(ind);
+        let tmp = self.fresh("flt");
+        let idx = self.fresh("i");
+        let access = if rty.is_ptr { format!("(*{rcode})") } else { rcode.to_string() };
+        let elem = self.elem_member_ty(rty);
+        let spell = self.decl_spelling(&elem);
+        let var = params.first().map(|p| p.name.clone()).unwrap_or_else(|| "_x".to_string());
+
+        self.push_scope();
+        self.define_local(&var, elem.clone());
+        // Capture any prelude the predicate hoists so it lands inside the loop.
+        let saved = std::mem::take(&mut self.prelude);
+        let pred = match body {
+            LambdaBody::Expr(e) => self.gen_expr(e).0,
+            // A block-bodied predicate is not supported; bail to keep the match total.
+            LambdaBody::Block(_) => {
+                self.prelude = saved;
+                self.pop_scope();
+                return (tmp, Ty::default());
+            }
+        };
+        let pred_prelude = std::mem::replace(&mut self.prelude, saved);
+        self.pop_scope();
+
+        let vec_ty = Ty { base: format!("std::vector<{spell} >"), ..Default::default() };
+        let mut buf = String::new();
+        let _ = writeln!(buf, "{t}{} {tmp};", self.decl_spelling(&vec_ty));
+        let _ = writeln!(buf, "{t}for (size_t {idx} = 0; {idx} < {access}.size(); ++{idx}) {{");
+        let _ = writeln!(buf, "{t}\t{spell} {var} = {access}[{idx}];");
+        buf.push_str(&pred_prelude);
+        let _ = writeln!(buf, "{t}\tif ({pred}) {{ {tmp}.push_back({var}); }}");
+        let _ = writeln!(buf, "{t}}}");
+        self.prelude.push_str(&buf);
+
+        (tmp, vec_ty)
+    }
+
+    /// `Array.sort(cmp)` → an in-place insertion sort (no `<algorithm>`). The
+    /// comparator lambda takes two elements and returns an `Int` (`< 0` / `0` /
+    /// `> 0`, like Haxe). Mutates the receiver; the expression's value is Void.
+    fn gen_array_sort(
+        &mut self,
+        rcode: &str,
+        rty: &Ty,
+        params: &[Param],
+        body: &LambdaBody,
+    ) -> (String, Ty) {
+        let ind = self.prelude_ind;
+        let t = "\t".repeat(ind);
+        let access = if rty.is_ptr { format!("(*{rcode})") } else { rcode.to_string() };
+        let elem = self.elem_member_ty(rty);
+        let spell = self.decl_spelling(&elem);
+        let i = self.fresh("i");
+        let j = self.fresh("j");
+        let key = self.fresh("key");
+        let cmp = self.fresh("cmp");
+        // The comparator's two parameters (defaulted if the lambda omits them).
+        let a = params.first().map(|p| p.name.clone()).unwrap_or_else(|| "_a".to_string());
+        let b = params.get(1).map(|p| p.name.clone()).unwrap_or_else(|| "_b".to_string());
+
+        self.push_scope();
+        self.define_local(&a, elem.clone());
+        self.define_local(&b, elem.clone());
+        // Comparator body, capturing any prelude it hoists.
+        let saved = std::mem::take(&mut self.prelude);
+        let ccode = match body {
+            LambdaBody::Expr(e) => self.gen_expr(e).0,
+            LambdaBody::Block(_) => {
+                self.prelude = saved;
+                self.pop_scope();
+                return ("((void)0)".to_string(), Ty::default());
+            }
+        };
+        let cmp_prelude = std::mem::replace(&mut self.prelude, saved);
+        self.pop_scope();
+
+        // Insertion sort: shift elements while the comparator says they belong after
+        // `key`. `a` is bound to the element under test, `b` to `key`, so the
+        // comparator's parameter references resolve inside the loop body.
+        let mut buf = String::new();
+        let _ = writeln!(buf, "{t}for (size_t {i} = 1; {i} < {access}.size(); ++{i}) {{");
+        let _ = writeln!(buf, "{t}\t{spell} {key} = {access}[{i}];");
+        let _ = writeln!(buf, "{t}\tsize_t {j} = {i};");
+        let _ = writeln!(buf, "{t}\twhile ({j} > 0) {{");
+        let _ = writeln!(buf, "{t}\t\t{spell} {a} = {access}[{j} - 1];");
+        let _ = writeln!(buf, "{t}\t\t{spell} {b} = {key};");
+        buf.push_str(&cmp_prelude);
+        let _ = writeln!(buf, "{t}\t\tint {cmp} = {ccode};");
+        let _ = writeln!(buf, "{t}\t\tif ({cmp} <= 0) break;");
+        let _ = writeln!(buf, "{t}\t\t{access}[{j}] = {a};");
+        let _ = writeln!(buf, "{t}\t\t--{j};");
+        let _ = writeln!(buf, "{t}\t}}");
+        let _ = writeln!(buf, "{t}\t{access}[{j}] = {key};");
+        let _ = writeln!(buf, "{t}}}");
+        self.prelude.push_str(&buf);
+
+        ("((void)0)".to_string(), Ty::default())
+    }
+
     fn gen_block_inner(&mut self, st: &Stmt, ind: usize, out: &mut String) {
         match st {
             Stmt::Block(stmts) => {
@@ -1244,6 +1637,18 @@ impl<'a> BodyGen<'a> {
     ) {
         let t = "\t".repeat(ind);
         let (subj, sty) = self.gen_expr(subject);
+        // The subject may hoist statements (a call, a comprehension); emit them
+        // before the switch rather than leaving them for the next statement.
+        self.flush(out);
+        // A subject that cannot be a C++ `case` label — a `String`, or a
+        // floating-point value such as a non-integral `enum abstract` — lowers to an
+        // `if`/`else if` chain comparing the subject (hoisted once) against each
+        // case's pattern(s) with `==`.
+        if matches!(sty.base.as_str(), "std::string" | "float" | "double") {
+            let spell = self.decl_spelling(&sty);
+            self.gen_equality_switch(&subj, &spell, cases, default, ind, out);
+            return;
+        }
         let _ = writeln!(out, "{t}switch ({subj}) {{");
         for case in cases {
             for pat in &case.patterns {
@@ -1274,12 +1679,133 @@ impl<'a> BodyGen<'a> {
         let _ = writeln!(out, "{t}}}");
     }
 
+    /// Lower a `switch` on a non-integral subject (a `String`, or a float-backed
+    /// `enum abstract`) to an `if`/`else if`/`else` chain. The subject is hoisted
+    /// into one local of type `spell` (so a side-effecting subject runs once), and
+    /// each case's patterns become an OR-ed equality test. Haxe cases do not fall
+    /// through, which the chain matches naturally.
+    fn gen_equality_switch(
+        &mut self,
+        subj: &str,
+        spell: &str,
+        cases: &[Case],
+        default: Option<&[Stmt]>,
+        ind: usize,
+        out: &mut String,
+    ) {
+        let t = "\t".repeat(ind);
+        let sw = self.fresh("sw");
+        let _ = writeln!(out, "{t}{spell} {sw} = {subj};");
+        let mut started = false;
+        for case in cases {
+            // String case patterns are constants (literals), so they hoist nothing.
+            let cond = case
+                .patterns
+                .iter()
+                .map(|p| format!("{sw} == {}", self.gen_expr(p).0))
+                .collect::<Vec<_>>()
+                .join(" || ");
+            let kw = if started { "} else if" } else { "if" };
+            let _ = writeln!(out, "{t}{kw} ({cond}) {{");
+            self.push_scope();
+            for s in &case.body {
+                self.gen_stmt(s, ind + 1, out);
+            }
+            self.pop_scope();
+            started = true;
+        }
+        match default {
+            Some(d) if started => {
+                let _ = writeln!(out, "{t}}} else {{");
+                self.push_scope();
+                for s in d {
+                    self.gen_stmt(s, ind + 1, out);
+                }
+                self.pop_scope();
+                let _ = writeln!(out, "{t}}}");
+            }
+            // A `default` with no preceding `case` is just an unconditional block.
+            Some(d) => {
+                let _ = writeln!(out, "{t}{{");
+                self.push_scope();
+                for s in d {
+                    self.gen_stmt(s, ind + 1, out);
+                }
+                self.pop_scope();
+                let _ = writeln!(out, "{t}}}");
+            }
+            None if started => {
+                let _ = writeln!(out, "{t}}}");
+            }
+            None => {}
+        }
+    }
+
+    /// Desugar a value-position `switch` into a hoisted temporary plus a statement
+    /// `switch` (reusing the integer/string/enum lowering): each arm assigns its
+    /// trailing value expression to the temp, and the whole thing evaluates to it.
+    fn gen_switch_expr(
+        &mut self,
+        subject: &Expr,
+        cases: &[Case],
+        default: Option<&[Stmt]>,
+    ) -> (String, Ty) {
+        let tmp = self.fresh("swx");
+        // The result type comes from the first arm's (or default's) value.
+        let ty = self.switch_expr_ty(cases, default);
+        let spell = self.decl_spelling(&ty);
+        // Rewrite each arm so its trailing value expression assigns to the temp.
+        let cases2: Vec<Case> = cases
+            .iter()
+            .map(|c| Case { patterns: c.patterns.clone(), body: assign_last_to(&c.body, &tmp) })
+            .collect();
+        let default2: Option<Vec<Stmt>> = default.map(|d| assign_last_to(d, &tmp));
+
+        // Build the statement switch in an isolated prelude context so its internal
+        // flushing does not move unrelated, already-pending prelude into the middle.
+        let saved = std::mem::take(&mut self.prelude);
+        let ind = self.prelude_ind;
+        let mut buf = String::new();
+        self.gen_switch(subject, &cases2, default2.as_deref(), ind, &mut buf);
+        // `gen_switch` flushes its own prelude into `buf`; nothing should remain.
+        let leftover = std::mem::replace(&mut self.prelude, saved);
+        let t = "\t".repeat(ind);
+        self.prelude.push_str(&format!("{t}{spell} {tmp};\n"));
+        self.prelude.push_str(&leftover);
+        self.prelude.push_str(&buf);
+        (tmp, ty)
+    }
+
+    /// The result type of a value-position `switch`: the type of the first arm's
+    /// (or the default's) trailing value expression, inferred without emitting.
+    fn switch_expr_ty(&mut self, cases: &[Case], default: Option<&[Stmt]>) -> Ty {
+        let value = cases
+            .iter()
+            .find_map(|c| case_value_expr(&c.body))
+            .or_else(|| default.and_then(case_value_expr))
+            .cloned();
+        match value {
+            Some(e) => self.dry_ty(&e),
+            None => Ty::default(),
+        }
+    }
+
+    /// Infer an expression's type without emitting any code: the throwaway
+    /// generation's prelude is discarded (a value expression has no side effects we
+    /// need to keep). The fresh-name counter may advance, which is harmless.
+    fn dry_ty(&mut self, e: &Expr) -> Ty {
+        let saved = std::mem::take(&mut self.prelude);
+        let (_, ty) = self.gen_expr(e);
+        self.prelude = saved;
+        ty
+    }
+
     fn case_label(&mut self, pat: &Expr, subj_ty: &Ty) -> String {
         if let Expr::Ident(name) = pat {
             // bare enum variant → qualify with the subject's enum type
             if let Some(info) = &subj_ty.info {
                 if info.kind == TypeKind::Enum {
-                    return format!("{}", self.enum_constant(info, name));
+                    return self.enum_constant(info, name).to_string();
                 }
             }
         }
@@ -1290,8 +1816,62 @@ impl<'a> BodyGen<'a> {
 
     /// Generate a statement-level expression, handling assignment to property
     /// accessors (`a.x = v` → `a->SetX(v)`).
+    /// `arr[i] = v` where `arr` lowers to a `std::vector`. Haxe array writes
+    /// auto-extend the array — a write past the end grows it, default-filling the
+    /// gap — whereas C++ `operator[]` is out-of-bounds UB there. Emit a grow-guard
+    /// that resizes first, evaluating the index exactly once. Returns `None` for a
+    /// non-vector receiver (a map inserts on write; anything else uses the normal
+    /// assignment path), having pushed nothing.
+    fn try_array_index_assign(
+        &mut self,
+        recv: &Expr,
+        idx: &Expr,
+        value: &Expr,
+    ) -> Option<(String, Ty)> {
+        let (rcode, rty) = self.gen_expr(recv);
+        if !rty.base.starts_with("std::vector") {
+            return None;
+        }
+        let access = if rty.is_ptr && is_container_ty(&rty) {
+            format!("(*{rcode})")
+        } else {
+            rcode
+        };
+        let (icode, _) = self.gen_expr(idx);
+        let ix = self.fresh("ix");
+        let t = "\t".repeat(self.prelude_ind);
+        self.prelude.push_str(&format!("{t}size_t {ix} = (size_t)({icode});\n"));
+        self.prelude
+            .push_str(&format!("{t}if ({ix} >= {access}.size()) {access}.resize({ix} + 1);\n"));
+        let ety = self.element_ty(&rty);
+        // `arr[i] = []` clears the (now-present) element container.
+        if matches!(value, Expr::ArrayLit(v) if v.is_empty()) {
+            return Some((format!("{access}[{ix}].clear()"), Ty::default()));
+        }
+        // `arr[i] = { ... }` builds the struct into a temp, then assigns it.
+        if let Expr::ObjectLit(fields) = value {
+            if ety.info.is_some() && !ety.base.is_empty() {
+                let tmp = self.hoist_object(fields, ety.clone());
+                return Some((format!("{access}[{ix}] = {tmp}"), ety));
+            }
+        }
+        self.expected = Some(ety.clone());
+        let (vcode, _) = self.gen_expr(value);
+        self.expected = None;
+        Some((format!("{access}[{ix}] = {vcode}"), ety))
+    }
+
     fn gen_assign_or_expr(&mut self, e: &Expr) -> (String, Ty) {
         if let Expr::Assign { op: None, target, value } = e {
+            // `arr[i] = v` into an Array (→ std::vector): Haxe auto-extends the
+            // array on an out-of-range write, so emit a grow-guard first (C++
+            // `operator[]` past the end is undefined behaviour). Maps and other
+            // receivers fall through to the normal assignment path.
+            if let Expr::Index(recv, idx) = &**target {
+                if let Some(result) = self.try_array_index_assign(recv, idx, value) {
+                    return result;
+                }
+            }
             // x = []  → x.clear()
             if matches!(&**value, Expr::ArrayLit(v) if v.is_empty()) {
                 let (t, _) = self.gen_expr(target);
@@ -1375,13 +1955,30 @@ impl<'a> BodyGen<'a> {
             Expr::Float(s) => (float_lit(s), Ty { base: "float".into(), ..Default::default() }),
             Expr::Bool(b) => (b.to_string(), Ty { base: "bool".into(), ..Default::default() }),
             Expr::Null => ("NULL".into(), Ty::default()),
+            // `untyped X` — emit X verbatim; its type is opaque to Hatchet.
+            Expr::Verbatim(code) => (code.clone(), Ty::default()),
+            // Regex literals are flagged `Unsupported` in validation, so a module
+            // using one is never generated; this arm only keeps the match total.
+            Expr::Regex { .. } => {
+                self.err("regular-expression literals are not supported".to_string());
+                ("/* regex unsupported */".into(), Ty::default())
+            }
+            // The `is` operator is flagged `Unsupported` in validation, so a module
+            // using one is never generated; this arm only keeps the match total.
+            Expr::Is { .. } => {
+                self.err("the `is` type-check operator is not supported".to_string());
+                ("/* is unsupported */".into(), Ty { base: "bool".into(), ..Default::default() })
+            }
+            Expr::Switch { subject, cases, default } => {
+                self.gen_switch_expr(subject, cases, default.as_deref())
+            }
             Expr::Str { raw, interpolated } => self.gen_string(raw, *interpolated),
             Expr::This => (
                 "this".into(),
                 Ty {
                     base: self.class.name.clone(),
                     is_ptr: true,
-                    info: self.prog.resolve_type(&[self.class.name.clone()], self.mi).cloned(),
+                    info: self.prog.resolve_type(std::slice::from_ref(&self.class.name), self.mi).cloned(),
                     ..Default::default()
                 },
             ),
@@ -1441,7 +2038,8 @@ impl<'a> BodyGen<'a> {
                     return (format!("std::string({a})"), Ty { base, ..Default::default() });
                 }
                 let param_tys = self.ctor_param_types(ty);
-                let a = self.gen_args_typed(args, &param_tys, false);
+                let owned = self.ctor_owned_params(ty);
+                let a = self.gen_args_owned(args, &param_tys, &owned, false);
                 (
                     format!("new {base}({a})"),
                     Ty {
@@ -1485,6 +2083,27 @@ impl<'a> BodyGen<'a> {
                         }
                     }
                 }
+                // String concatenation: in Haxe `+` with a `String` operand concatenates
+                // (stringifying the other side). In C++ `int + "literal"` would be
+                // pointer arithmetic and `std::string + int` does not compile, so build a
+                // `std::string` concatenation, formatting any non-string operand.
+                if matches!(*op, BinOp::Add) && (lty.base == "std::string" || rty.base == "std::string") {
+                    let lpart = self.concat_part(&l, &lty);
+                    let rpart = self.concat_part(&r, &rty);
+                    // `"a" + "b"` is `const char* + const char*` — anchor the left as a
+                    // `std::string` so the chain is string concatenation, not pointer math.
+                    let lpart = if matches!(lhs.as_ref(), Expr::Str { .. })
+                        && matches!(rhs.as_ref(), Expr::Str { .. })
+                    {
+                        format!("std::string({lpart})")
+                    } else {
+                        lpart
+                    };
+                    return (
+                        format!("{lpart} + {rpart}"),
+                        Ty { base: "std::string".into(), ..Default::default() },
+                    );
+                }
                 let ty = binop_result_ty(*op, lty);
                 (format!("{l} {} {r}", binop(*op)), ty)
             }
@@ -1523,7 +2142,7 @@ impl<'a> BodyGen<'a> {
                 let tmp = self.fresh("map");
                 let mut buf = String::new();
                 self.expand_map_into_local(
-                    &tmp, &map_ty, &Ty::default(), &Ty::default(), pairs, self.prelude_ind, &mut buf,
+                    &tmp, &map_ty, &Ty::default(), pairs, self.prelude_ind, &mut buf,
                 );
                 self.prelude.push_str(&buf);
                 (tmp, map_ty)
@@ -1550,7 +2169,14 @@ impl<'a> BodyGen<'a> {
                     None => (c, cty),
                 }
             }
-            Expr::TypeCheck { expr, .. } => self.gen_expr(expr),
+            // `(expr : Type)` is a compile-time type ascription with no runtime
+            // effect — emit the inner expression unchanged, but honor the ascribed
+            // type (it is exactly the hint for cases like `([] : Array<Int>)` or
+            // `(null : Foo)`, where the inner expression's own type is uninformative).
+            Expr::TypeCheck { expr, ty } => {
+                let (c, _) = self.gen_expr(expr);
+                (c, self.ty_of(ty))
+            }
         }
     }
 
@@ -1639,24 +2265,53 @@ impl<'a> BodyGen<'a> {
         }
         // A global `final` constant (`static const` inside its namespace, or a
         // `@:native` const from the C++ engine): namespace-qualify the reference
-        // when it is used from a different namespace — e.g. `mucus::MAX_CHARACTERS`,
+        // when it is used from a different namespace — e.g. `native::MAX_CHARACTERS`,
         // or `game::ALIENBEACH_SCENE_ID` inside a global-scope `extern "C"` export.
         if let Some(qref) = self.prog.global_final_ref(name, self.mi, &self.ns) {
             return (qref, Ty::default());
+        }
+        // A bare enum variant in expression position (`return CircleKind`,
+        // `kind = RectKind`): qualify it with its enum's C++ type, mirroring the
+        // `switch`-case path (`demo::ShapeKind_::CircleKind`). Without this the
+        // raw `CircleKind` is undeclared in C++ (the constant lives inside the
+        // enum's `struct E_`).
+        if let Some((qref, ty)) = self.enum_variant_ref(name) {
+            return (qref, ty);
+        }
+        // Reference to the value of a non-binding catch (`catch (...)` from an
+        // untyped/`Dynamic` catch): C++ cannot bind the value, so this can't be
+        // lowered. Fail loudly instead of emitting an undeclared identifier. (Only
+        // reached when `name` resolved to nothing else — a shadowing local would
+        // have been found above.)
+        if self.nonbinding_catch_vars.iter().any(|n| n == name) {
+            self.err(format!(
+                "the value `{name}` of an untyped/`Dynamic` catch cannot be used: C++ `catch (...)` \
+                 does not bind the exception — give the catch a concrete type (e.g. `catch ({name}:String)`)"
+            ));
+            return (name.to_string(), Ty::default());
         }
         // free function / global / unknown — pass through
         (name.to_string(), Ty::default())
     }
 
     fn gen_field(&mut self, recv: &Expr, name: &str) -> (String, Ty) {
-        // Enum constant: `EnumType.Variant`
+        // Enum constant: `EnumType.Variant` (a plain/Int enum, or a non-integral
+        // `enum abstract` whose member is the underlying type).
         if let Expr::Ident(tname) = recv {
             if self.lookup_local(tname).is_none() && self.class_field(tname).is_none() {
-                if let Some(info) = self.prog.resolve_type(&[tname.clone()], self.mi).cloned() {
-                    if info.kind == TypeKind::Enum {
+                if let Some(info) = self.prog.resolve_type(std::slice::from_ref(tname), self.mi).cloned() {
+                    if matches!(info.kind, TypeKind::Enum | TypeKind::EnumAbstract) {
+                        let base = if info.kind == TypeKind::EnumAbstract {
+                            self.prog
+                                .enum_abstract_underlying(&info)
+                                .map(|u| self.prog.map_type_base(&u, self.mi, &self.ns))
+                                .unwrap_or_else(|| info.cpp_name().to_string())
+                        } else {
+                            info.cpp_name().to_string()
+                        };
                         return (
                             self.enum_constant(&info, name),
-                            Ty { base: info.cpp_name().to_string(), info: Some(info), ..Default::default() },
+                            Ty { base, info: Some(info), ..Default::default() },
                         );
                     }
                 }
@@ -1733,7 +2388,8 @@ impl<'a> BodyGen<'a> {
     fn hoist_new_receiver(&mut self, ty: &Type, args: &[Expr]) -> (String, Ty) {
         let base = self.prog.map_type_base(ty, self.mi, &self.ns);
         let param_tys = self.ctor_param_types(ty);
-        let a = self.gen_args_typed(args, &param_tys, false);
+        let owned = self.ctor_owned_params(ty);
+        let a = self.gen_args_owned(args, &param_tys, &owned, false);
         let rty = Ty {
             base: base.clone(),
             is_ptr: true,
@@ -1834,6 +2490,13 @@ impl<'a> BodyGen<'a> {
         }
         // Bare call: free function or own method.
         if let Expr::Ident(fname) = target {
+            // `trace(...)` is the Haxe top-level trace (unless shadowed locally).
+            if fname == "trace"
+                && self.lookup_local(fname).is_none()
+                && self.class_field(fname).is_none()
+            {
+                return self.gen_trace(args);
+            }
             // An aliased import (`import a.b.Foo as Bar;`) calls the real name.
             let callee = self.resolve_alias(fname);
             let param_tys = self.own_method_param_types(fname);
@@ -1849,13 +2512,25 @@ impl<'a> BodyGen<'a> {
         (format!("{tc}({a})"), Ty::default())
     }
 
-    /// Return type of a top-level free function declared in this module.
+    /// Return type of a top-level free function — a lambda-form `final NAME = …` or
+    /// a plain `function NAME(...)`. Searched across all modules (a free function may
+    /// be imported from another file), so a `var x = f()` gets a typed declaration.
     fn free_fn_return(&self, name: &str) -> Option<Ty> {
-        for d in &self.prog.modules[self.mi].file.decls {
-            if let Decl::Global(g) = d {
-                if g.name == name {
-                    let (_, ret, body) = lambda_parts(g)?;
-                    return Some(self.resolve_lambda_ret(ret, body, g.ty.as_ref()));
+        for m in &self.prog.modules {
+            for d in &m.file.decls {
+                match d {
+                    Decl::Global(g) if g.name == name => {
+                        if let Some((_, ret, body)) = lambda_parts(g) {
+                            return Some(self.resolve_lambda_ret(ret, body, g.ty.as_ref()));
+                        }
+                    }
+                    Decl::Function(f) if f.name.as_deref() == Some(name) && f.body.is_some() => {
+                        return Some(match &f.ret {
+                            Some(t) => self.ty_of(t),
+                            None => Ty { base: "void".into(), ..Default::default() },
+                        });
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1880,8 +2555,22 @@ impl<'a> BodyGen<'a> {
     }
 
     /// Generate call arguments, hoisting anonymous struct literals to temporaries
-    /// typed by the callee's parameter (per SKILL: anon struct arg → temp var).
+    /// typed by the callee's parameter (an anon-struct argument → a named temp var).
     fn gen_args_typed(&mut self, args: &[Expr], param_tys: &[Option<Ty>], coerce_str: bool) -> String {
+        self.gen_args_owned(args, param_tys, &[], coerce_str)
+    }
+
+    /// As [`gen_args_typed`], plus `owned`: per-position flags marking parameters
+    /// the callee takes ownership of (constructor args stored into freed fields). A
+    /// `new` at an owned position is emitted inline (the callee frees it) instead of
+    /// being hoisted into a scope-owned local that would double-free it.
+    fn gen_args_owned(
+        &mut self,
+        args: &[Expr],
+        param_tys: &[Option<Ty>],
+        owned: &[bool],
+        coerce_str: bool,
+    ) -> String {
         args.iter()
             .enumerate()
             .map(|(i, a)| {
@@ -1913,10 +2602,17 @@ impl<'a> BodyGen<'a> {
                         tmp
                     }
                     // A `new X(...)` argument is hoisted to an owned local (the
-                    // caller frees it) unless the receiver escapes.
+                    // caller frees it) unless the receiver escapes — or the callee
+                    // takes ownership of this parameter (an `@owned`/allocated field),
+                    // in which case the constructed object frees it, so it is emitted
+                    // inline to avoid a double-free.
                     Expr::New(nty, _) if !is_value_new(nty) => {
                         let (code, vty) = self.gen_expr(a);
-                        self.place_new_arg(code, vty)
+                        if owned.get(i).copied().unwrap_or(false) {
+                            code
+                        } else {
+                            self.place_new_arg(code, vty)
+                        }
                     }
                     _ => {
                         let (code, vty) = self.gen_expr(a);
@@ -2020,7 +2716,18 @@ impl<'a> BodyGen<'a> {
                 let val = self.gen_args_typed(&args[1..2], &[Some(elem)], false);
                 Some((format!("{rcode}.insert({rcode}.begin() + {pos}, {val})"), Ty::default()))
             }
-            "pop" => Some((format!("{rcode}.back()"), Ty::default())),
+            "pop" => {
+                // Haxe `Array.pop()` removes AND returns the last element; C++
+                // `back()` only *reads* it and `pop_back()` returns `void`, so capture
+                // the value into a temp first, then shrink the vector.
+                let elem = self.element_ty(_rty);
+                let spell = self.decl_spelling(&elem);
+                let tmp = self.fresh("pop");
+                let t = "\t".repeat(self.prelude_ind);
+                self.prelude.push_str(&format!("{t}{spell} {tmp} = {rcode}.back();\n"));
+                self.prelude.push_str(&format!("{t}{rcode}.pop_back();\n"));
+                Some((tmp, elem))
+            }
             // Map.get(k) → m[k]; element type is the map's value type.
             "get" if rcode_is_map(_rty) => {
                 let k = self.gen_expr(&args[0]).0;
@@ -2038,6 +2745,222 @@ impl<'a> BodyGen<'a> {
                 } else {
                     None
                 }
+            }
+            // Array.filter(p) → a hoisted std::vector of the elements the predicate
+            // keeps (same element type as the receiver).
+            "filter" if matches!(args.first(), Some(Expr::Lambda { .. })) => {
+                if let Some(Expr::Lambda { params, body, .. }) = args.first() {
+                    Some(self.gen_array_filter(rcode, _rty, params, body))
+                } else {
+                    None
+                }
+            }
+            // Array.sort(cmp) → an in-place insertion sort (no `<algorithm>`) driven
+            // by the comparator lambda; mutates the receiver, returns Void.
+            "sort" if matches!(args.first(), Some(Expr::Lambda { .. })) => {
+                if let Some(Expr::Lambda { params, body, .. }) = args.first() {
+                    Some(self.gen_array_sort(rcode, _rty, params, body))
+                } else {
+                    None
+                }
+            }
+
+            // ---- Map (std::map) methods ------------------------------------
+            // `Map.set(k, v)` → `m[k] = v`.
+            "set" if rcode_is_map(_rty) => {
+                let k = self.gen_expr(&args[0]).0;
+                let v = self.gen_expr(&args[1]).0;
+                Some((format!("{rcode}[{k}] = {v}"), Ty::default()))
+            }
+            // `Map.remove(k)` → `m.erase(k)`; Haxe returns Bool (was it present?).
+            "remove" if rcode_is_map(_rty) => {
+                let k = self.gen_expr(&args[0]).0;
+                Some((format!("({rcode}.erase({k}) != 0)"), bool_ty()))
+            }
+            // `Map.keys()` → a hoisted std::vector<K> of the keys (iterable via the
+            // ordinary collection `for`).
+            "keys" if rcode_is_map(_rty) => {
+                let kspell = self.decl_spelling(&self.map_key_ty(_rty));
+                let it = self.fresh("it");
+                let acc = self.fresh("keys");
+                let t = "\t".repeat(self.prelude_ind);
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}std::vector<{kspell} > {acc};");
+                let _ = writeln!(
+                    pre,
+                    "{t}for ({}::iterator {it} = {rcode}.begin(); {it} != {rcode}.end(); ++{it}) {{ {acc}.push_back({it}->first); }}",
+                    _rty.base
+                );
+                self.prelude.push_str(&pre);
+                Some((acc, Ty { base: format!("std::vector<{kspell} >"), ..Default::default() }))
+            }
+
+            // ---- Array (std::vector) methods -------------------------------
+            // `Array.contains(x)` → linear scan, no <algorithm> dependency.
+            "contains" => {
+                let x = self.gen_expr(&args[0]).0;
+                let i = self.fresh("i");
+                let has = self.fresh("has");
+                let t = "\t".repeat(self.prelude_ind);
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}bool {has} = false;");
+                let _ = writeln!(
+                    pre,
+                    "{t}for (size_t {i} = 0; {i} < {rcode}.size(); ++{i}) {{ if ({rcode}[{i}] == {x}) {{ {has} = true; break; }} }}"
+                );
+                self.prelude.push_str(&pre);
+                Some((has, bool_ty()))
+            }
+            // `Array.indexOf(x[, fromIndex])` → first matching index or -1.
+            "indexOf" => {
+                let x = self.gen_expr(&args[0]).0;
+                let start = if args.len() > 1 { self.gen_expr(&args[1]).0 } else { "0".to_string() };
+                let i = self.fresh("i");
+                let idx = self.fresh("idx");
+                let t = "\t".repeat(self.prelude_ind);
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}int {idx} = -1;");
+                let _ = writeln!(
+                    pre,
+                    "{t}for (size_t {i} = (size_t)({start}); {i} < {rcode}.size(); ++{i}) {{ if ({rcode}[{i}] == {x}) {{ {idx} = (int){i}; break; }} }}"
+                );
+                self.prelude.push_str(&pre);
+                Some((idx, int_ty()))
+            }
+            // `Array.remove(x)` → erase first match; Haxe returns Bool.
+            "remove" => {
+                let x = self.gen_expr(&args[0]).0;
+                let i = self.fresh("i");
+                let rem = self.fresh("rem");
+                let t = "\t".repeat(self.prelude_ind);
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}bool {rem} = false;");
+                let _ = writeln!(
+                    pre,
+                    "{t}for (size_t {i} = 0; {i} < {rcode}.size(); ++{i}) {{ if ({rcode}[{i}] == {x}) {{ {rcode}.erase({rcode}.begin() + {i}); {rem} = true; break; }} }}"
+                );
+                self.prelude.push_str(&pre);
+                Some((rem, bool_ty()))
+            }
+            // `Array.reverse()` → in-place swap loop (Void).
+            "reverse" => {
+                let espell = self.decl_spelling(&self.element_ty(_rty));
+                let i = self.fresh("i");
+                let tmp = self.fresh("tmp");
+                let t = "\t".repeat(self.prelude_ind);
+                let mut pre = String::new();
+                let _ = writeln!(
+                    pre,
+                    "{t}for (size_t {i} = 0; {i} < {rcode}.size() / 2; ++{i}) {{ {espell} {tmp} = {rcode}[{i}]; {rcode}[{i}] = {rcode}[{rcode}.size() - 1 - {i}]; {rcode}[{rcode}.size() - 1 - {i}] = {tmp}; }}"
+                );
+                self.prelude.push_str(&pre);
+                Some(("((void)0)".to_string(), Ty::default()))
+            }
+            // `Array.copy()` → a shallow copy via the vector copy constructor.
+            "copy" => Some((format!("{}({rcode})", _rty.base), _rty.clone())),
+            // `Array.join(sep)` → concatenate elements (stringified) with `sep`.
+            "join" => {
+                let sep = self.gen_expr(&args[0]).0;
+                let elem = self.element_ty(_rty);
+                let i = self.fresh("i");
+                let acc = self.fresh("join");
+                let t = "\t".repeat(self.prelude_ind);
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}std::string {acc};");
+                if elem.base == "std::string" {
+                    let _ = writeln!(
+                        pre,
+                        "{t}for (size_t {i} = 0; {i} < {rcode}.size(); ++{i}) {{ if ({i}) {acc} += {sep}; {acc} += {rcode}[{i}]; }}"
+                    );
+                } else {
+                    let (spec, _) = self.spec_for("", &elem);
+                    let buf = self.fresh("buf");
+                    let _ = writeln!(
+                        pre,
+                        "{t}for (size_t {i} = 0; {i} < {rcode}.size(); ++{i}) {{ if ({i}) {acc} += {sep}; char {buf}[64]; sprintf({buf}, \"{spec}\", {rcode}[{i}]); {acc} += {buf}; }}"
+                    );
+                }
+                self.prelude.push_str(&pre);
+                Some((acc, Ty { base: "std::string".into(), ..Default::default() }))
+            }
+            // `Array.concat(other)` → a new vector: a copy of this with `other`'s
+            // elements appended (Haxe returns a fresh array, leaving both operands).
+            "concat" => {
+                let other = self.gen_expr(&args[0]).0;
+                let i = self.fresh("i");
+                let acc = self.fresh("cat");
+                let t = "\t".repeat(self.prelude_ind);
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}{} {acc} = {rcode};", _rty.base);
+                let _ = writeln!(
+                    pre,
+                    "{t}for (size_t {i} = 0; {i} < ({other}).size(); ++{i}) {{ {acc}.push_back(({other})[{i}]); }}"
+                );
+                self.prelude.push_str(&pre);
+                Some((acc, _rty.clone()))
+            }
+            // `Array.slice(pos, ?end)` → a new vector of `[pos, end)`; negative
+            // indices count from the end, and the range is clamped to the array.
+            "slice" => {
+                let pos = self.gen_expr(&args[0]).0;
+                let end = if args.len() > 1 { Some(self.gen_expr(&args[1]).0) } else { None };
+                let acc = self.fresh("slc");
+                let a = self.fresh("a");
+                let b = self.fresh("b");
+                let i = self.fresh("i");
+                let t = "\t".repeat(self.prelude_ind);
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}{} {acc};", _rty.base);
+                let _ = writeln!(pre, "{t}int {a} = (int)({pos}); if ({a} < 0) {a} += (int){rcode}.size(); if ({a} < 0) {a} = 0; if ((size_t){a} > {rcode}.size()) {a} = (int){rcode}.size();");
+                match end {
+                    Some(end) => {
+                        let _ = writeln!(pre, "{t}int {b} = (int)({end}); if ({b} < 0) {b} += (int){rcode}.size(); if ({b} < 0) {b} = 0; if ((size_t){b} > {rcode}.size()) {b} = (int){rcode}.size();");
+                    }
+                    None => {
+                        let _ = writeln!(pre, "{t}int {b} = (int){rcode}.size();");
+                    }
+                }
+                let _ = writeln!(pre, "{t}for (size_t {i} = (size_t){a}; {i} < (size_t){b}; ++{i}) {{ {acc}.push_back({rcode}[{i}]); }}");
+                self.prelude.push_str(&pre);
+                Some((acc, _rty.clone()))
+            }
+            // `Array.shift()` → remove and return the first element.
+            "shift" => {
+                let elem = self.element_ty(_rty);
+                let spell = self.decl_spelling(&elem);
+                let tmp = self.fresh("shift");
+                let t = "\t".repeat(self.prelude_ind);
+                self.prelude.push_str(&format!("{t}{spell} {tmp} = {rcode}.front();\n"));
+                self.prelude.push_str(&format!("{t}{rcode}.erase({rcode}.begin());\n"));
+                Some((tmp, elem))
+            }
+            // `Array.unshift(x)` → insert `x` at the front (Void).
+            "unshift" => {
+                let elem = self.elem_member_ty(_rty);
+                let val = self.gen_args_typed(args, &[Some(elem)], false);
+                Some((format!("{rcode}.insert({rcode}.begin(), {val})"), Ty::default()))
+            }
+            // `Array.lastIndexOf(x[, fromIndex])` → last matching index or -1,
+            // searching backward from `fromIndex` (default: the last element).
+            "lastIndexOf" => {
+                let x = self.gen_expr(&args[0]).0;
+                let i = self.fresh("i");
+                let idx = self.fresh("idx");
+                let t = "\t".repeat(self.prelude_ind);
+                let start = if args.len() > 1 {
+                    let from = self.gen_expr(&args[1]).0;
+                    format!("(size_t)({from}) + 1")
+                } else {
+                    format!("{rcode}.size()")
+                };
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}int {idx} = -1;");
+                let _ = writeln!(
+                    pre,
+                    "{t}for (size_t {i} = {start}; {i}-- > 0; ) {{ if ({i} < {rcode}.size() && {rcode}[{i}] == {x}) {{ {idx} = (int){i}; break; }} }}"
+                );
+                self.prelude.push_str(&pre);
+                Some((idx, int_ty()))
             }
             _ => None,
         }
@@ -2082,6 +3005,110 @@ impl<'a> BodyGen<'a> {
                 let i = self.gen_expr(&args[0]).0;
                 Some((format!("((int)(unsigned char){rcode}.at({i}))"), int_ty()))
             }
+            // Tier 2: ASCII case mapping done in-place on a copy (no <cctype>).
+            "toUpperCase" | "toLowerCase" => {
+                let upper = method == "toUpperCase";
+                let acc = self.fresh("case");
+                let i = self.fresh("i");
+                let t = "\t".repeat(self.prelude_ind);
+                let (lo, hi, delta) = if upper { ('a', 'z', "- 'a' + 'A'") } else { ('A', 'Z', "- 'A' + 'a'") };
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}std::string {acc} = {rcode};");
+                let _ = writeln!(
+                    pre,
+                    "{t}for (size_t {i} = 0; {i} < {acc}.size(); ++{i}) {{ if ({acc}[{i}] >= '{lo}' && {acc}[{i}] <= '{hi}') {acc}[{i}] = (char)({acc}[{i}] {delta}); }}"
+                );
+                self.prelude.push_str(&pre);
+                Some((acc, str_ty))
+            }
+            // Tier 2: `split(delim)` → a std::vector<std::string>. An empty delimiter
+            // splits into individual characters (Haxe semantics).
+            "split" => {
+                let delim = self.gen_expr(&args[0]).0;
+                let acc = self.fresh("spl");
+                let s = self.fresh("s");
+                let d = self.fresh("d");
+                let i = self.fresh("i");
+                let start = self.fresh("start");
+                let found = self.fresh("found");
+                let t = "\t".repeat(self.prelude_ind);
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}std::vector<std::string > {acc};");
+                let _ = writeln!(pre, "{t}std::string {s} = {rcode};");
+                let _ = writeln!(pre, "{t}std::string {d} = {delim};");
+                let _ = writeln!(pre, "{t}if ({d}.empty()) {{");
+                let _ = writeln!(pre, "{t}\tfor (size_t {i} = 0; {i} < {s}.size(); ++{i}) {{ {acc}.push_back({s}.substr({i}, 1)); }}");
+                let _ = writeln!(pre, "{t}}} else {{");
+                let _ = writeln!(pre, "{t}\tsize_t {start} = 0;");
+                let _ = writeln!(pre, "{t}\tsize_t {found};");
+                let _ = writeln!(pre, "{t}\twhile (({found} = {s}.find({d}, {start})) != std::string::npos) {{");
+                let _ = writeln!(pre, "{t}\t\t{acc}.push_back({s}.substr({start}, {found} - {start}));");
+                let _ = writeln!(pre, "{t}\t\t{start} = {found} + {d}.size();");
+                let _ = writeln!(pre, "{t}\t}}");
+                let _ = writeln!(pre, "{t}\t{acc}.push_back({s}.substr({start}));");
+                let _ = writeln!(pre, "{t}}}");
+                self.prelude.push_str(&pre);
+                Some((acc, Ty { base: "std::vector<std::string >".into(), ..Default::default() }))
+            }
+            // `substr(pos, ?len)` — `pos` may be negative (counted from the end);
+            // `len` omitted means "to the end". Indices are clamped to the string.
+            "substr" => {
+                let pos = self.gen_expr(&args[0]).0;
+                let len = if args.len() > 1 { Some(self.gen_expr(&args[1]).0) } else { None };
+                let s = self.fresh("s");
+                let p = self.fresh("p");
+                let res = self.fresh("sub");
+                let t = "\t".repeat(self.prelude_ind);
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}std::string {s} = {rcode};");
+                let _ = writeln!(pre, "{t}int {p} = (int)({pos});");
+                let _ = writeln!(pre, "{t}if ({p} < 0) {p} += (int){s}.size();");
+                let _ = writeln!(pre, "{t}if ({p} < 0) {p} = 0;");
+                let _ = writeln!(pre, "{t}if ((size_t){p} > {s}.size()) {p} = (int){s}.size();");
+                if let Some(len) = len {
+                    let n = self.fresh("n");
+                    let _ = writeln!(pre, "{t}int {n} = (int)({len}); if ({n} < 0) {n} = 0;");
+                    let _ = writeln!(pre, "{t}std::string {res} = {s}.substr((size_t){p}, (size_t){n});");
+                } else {
+                    let _ = writeln!(pre, "{t}std::string {res} = {s}.substr((size_t){p});");
+                }
+                self.prelude.push_str(&pre);
+                Some((res, str_ty))
+            }
+            // `substring(start, ?end)` — negative indices clamp to 0, and start/end
+            // are swapped when start > end (Haxe semantics).
+            "substring" => {
+                let start = self.gen_expr(&args[0]).0;
+                let end = if args.len() > 1 { Some(self.gen_expr(&args[1]).0) } else { None };
+                let s = self.fresh("s");
+                let a = self.fresh("a");
+                let b = self.fresh("b");
+                let res = self.fresh("sub");
+                let t = "\t".repeat(self.prelude_ind);
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}std::string {s} = {rcode};");
+                let _ = writeln!(pre, "{t}int {a} = (int)({start}); if ({a} < 0) {a} = 0; if ((size_t){a} > {s}.size()) {a} = (int){s}.size();");
+                match end {
+                    Some(end) => {
+                        let _ = writeln!(pre, "{t}int {b} = (int)({end}); if ({b} < 0) {b} = 0; if ((size_t){b} > {s}.size()) {b} = (int){s}.size();");
+                    }
+                    None => {
+                        let _ = writeln!(pre, "{t}int {b} = (int){s}.size();");
+                    }
+                }
+                let _ = writeln!(pre, "{t}if ({a} > {b}) {{ int t = {a}; {a} = {b}; {b} = t; }}");
+                let _ = writeln!(pre, "{t}std::string {res} = {s}.substr((size_t){a}, (size_t)({b} - {a}));");
+                self.prelude.push_str(&pre);
+                Some((res, str_ty))
+            }
+            // `StringBuf.add(x)` → append `x` stringified (reuses the `Std.string`
+            // lowering); `StringBuf` is a `std::string` accumulator. Returns Void.
+            "add" => {
+                let (sv, _) = self.gen_std_string(&args[0]);
+                Some((format!("{rcode} += {sv}"), Ty::default()))
+            }
+            // `StringBuf.addChar(c)` → append a single byte.
+            "addChar" => Some((format!("{rcode} += (char)({})", self.gen_expr(&args[0]).0), Ty::default())),
             _ => None,
         }
     }
@@ -2151,6 +3178,109 @@ impl<'a> BodyGen<'a> {
             }
             ("Math", "isFinite") => Some((format!("((({}) * 0.0) == 0.0)", f(self, 0)), bool_ty())),
             ("Std", "int") => Some((format!("(int)({})", f(self, 0)), Ty { base: "int".into(), ..Default::default() })),
+            ("Std", "string") => Some(self.gen_std_string(&args[0])),
+            // `Std.parseInt` accepts decimal and `0x` hex (strtol base 0). Haxe
+            // returns `Null<Int>`; the C++98 lowering yields a plain `int` (0 on a
+            // fully unparseable string).
+            ("Std", "parseInt") => {
+                let s = self.cstr_arg(&args[0]);
+                Some((format!("(int)strtol({s}, NULL, 0)"), int_ty()))
+            }
+            ("Std", "parseFloat") => {
+                let s = self.cstr_arg(&args[0]);
+                Some((format!("(float)atof({s})"), float_ty()))
+            }
+            // `Std.random(x)` → a non-negative int in `[0, x)` (0 when `x <= 0`, as in
+            // Haxe). The argument is virtually always pure, so re-using it is safe.
+            ("Std", "random") => {
+                let n = f(self, 0);
+                Some((format!("(((int)({n})) > 0 ? (rand() % (int)({n})) : 0)"), int_ty()))
+            }
+            // `StringTools.replace(s, sub, by)` → replace every occurrence of `sub`.
+            ("StringTools", "replace") => {
+                let s = self.gen_expr(&args[0]).0;
+                let sub = self.gen_expr(&args[1]).0;
+                let by = self.gen_expr(&args[2]).0;
+                let acc = self.fresh("rep");
+                let needle = self.fresh("sub");
+                let repl = self.fresh("by");
+                let pos = self.fresh("pos");
+                let t = "\t".repeat(self.prelude_ind);
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}std::string {acc} = {s};");
+                let _ = writeln!(pre, "{t}std::string {needle} = {sub};");
+                let _ = writeln!(pre, "{t}std::string {repl} = {by};");
+                let _ = writeln!(pre, "{t}if (!{needle}.empty()) {{");
+                let _ = writeln!(pre, "{t}\tsize_t {pos} = 0;");
+                let _ = writeln!(pre, "{t}\twhile (({pos} = {acc}.find({needle}, {pos})) != std::string::npos) {{ {acc}.replace({pos}, {needle}.size(), {repl}); {pos} += {repl}.size(); }}");
+                let _ = writeln!(pre, "{t}}}");
+                self.prelude.push_str(&pre);
+                Some((acc, str_ty()))
+            }
+            // `StringTools.trim(s)` → strip leading/trailing ASCII whitespace.
+            ("StringTools", "trim") | ("StringTools", "ltrim") | ("StringTools", "rtrim") => {
+                let s = self.gen_expr(&args[0]).0;
+                let acc = self.fresh("trm");
+                let a = self.fresh("a");
+                let b = self.fresh("b");
+                let res = self.fresh("res");
+                let t = "\t".repeat(self.prelude_ind);
+                let ws = "== ' ' || {C} == '\\t' || {C} == '\\n' || {C} == '\\r'";
+                let lo = ws.replace("{C}", &format!("{acc}[{a}]"));
+                let hi = ws.replace("{C}", &format!("{acc}[{b} - 1]"));
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}std::string {acc} = {s};");
+                let _ = writeln!(pre, "{t}size_t {a} = 0; size_t {b} = {acc}.size();");
+                if method != "rtrim" {
+                    let _ = writeln!(pre, "{t}while ({a} < {b} && ({acc}[{a}] {lo})) ++{a};");
+                }
+                if method != "ltrim" {
+                    let _ = writeln!(pre, "{t}while ({b} > {a} && ({acc}[{b} - 1] {hi})) --{b};");
+                }
+                let _ = writeln!(pre, "{t}std::string {res} = {acc}.substr({a}, {b} - {a});");
+                self.prelude.push_str(&pre);
+                Some((res, str_ty()))
+            }
+            // `StringTools.startsWith(s, start)` / `endsWith(s, end)` → a bool temp
+            // (hoisted so the operands are evaluated exactly once).
+            ("StringTools", "startsWith") | ("StringTools", "endsWith") => {
+                let starts = method == "startsWith";
+                let s = self.gen_expr(&args[0]).0;
+                let sub = self.gen_expr(&args[1]).0;
+                let sv = self.fresh("s");
+                let ss = self.fresh("sub");
+                let res = self.fresh("res");
+                let t = "\t".repeat(self.prelude_ind);
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}std::string {sv} = {s};");
+                let _ = writeln!(pre, "{t}std::string {ss} = {sub};");
+                let cmp = if starts {
+                    format!("{sv}.compare(0, {ss}.size(), {ss}) == 0")
+                } else {
+                    format!("{sv}.compare({sv}.size() - {ss}.size(), {ss}.size(), {ss}) == 0")
+                };
+                let _ = writeln!(pre, "{t}bool {res} = ({sv}.size() >= {ss}.size() && {cmp});");
+                self.prelude.push_str(&pre);
+                Some((res, bool_ty()))
+            }
+            // `StringTools.hex(n, ?digits)` → uppercase hex, zero-padded to `digits`.
+            ("StringTools", "hex") => {
+                let n = self.gen_expr(&args[0]).0;
+                let buf = self.fresh("hex");
+                let res = self.fresh("res");
+                let t = "\t".repeat(self.prelude_ind);
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}char {buf}[32];");
+                if args.len() > 1 {
+                    let digits = self.gen_expr(&args[1]).0;
+                    let _ = writeln!(pre, "{t}sprintf({buf}, \"%0*X\", (int)({digits}), (unsigned int)({n}));");
+                } else {
+                    let _ = writeln!(pre, "{t}sprintf({buf}, \"%X\", (unsigned int)({n}));");
+                }
+                let _ = writeln!(pre, "{t}std::string {res} = {buf};");
+                self.prelude.push_str(&pre);
+                Some((res, str_ty()))
+            }
             ("Sys", "cpuTime") => Some((
                 "((float) clock() / (float) CLOCKS_PER_SEC)".into(),
                 float_ty(),
@@ -2174,45 +3304,121 @@ impl<'a> BodyGen<'a> {
 
     fn gen_string(&mut self, raw: &str, interpolated: bool) -> (String, Ty) {
         let str_ty = Ty { base: "std::string".into(), ..Default::default() };
-        if !interpolated || !raw.contains("${") {
+        if !interpolated || !has_interpolation(raw) {
             return (format!("\"{}\"", escape_str(raw)), str_ty);
         }
-        // String interpolation → sprintf into a stack buffer, returned as a temp.
-        let (literal, exprs) = split_interpolation(raw);
+        let (segments, exprs) = split_interpolation(raw);
         if exprs.is_empty() {
             return (format!("\"{}\"", escape_str(raw)), str_ty);
         }
-        let mut fmt = String::new();
-        let mut args = Vec::new();
-        let mut lit_chars = 0usize;
-        for seg in literal {
-            match seg {
-                Seg::Lit(s) => {
-                    lit_chars += s.len();
-                    fmt.push_str(&printf_escape(&s));
-                }
-                Seg::Expr(src) => {
-                    let (spec, arg) = match crate::parser::parse_expression(&src) {
-                        Ok(e) => {
-                            let (code, ty) = self.gen_expr(&e);
-                            self.spec_for(&code, &ty)
-                        }
-                        Err(_) => ("%s".to_string(), format!("\"{}\"", escape_str(&src))),
-                    };
-                    fmt.push_str(&spec);
-                    args.push(arg);
-                }
-            }
-        }
-        // Buffer sizing per SKILL: (n interpolations * 50) + literal characters.
-        let size = exprs.len() * 50 + lit_chars + 1;
-        let buf = self.fresh("buf");
+        // Build the result by appending each piece to a `std::string`: literal and string
+        // segments append directly (`s += part`) — `std::string` grows itself, so an
+        // arbitrarily long interpolated string is safe — while each numeric segment is
+        // formatted into a type-bounded buffer. There is no single value-guessed buffer,
+        // so this cannot overflow regardless of the runtime values.
+        let acc = self.fresh("str");
         let t = "\t".repeat(self.prelude_ind);
-        let mut pre = String::new();
-        let _ = writeln!(pre, "{t}char {buf}[{size}];");
-        let _ = writeln!(pre, "{t}sprintf({buf}, \"{fmt}\", {});", args.join(", "));
-        self.prelude.push_str(&pre);
+        self.prelude.push_str(&format!("{t}std::string {acc};\n"));
+        for seg in segments {
+            let part = match seg {
+                Seg::Lit(s) => format!("\"{}\"", escape_str(&s)),
+                Seg::Expr(src) => match crate::parser::parse_expression(&src) {
+                    Ok(e) => {
+                        let (code, ty) = self.gen_expr(&e);
+                        if ty.base == "std::string" {
+                            code
+                        } else {
+                            self.format_scalar(&code, &ty)
+                        }
+                    }
+                    Err(_) => format!("\"{}\"", escape_str(&src)),
+                },
+            };
+            self.prelude.push_str(&format!("{t}{acc} += {part};\n"));
+        }
+        (acc, str_ty)
+    }
+
+    /// Lower a Haxe `trace(args...)` call. Like Haxe, the output is prefixed with
+    /// the source `file:line` and the arguments follow, comma-separated. It reuses
+    /// the string-interpolation plumbing (`spec_for`) to pick a printf conversion
+    /// per argument, emitting a single `printf` to stdout. Under `--no-traces` the
+    /// whole call (and its argument evaluation) is stripped to a no-op.
+    fn gen_trace(&mut self, args: &[Expr]) -> (String, Ty) {
+        if self.no_trace {
+            return ("((void)0)".to_string(), Ty::default());
+        }
+        let file = self.prog.modules[self.mi]
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?");
+        let mut fmt = printf_escape(&format!("{file}:{}: ", self.current_line));
+        let mut printf_args: Vec<String> = Vec::new();
+        for (i, a) in args.iter().enumerate() {
+            if i > 0 {
+                fmt.push_str(", ");
+            }
+            let (code, ty) = self.gen_expr(a);
+            // A bare string literal is already a `const char*`; everything else
+            // goes through the interpolation type→spec mapping (a `std::string`
+            // value needs `.c_str()`, which `spec_for` supplies).
+            let (spec, arg) = if matches!(a, Expr::Str { interpolated: false, .. }) {
+                ("%s".to_string(), code)
+            } else {
+                self.spec_for(&code, &ty)
+            };
+            fmt.push_str(&spec);
+            printf_args.push(arg);
+        }
+        fmt.push_str("\\n");
+        let call = if printf_args.is_empty() {
+            format!("printf(\"{fmt}\")")
+        } else {
+            format!("printf(\"{fmt}\", {})", printf_args.join(", "))
+        };
+        (call, Ty::default())
+    }
+
+    /// `Std.string(x)` → a `std::string` holding x's textual form. A value that is
+    /// already a string passes through; a bool maps to `"true"`/`"false"`; a numeric
+    /// value is formatted via `sprintf` into a stack buffer (reusing `spec_for`'s
+    /// type→conversion mapping).
+    fn gen_std_string(&mut self, arg: &Expr) -> (String, Ty) {
+        let str_ty = Ty { base: "std::string".into(), ..Default::default() };
+        // A bare string literal is emitted as a `const char*`; wrap it so the
+        // result is a genuine `std::string` value.
+        if matches!(arg, Expr::Str { interpolated: false, .. }) {
+            let (code, _) = self.gen_expr(arg);
+            return (format!("std::string({code})"), str_ty);
+        }
+        let (code, ty) = self.gen_expr(arg);
+        if ty.base == "std::string" {
+            return (code, str_ty);
+        }
+        if ty.base == "bool" {
+            return (
+                format!("(({code}) ? std::string(\"true\") : std::string(\"false\"))"),
+                str_ty,
+            );
+        }
+        let buf = self.format_scalar(&code, &ty);
         (format!("std::string({buf})"), str_ty)
+    }
+
+    /// Evaluate a string-typed argument as a C++ `const char*` expression: a
+    /// `std::string` value gets `.c_str()`; a bare string literal is already one.
+    fn cstr_arg(&mut self, arg: &Expr) -> String {
+        let (code, ty) = self.gen_expr(arg);
+        // A bare string literal is already a `const char*` — `.c_str()` on it is
+        // invalid; everything else of string type is a `std::string` value.
+        if matches!(arg, Expr::Str { interpolated: false, .. }) {
+            code
+        } else if ty.base == "std::string" {
+            format!("{code}.c_str()")
+        } else {
+            code
+        }
     }
 
     /// Choose a printf conversion and the matching argument expression for an
@@ -2225,6 +3431,38 @@ impl<'a> BodyGen<'a> {
         } else {
             ("%d".to_string(), code.to_string())
         }
+    }
+
+    /// Format a non-string scalar (`code` of type `ty`) into a hoisted stack buffer and
+    /// return the buffer name (a `const char*`). The buffer size is fixed by the *type*,
+    /// never guessed from the runtime value, so it can never overflow: a 32-bit `int`
+    /// prints ≤ 11 chars, a `float`/`double` via `%f` ≤ ~48 / ~316. This is the one place
+    /// that turns a number into text, shared by interpolation, concatenation and
+    /// `Std.string`. (Strings are never formatted through here — they are appended
+    /// directly, which is unbounded-safe.)
+    fn format_scalar(&mut self, code: &str, ty: &Ty) -> String {
+        let (spec, arg) = self.spec_for(code, ty);
+        let size = match ty.base.as_str() {
+            "double" => 320, // %f of DBL_MAX ≈ 316 chars
+            "float" => 64,   // %f of FLT_MAX ≈ 48 chars
+            _ => 24,         // a 64-bit integer ≤ 20 chars
+        };
+        let buf = self.fresh("buf");
+        let t = "\t".repeat(self.prelude_ind);
+        self.prelude.push_str(&format!("{t}char {buf}[{size}]; sprintf({buf}, \"{spec}\", {arg});\n"));
+        buf
+    }
+
+    /// One operand of a string concatenation, as a C++ expression that participates in
+    /// `std::string` `operator+`. A `String` operand (variable or literal) is used as-is;
+    /// a non-string (numeric) operand is formatted into a type-bounded buffer and wrapped
+    /// as a `std::string` so it anchors the chain (`std::string(buf) + ","`).
+    fn concat_part(&mut self, code: &str, ty: &Ty) -> String {
+        if ty.base == "std::string" {
+            return code.to_string();
+        }
+        let buf = self.format_scalar(code, ty);
+        format!("std::string({buf})")
     }
 
     // ---- object-literal expansion --------------------------------------
@@ -2269,9 +3507,9 @@ impl<'a> BodyGen<'a> {
                 // Nested map literal → expand into a temp map of the member type.
                 Expr::MapLit(pairs) if !pairs.is_empty() => {
                     let mt = member.clone().unwrap_or_default();
-                    let (kty, vty) = self.map_kv_ty(&mt);
+                    let (_, vty) = self.map_kv_ty(&mt);
                     let tmp = self.fresh("f");
-                    self.expand_map_into_local(&tmp, &mt, &kty, &vty, pairs, ind, out);
+                    self.expand_map_into_local(&tmp, &mt, &vty, pairs, ind, out);
                     let _ = writeln!(out, "{t}{name}.{key} = {tmp};");
                 }
                 _ => {
@@ -2346,7 +3584,7 @@ impl<'a> BodyGen<'a> {
         let mut parts = Vec::new();
         for sf in sfields {
             let val = fields.iter().find(|(k, _)| k == &sf.name).map(|(_, v)| v)?;
-            // Nested struct values aren't needed by the corpus; bail (→ caller
+            // Nested struct values aren't supported here; bail (→ caller
             // returns None) rather than emit something wrong.
             if matches!(val, Expr::ObjectLit(_)) {
                 return None;
@@ -2360,7 +3598,7 @@ impl<'a> BodyGen<'a> {
     /// `const` vector object initialised from it (C++98 cannot brace-initialise a
     /// `std::vector`). Keeps the symbol a `std::vector`, so call sites are unchanged.
     fn render_const_vector(&mut self, name: &str, vec_ty: &Ty, elems: &[Expr]) -> String {
-        let builder = format!("_hatchet_init_{name}");
+        let builder = format!("_init_{name}");
         let spell = self.decl_spelling(vec_ty);
         let elem = self.elem_member_ty(vec_ty);
         let mut body = String::new();
@@ -2414,7 +3652,6 @@ impl<'a> BodyGen<'a> {
         &mut self,
         name: &str,
         map_ty: &Ty,
-        _key: &Ty,
         val: &Ty,
         pairs: &[(Expr, Expr)],
         ind: usize,
@@ -2477,6 +3714,22 @@ impl<'a> BodyGen<'a> {
         }
     }
 
+    /// Per-position flags marking which constructor parameters of `ty`'s class take
+    /// ownership of their argument (it is stored into a field the destructor frees).
+    /// A `new` at such a position is freed by the constructed object, so it must be
+    /// emitted inline rather than hoisted into a scope-owned local.
+    fn ctor_owned_params(&self, ty: &Type) -> Vec<bool> {
+        let Some(info) = ty_named_info(self.prog, self.mi, ty) else { return Vec::new() };
+        let Some(Decl::Class(c)) = self.prog.type_decl(&info) else { return Vec::new() };
+        // Which constructor parameters take ownership of their argument comes from
+        // the escape analysis, as a per-position predicate.
+        let owned = crate::sema::escape::ctor_owned_params(self.prog, info.module_index, c);
+        match &c.ctor {
+            Some(ctor) => (0..ctor.params.len()).map(|i| owned.contains(&i)).collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// Element `Ty` (with `info`) from a declared `Array<T>` AST type.
     fn elem_ast_ty(&self, ty: Option<&Type>) -> Option<Ty> {
         if let Some(Type::Named { path, params, .. }) = ty {
@@ -2530,6 +3783,17 @@ impl<'a> BodyGen<'a> {
                 let v = v.trim();
                 let is_ptr = v.ends_with('*');
                 return Ty { base: v.trim_end_matches('*').trim().to_string(), is_ptr, ..Default::default() };
+            }
+        }
+        Ty::default()
+    }
+
+    fn map_key_ty(&self, map: &Ty) -> Ty {
+        if let Some(inner) = map.base.strip_prefix("std::map<").and_then(|s| s.strip_suffix(">")) {
+            if let Some((k, _)) = split_top_comma(inner.trim()) {
+                let k = k.trim();
+                let is_ptr = k.ends_with('*');
+                return Ty { base: k.trim_end_matches('*').trim().to_string(), is_ptr, ..Default::default() };
             }
         }
         Ty::default()
@@ -2593,6 +3857,20 @@ impl<'a> BodyGen<'a> {
         format!("_{hint}{}", self.tmp)
     }
 
+    /// Allocate a unique C++ name for a counter-style loop control variable (a
+    /// `for`-init `int`) and register the rename so the loop body resolves the
+    /// Haxe name to it. VC6 uses the pre-standard `for` scope rule, where a
+    /// `for (int i ...)` init variable leaks into the *enclosing* block; two
+    /// loops (or comprehensions) reusing the same Haxe name in one function would
+    /// then redeclare `i` (`error C2374`). A fresh name per loop sidesteps that
+    /// with no change in behaviour. (Element/iterator bindings declared inside the
+    /// loop braces are already block-scoped, so only the `for`-init needs this.)
+    fn loop_var(&mut self, haxe: &str) -> String {
+        let cpp = self.fresh(haxe);
+        self.renames.last_mut().unwrap().insert(haxe.to_string(), cpp.clone());
+        cpp
+    }
+
     // ---- type helpers --------------------------------------------------
 
     fn ty_of(&self, ht: &Type) -> Ty {
@@ -2601,7 +3879,7 @@ impl<'a> BodyGen<'a> {
 
     /// Like `ty_of`, but resolve the type in the context of module `ctx` (used
     /// for a callee's parameter types, which must resolve where they were
-    /// declared — e.g. `Line` inside `mucus.api` is the native `mucus::Line`).
+    /// declared — e.g. `Line` inside `native.api` is the native `native::Line`).
     /// The C++ spelling is still relative to the current namespace.
     fn ty_of_in(&self, ht: &Type, ctx: usize) -> Ty {
         if let Type::Named { path, params, .. } = ht {
@@ -2633,8 +3911,8 @@ impl<'a> BodyGen<'a> {
     /// lowers an *optional* value-struct (`?x:V`) to `V* x = NULL` — the same
     /// pointer shape as a *nullable* `Null<T>`. So optionality and nullability
     /// collapse to one C++ representation: mark such a param `nullable` so call
-    /// sites pass a pointer matching the signature (see SKILL: optional/nullable
-    /// value types both lower to `T*`). Reference types are already pointers (no
+    /// sites pass a pointer matching the signature (optional and nullable value
+    /// types both lower to `T*`). Reference types are already pointers (no
     /// change); `String`/primitive/`Array`/`Map` optionals stay by-value with a
     /// default, so they are left alone.
     fn param_ty_in(&self, p: &Param, ctx: usize) -> Option<Ty> {
@@ -2705,6 +3983,21 @@ impl<'a> BodyGen<'a> {
         self.find_field(self.class, name)
     }
 
+    /// The class-field name an assignment target stores into when it is an
+    /// **own-field** store: `this.field`, or a bare `field` that resolves to a
+    /// class field rather than a local. `obj.field` on another object is not an
+    /// own-field store and yields `None`. This is what lets `field = new X()`
+    /// behave identically to `this.field = new X()` for ownership/escape.
+    fn assigned_own_field(&self, target: &Expr) -> Option<String> {
+        match target {
+            Expr::Field(recv, field) if matches!(**recv, Expr::This) => Some(field.clone()),
+            Expr::Ident(name) if self.lookup_local(name).is_none() && self.class_field(name).is_some() => {
+                Some(name.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// Find a field in `class` or any of its base classes.
     fn find_field(&self, class: &'a Class, name: &str) -> Option<&'a Field> {
         if let Some(f) = class.fields.iter().find(|f| f.name == name) {
@@ -2760,7 +4053,7 @@ impl<'a> BodyGen<'a> {
 
     /// Find a field declaration in another type and whether it exposes a getter.
     fn field_has_getter(&self, info: &TypeInfo, name: &str) -> bool {
-        self.lookup_field(info, name).map(|f| has_accessor(f)).unwrap_or(false)
+        self.lookup_field(info, name).map(has_accessor).unwrap_or(false)
     }
     fn field_has_setter(&self, info: &TypeInfo, name: &str) -> bool {
         self.lookup_field(info, name).map(|f| f.set == PropAccess::Set).unwrap_or(false)
@@ -2907,6 +4200,54 @@ impl<'a> BodyGen<'a> {
         }
     }
 
+    /// Resolve a bare enum-variant identifier (e.g. `CircleKind`) to its
+    /// qualified C++ constant (`demo::ShapeKind_::CircleKind`) and enum type.
+    /// Searches enums in scope by variant name, preferring the expected type when
+    /// it is an enum (so a name shared by two enums resolves to the contextual
+    /// one). Returns `None` when no enum declares the variant — the caller then
+    /// treats the identifier as an ordinary unknown.
+    fn enum_variant_ref(&self, name: &str) -> Option<(String, Ty)> {
+        let is_enumish = |k: TypeKind| matches!(k, TypeKind::Enum | TypeKind::EnumAbstract);
+        let mut order: Vec<&TypeInfo> = Vec::new();
+        if let Some(info) = self.expected.as_ref().and_then(|t| t.info.as_ref()) {
+            if is_enumish(info.kind) {
+                order.push(info);
+            }
+        }
+        for info in &self.prog.types {
+            if is_enumish(info.kind) {
+                order.push(info);
+            }
+        }
+        for info in order {
+            if self.enum_has_variant(info, name) {
+                // A plain/Int enum member has the enum type; a non-integral
+                // `enum abstract` member has the underlying type (String/Float).
+                let base = if info.kind == TypeKind::EnumAbstract {
+                    self.prog
+                        .enum_abstract_underlying(info)
+                        .map(|u| self.prog.map_type_base(&u, self.mi, &self.ns))
+                        .unwrap_or_else(|| info.name.clone())
+                } else {
+                    info.name.clone()
+                };
+                let ty = Ty { base, info: Some(info.clone()), ..Default::default() };
+                return Some((self.enum_constant(info, name), ty));
+            }
+        }
+        None
+    }
+
+    /// Whether the enum `info` declares a variant named `name`.
+    fn enum_has_variant(&self, info: &TypeInfo, name: &str) -> bool {
+        let Some(m) = self.prog.modules.get(info.module_index) else {
+            return false;
+        };
+        m.file.decls.iter().any(|d| {
+            matches!(d, Decl::Enum(e) if e.name == info.name && e.variants.iter().any(|v| v.name == name))
+        })
+    }
+
     fn enum_constant(&self, info: &TypeInfo, variant: &str) -> String {
         let ns = info.cpp_namespace();
         let prefix = if ns == self.ns || ns.is_empty() {
@@ -2936,12 +4277,23 @@ fn has_accessor(f: &Field) -> bool {
 /// Collect local names that escape a function body — assigned to a field
 /// (`this.f = x`) or returned (`return x`) — so their heap value is owned
 /// elsewhere and must not be freed at scope close.
-fn collect_escaping(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+fn collect_escaping(
+    stmts: &[Stmt],
+    fields: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
     for st in stmts {
         match st {
             Stmt::Expr(Expr::Assign { op: None, target, value }, _) => {
-                if let (Expr::Field(recv, _), Expr::Ident(name)) = (&**target, &**value) {
-                    if matches!(**recv, Expr::This) {
+                // A local stored into a field — `this.field = local` or the bare
+                // `field = local` — escapes this scope (the field now owns it).
+                let into_field = match &**target {
+                    Expr::Field(recv, _) => matches!(**recv, Expr::This),
+                    Expr::Ident(name) => fields.contains(name),
+                    _ => false,
+                };
+                if into_field {
+                    if let Expr::Ident(name) = &**value {
                         out.insert(name.clone());
                     }
                 }
@@ -2950,21 +4302,21 @@ fn collect_escaping(stmts: &[Stmt], out: &mut std::collections::HashSet<String>)
                 out.insert(name.clone());
             }
             Stmt::If { then, els, .. } => {
-                collect_escaping(std::slice::from_ref(then), out);
+                collect_escaping(std::slice::from_ref(then), fields, out);
                 if let Some(e) = els {
-                    collect_escaping(std::slice::from_ref(e), out);
+                    collect_escaping(std::slice::from_ref(e), fields, out);
                 }
             }
             Stmt::For { body, .. } | Stmt::While { body, .. } => {
-                collect_escaping(std::slice::from_ref(body), out);
+                collect_escaping(std::slice::from_ref(body), fields, out);
             }
-            Stmt::Block(stmts) => collect_escaping(stmts, out),
+            Stmt::Block(stmts) => collect_escaping(stmts, fields, out),
             Stmt::Switch { cases, default, .. } => {
                 for c in cases {
-                    collect_escaping(&c.body, out);
+                    collect_escaping(&c.body, fields, out);
                 }
                 if let Some(d) = default {
-                    collect_escaping(d, out);
+                    collect_escaping(d, fields, out);
                 }
             }
             _ => {}
@@ -2991,13 +4343,42 @@ fn map_get_init(init: Option<&Expr>) -> Option<(&Expr, &Expr)> {
     None
 }
 
+/// The trailing value expression of a `switch`-expression arm: the last statement
+/// if it is a bare expression statement (the value the arm evaluates to). `None`
+/// for an arm that ends in control flow (`return`/`throw`) or is empty.
+fn case_value_expr(body: &[Stmt]) -> Option<&Expr> {
+    match body.last() {
+        Some(Stmt::Expr(e, _)) => Some(e),
+        _ => None,
+    }
+}
+
+/// A copy of a `switch`-expression arm body with its trailing value expression
+/// rewritten to assign to `tmp` (`… expr` → `… tmp = expr`). An arm that ends in
+/// control flow is left unchanged (it yields no value through fall-through).
+fn assign_last_to(body: &[Stmt], tmp: &str) -> Vec<Stmt> {
+    let mut out = body.to_vec();
+    if let Some(Stmt::Expr(e, line)) = out.last() {
+        let assign = Stmt::Expr(
+            Expr::Assign {
+                op: None,
+                target: Box::new(Expr::Ident(tmp.to_string())),
+                value: Box::new(e.clone()),
+            },
+            *line,
+        );
+        *out.last_mut().unwrap() = assign;
+    }
+    out
+}
+
 fn is_value_new(ty: &Type) -> bool {
     matches!(
         ty,
         Type::Named { path, .. }
             if matches!(
                 path.last().map(|s| s.as_str()),
-                Some("Array") | Some("Map") | Some("String")
+                Some("Array") | Some("Map") | Some("String") | Some("StringBuf")
             )
     )
 }
@@ -3018,6 +4399,26 @@ fn is_null_type(ty: &Option<Type>) -> bool {
 }
 
 /// A top-level `final NAME = function/lambda` — the source of a free function.
+/// Lambda params with any missing type filled from a function-type binding
+/// annotation: `Cross:(Vector, Vector) -> Float = (a, b) -> a.x * b.y` leaves
+/// `a`/`b` unannotated on the arrow, but the binding's `(Vector, Vector)` types
+/// them — without this they would default to `int` and `a.x` would be invalid.
+/// An arrow param that *is* annotated wins over the binding's type.
+fn effective_lambda_params(params: &[Param], decl_ty: Option<&Type>) -> Vec<Param> {
+    let func_params = match decl_ty {
+        Some(Type::Func { params, .. }) => Some(params),
+        _ => None,
+    };
+    params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| match (&p.ty, func_params.and_then(|fps| fps.get(i))) {
+            (None, Some(fp)) => Param { ty: Some(fp.clone()), ..p.clone() },
+            _ => p.clone(),
+        })
+        .collect()
+}
+
 fn lambda_parts(g: &GlobalVar) -> Option<(&Vec<Param>, &Option<Type>, &LambdaBody)> {
     if !g.is_final {
         return None;
@@ -3055,7 +4456,7 @@ pub(crate) fn render_final_const(prog: &Program, module_index: usize, g: &Global
         return None;
     }
     let empty = empty_class();
-    let mut bg = BodyGen::new(prog, module_index, &empty, 1);
+    let mut bg = BodyGen::new(prog, module_index, &empty, 1, false);
     bg.file_scope_const(g)
 }
 
@@ -3082,6 +4483,10 @@ fn int_ty() -> Ty {
 
 fn bool_ty() -> Ty {
     Ty { base: "bool".into(), ..Default::default() }
+}
+
+fn str_ty() -> Ty {
+    Ty { base: "std::string".into(), ..Default::default() }
 }
 
 /// A bare `Type::Named` from a single type name (used to map a parsed overload
@@ -3201,7 +4606,7 @@ fn unop(op: UnOp) -> &'static str {
     }
 }
 
-fn float_lit(s: &str) -> String {
+pub(crate) fn float_lit(s: &str) -> String {
     if s.ends_with('f') || s.ends_with('F') || s.contains('x') {
         s.to_string()
     } else {
@@ -3209,7 +4614,7 @@ fn float_lit(s: &str) -> String {
     }
 }
 
-fn escape_str(s: &str) -> String {
+pub(crate) fn escape_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
@@ -3217,6 +4622,24 @@ fn escape_str(s: &str) -> String {
 enum Seg {
     Lit(String),
     Expr(String),
+}
+
+/// Whether a single-quoted string's raw text carries any interpolation: either
+/// the `${expr}` form or the `$ident` shorthand. A `$` followed by anything else
+/// (a digit, punctuation, end of string) is a literal dollar sign.
+fn has_interpolation(raw: &str) -> bool {
+    let b = raw.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' && i + 1 < b.len() {
+            let n = b[i + 1];
+            if n == b'{' || n.is_ascii_alphabetic() || n == b'_' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Split `'a${b}c'` raw text into ordered segments plus the list of expression

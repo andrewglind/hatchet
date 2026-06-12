@@ -5,6 +5,7 @@
 //! then imported modules) and mapped to their C++ spelling with the correct
 //! namespace. It also computes the set of `#include`s each generated header needs.
 
+pub mod escape;
 pub mod includes;
 pub mod types;
 pub mod validate;
@@ -16,7 +17,7 @@ use crate::ast::*;
 use crate::discover;
 use crate::parser;
 
-use types::{container_template, is_uint_shim, map_primitive};
+use types::{container_template, is_integral_underlying, is_uint_shim, map_primitive};
 
 /// What a declared name is, which determines value-vs-reference semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +25,10 @@ pub enum TypeKind {
     Class,
     Interface,
     Enum,
+    /// A non-integral `enum abstract X(String|Float)` — a set of typed `static
+    /// const` constants whose values *are* the underlying type. The type itself maps
+    /// to that underlying C++ type; members are referenced as `X_::Member`.
+    EnumAbstract,
     /// `typedef X = { ... }` — a C++ value struct.
     StructTypedef,
     /// `typedef X = Y` — an alias.
@@ -57,7 +62,7 @@ impl TypeInfo {
     /// * regular types → their Haxe package (the rule "namespaces match packages");
     /// * `@:native("a::b::N")` → the explicit namespace `a::b`;
     /// * bare `@:native` → the first package component (the engine's root
-    ///   namespace, e.g. package `mucus.api` → namespace `mucus`).
+    ///   namespace, e.g. package `native.api` → namespace `native`).
     pub fn cpp_namespace(&self) -> Vec<String> {
         if self.is_native {
             if let Some(ns) = &self.native_ns {
@@ -96,6 +101,12 @@ pub struct Program {
     /// `extern inline` functions (default `HATCHET` → `HATCHET_EXPORT`/`HATCHET_CALL`;
     /// configurable via `--export-macro`).
     pub export_macro: String,
+    /// When generated files are written somewhere other than in-place, the
+    /// `(source_root_abs, out_dir_abs)` pair used to re-base `#include`s that
+    /// escape the generated tree (external engine / sibling-project headers) onto
+    /// the real output location. `None` (the default, and what tests use) keeps
+    /// every include purely source-relative — correct for in-place generation.
+    pub include_rebase: Option<(PathBuf, PathBuf)>,
 }
 
 impl Program {
@@ -145,6 +156,7 @@ impl Program {
             types: Vec::new(),
             stdafx_stem: stdafx_stem.to_string(),
             export_macro: "HATCHET".to_string(),
+            include_rebase: None,
         };
         prog.index_types();
         prog.resolve_imports();
@@ -157,7 +169,15 @@ impl Program {
                 let (name, kind, meta) = match decl {
                     Decl::Class(c) => (&c.name, TypeKind::Class, &c.meta),
                     Decl::Interface(i) => (&i.name, TypeKind::Interface, &i.meta),
-                    Decl::Enum(e) => (&e.name, TypeKind::Enum, &e.meta),
+                    Decl::Enum(e) => {
+                        // A non-integral `enum abstract` is its own kind (it maps to
+                        // the underlying type, not a C++ enum).
+                        let kind = match &e.underlying {
+                            Some(u) if !is_integral_underlying(u) => TypeKind::EnumAbstract,
+                            _ => TypeKind::Enum,
+                        };
+                        (&e.name, kind, &e.meta)
+                    }
                     Decl::Typedef(t) => {
                         let kind = match t.target {
                             TypedefTarget::Struct(_) => TypeKind::StructTypedef,
@@ -165,7 +185,7 @@ impl Program {
                         };
                         (&t.name, kind, &t.meta)
                     }
-                    Decl::Global(_) | Decl::Function(_) => continue,
+                    Decl::Global(_) | Decl::Function(_) | Decl::Unsupported { .. } => continue,
                 };
                 let is_native = has_meta(meta, "native");
                 let (native_ns, native_name) = native_target(meta);
@@ -240,8 +260,8 @@ impl Program {
             }
         }
         // Bare name: pick the best candidate. A local declaration always wins;
-        // otherwise a generated (`@:expose`, non-native) type beats a native
-        // shadow of the same name (the `mucus.modules.api` re-export declares
+        // otherwise a generated (transpiled, non-native) type beats a native
+        // shadow of the same name (the `native.modules.api` re-export declares
         // native aliases of the real `modules` classes, and references from
         // other packages should resolve to the real ones). Tie-break by scope:
         // local > imported > any.
@@ -264,7 +284,7 @@ impl Program {
             };
             // local-ness dominates, then non-native, then nearest scope
             let key = ((scope != 0) as u8, t.is_native as u8, scope);
-            if best.map_or(true, |(_, bk)| key < bk) {
+            if best.is_none_or(|(_, bk)| key < bk) {
                 best = Some((t, key));
             }
         }
@@ -331,6 +351,14 @@ impl Program {
             .find(|d| decl_name(d) == Some(ti.name.as_str()))
     }
 
+    /// The underlying type of an `enum abstract` (`None` for any other type).
+    pub fn enum_abstract_underlying(&self, ti: &TypeInfo) -> Option<Type> {
+        match self.type_decl(ti) {
+            Some(Decl::Enum(e)) => e.underlying.clone(),
+            _ => None,
+        }
+    }
+
     /// Does `class` (or any transitive base / implemented interface, including
     /// native ones) declare a method named `name`? Used to decide `virtual`.
     pub fn method_overrides_base(&self, class: &Class, ctx_module: usize, name: &str) -> bool {
@@ -351,6 +379,59 @@ impl Program {
             if decl_has_method(decl, name) {
                 return true;
             }
+            frontier.extend(decl_bases(decl));
+        }
+        false
+    }
+
+    /// Whether some subclass of `class` declares (overrides) the method `name`.
+    /// Haxe methods are virtual by default, but C++ only dispatches through a base
+    /// pointer when the *base* declaration is `virtual`. So a base method that any
+    /// descendant overrides must itself be emitted `virtual`, or calls through a
+    /// base pointer would statically bind to the base version.
+    pub fn method_overridden_in_subclass(&self, class: &Class, ctx_module: usize, name: &str) -> bool {
+        let Some(base_ti) = self.resolve_type(std::slice::from_ref(&class.name), ctx_module) else {
+            return false;
+        };
+        let target = (base_ti.package.clone(), base_ti.name.clone());
+        for (mj, m) in self.modules.iter().enumerate() {
+            for d in &m.file.decls {
+                if let Decl::Class(dc) = d {
+                    if decl_has_method(d, name) && self.class_has_ancestor(dc, mj, &target) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether `class` (declared in module `ctx_module`) has the `(package, name)`
+    /// type `target` somewhere up its `extends`/`implements` chain.
+    fn class_has_ancestor(
+        &self,
+        class: &Class,
+        ctx_module: usize,
+        target: &(Vec<String>, String),
+    ) -> bool {
+        let mut frontier: Vec<Type> = class
+            .extends
+            .iter()
+            .cloned()
+            .chain(class.implements.iter().cloned())
+            .collect();
+        let mut seen: BTreeSet<(Vec<String>, String)> = BTreeSet::new();
+        while let Some(base) = frontier.pop() {
+            let Type::Named { path, .. } = &base else { continue };
+            let Some(ti) = self.resolve_type(path, ctx_module) else { continue };
+            let key = (ti.package.clone(), ti.name.clone());
+            if &key == target {
+                return true;
+            }
+            if !seen.insert(key) {
+                continue;
+            }
+            let Some(decl) = self.type_decl(ti) else { continue };
             frontier.extend(decl_bases(decl));
         }
         false
@@ -384,6 +465,13 @@ impl Program {
                     return format!("{tmpl}<{inner}{pad}>");
                 }
                 match self.resolve_type(path, ctx_module) {
+                    // A non-integral `enum abstract` *is* its underlying type at
+                    // runtime (its members are typed constants), so it maps to that
+                    // type's C++ spelling rather than to a name of its own.
+                    Some(ti) if ti.kind == TypeKind::EnumAbstract => self
+                        .enum_abstract_underlying(ti)
+                        .map(|u| self.map_type_base(&u, ti.module_index, current_ns))
+                        .unwrap_or_else(|| qualify(ti, current_ns)),
                     Some(ti) => qualify(ti, current_ns),
                     // Unknown (e.g. a generic parameter) — emit the name verbatim.
                     None => name.to_string(),
@@ -440,6 +528,8 @@ impl Program {
             Decl::Typedef(t) => !has_meta(&t.meta, "native") && !is_uint_shim(&t.name),
             Decl::Global(g) => !has_meta(&g.meta, "native"),
             Decl::Function(f) => !has_meta(&f.meta, "native"),
+            // Parsed-and-skipped; nothing to emit (it is flagged unsupported).
+            Decl::Unsupported { .. } => false,
         }
     }
 
@@ -466,7 +556,7 @@ impl Program {
 
         // This module's own @:include directives (resolved against itself).
         for raw in module_includes_raw(&m.file) {
-            push(includes::resolve_include(&raw, &m.dir, target_dir), &mut out);
+            push(self.finalize_include(includes::resolve_include(&raw, &m.dir, target_dir), target_dir), &mut out);
         }
 
         // Helper: pull in a module's header (or, for native-interop modules that
@@ -476,10 +566,10 @@ impl Program {
                 let mut header = im.dir.clone();
                 let stem = im.path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 header.push(format!("{stem}.h"));
-                push(includes::relative_header(&header, target_dir), out);
+                push(self.finalize_include(includes::relative_header(&header, target_dir), target_dir), out);
             } else {
                 for raw in module_includes_raw(&im.file) {
-                    push(includes::resolve_include(&raw, &im.dir, target_dir), out);
+                    push(self.finalize_include(includes::resolve_include(&raw, &im.dir, target_dir), target_dir), out);
                 }
             }
         };
@@ -490,12 +580,22 @@ impl Program {
 
         // Referenced-type headers: a type used without an explicit `import` (legal
         // in Haxe for same-package types) still needs its declaration included.
-        // For the corpus this adds nothing (every reference is already imported);
-        // it is what makes standalone, import-free projects compile.
+        // When every reference is already imported this adds nothing; it is what
+        // makes standalone, import-free projects compile.
         for dep in validate::referenced_modules(self, module_index) {
             pull_module(&self.modules[dep], &mut out, &mut push);
         }
         out
+    }
+
+    /// Apply include re-basing when generating out-of-place (see `include_rebase`).
+    /// A no-op for in-place generation (the default), so source-relative includes
+    /// are untouched.
+    fn finalize_include(&self, inc: String, target_dir: &[String]) -> String {
+        match &self.include_rebase {
+            Some((root, out)) => includes::rebase_if_escaping(&inc, target_dir, root, out),
+            None => inc,
+        }
     }
 }
 
@@ -515,7 +615,7 @@ fn dir_components(src_root: &Path, file: &Path) -> Vec<String> {
 }
 
 /// The leading lowercase-initial components of a dotted type path form its
-/// package (e.g. `mucus.api.Mucus.Vertex` → `[mucus, api]`).
+/// package (e.g. `native.api.Native.Vertex` → `[native, api]`).
 fn leading_package(path: &[String]) -> Vec<String> {
     path.iter()
         .take(path.len() - 1) // never include the type name itself
@@ -560,6 +660,7 @@ fn decl_meta(decl: &Decl) -> &[Meta] {
         Decl::Typedef(t) => &t.meta,
         Decl::Global(g) => &g.meta,
         Decl::Function(f) => &f.meta,
+        Decl::Unsupported { .. } => &[],
     }
 }
 
@@ -571,6 +672,7 @@ fn decl_name(decl: &Decl) -> Option<&str> {
         Decl::Typedef(t) => &t.name,
         Decl::Global(g) => &g.name,
         Decl::Function(f) => return f.name.as_deref(),
+        Decl::Unsupported { .. } => return None,
     })
 }
 
@@ -647,10 +749,10 @@ mod tests {
 
     #[test]
     fn native_types_get_engine_namespace_and_pointer() {
-        let mucus = (
-            "/src/mucus/api/Mucus.hx",
-            "package mucus.api;\n\
-             @:include(\"../../src/Mucus.h\")\n\
+        let native = (
+            "/src/native/api/Native.hx",
+            "package native.api;\n\
+             @:include(\"../../src/Native.h\")\n\
              @:native interface IEngine {}\n\
              @:native typedef Effects = { values:Array<Float> };\n\
              @:native typedef Vertex = { x:Float };",
@@ -658,53 +760,53 @@ mod tests {
         let vertex = (
             "/src/modules/Vertex.hx",
             "package modules;\n\
-             import mucus.api.Mucus;\n\
+             import native.api.Native;\n\
              import modules.Module;\n\
-             @:expose class Vertex extends Module {}",
+             class Vertex extends Module {}",
         );
         let module = (
             "/src/modules/Module.hx",
-            "package modules; @:expose class Module {}",
+            "package modules; class Module {}",
         );
-        let p = prog(&[mucus, vertex, module]);
+        let p = prog(&[native, vertex, module]);
         let vidx = p.modules.iter().position(|m| m.path.ends_with("Vertex.hx")).unwrap();
         let ns = vec!["modules".to_string()];
 
-        // native interface → mucus::IEngine*, pointer because it's a reference type
-        assert_eq!(p.map_type_use(&named(&["IEngine"]), vidx, &ns), "mucus::IEngine*");
+        // native interface → native::IEngine*, pointer because it's a reference type
+        assert_eq!(p.map_type_use(&named(&["IEngine"]), vidx, &ns), "native::IEngine*");
         // native struct typedef → value, namespaced
-        assert_eq!(p.map_type_use(&named(&["Effects"]), vidx, &ns), "mucus::Effects");
+        assert_eq!(p.map_type_use(&named(&["Effects"]), vidx, &ns), "native::Effects");
         // qualified native type disambiguates from the local `modules.Vertex` class
-        let qualified = named(&["mucus", "api", "Mucus", "Vertex"]);
-        assert_eq!(p.map_type_base(&qualified, vidx, &ns), "mucus::Vertex");
+        let qualified = named(&["native", "api", "Native", "Vertex"]);
+        assert_eq!(p.map_type_base(&qualified, vidx, &ns), "native::Vertex");
         // local user class in the same namespace → unqualified, pointer
         assert_eq!(p.map_type_use(&named(&["Module"]), vidx, &ns), "Module*");
     }
 
     #[test]
     fn header_includes_inherit_and_reference() {
-        let mucus = (
-            "/src/mucus/api/Mucus.hx",
-            "package mucus.api;\n\
-             @:include(\"../../src/Mucus.h\")\n\
+        let native = (
+            "/src/native/api/Native.hx",
+            "package native.api;\n\
+             @:include(\"../../src/Native.h\")\n\
              typedef UInt8 = UInt;\n\
              @:native interface IEngine {}",
         );
         let stdafx = ("/src/modules/StdAfx.hx", "package modules;");
-        let module = ("/src/modules/Module.hx", "package modules; @:expose class Module {}");
+        let module = ("/src/modules/Module.hx", "package modules; class Module {}");
         let vertex = (
             "/src/modules/Vertex.hx",
             "package modules;\n\
-             import mucus.api.Mucus;\n\
+             import native.api.Native;\n\
              import modules.Module;\n\
-             @:expose class Vertex extends Module {}",
+             class Vertex extends Module {}",
         );
-        let p = prog(&[mucus, stdafx, module, vertex]);
+        let p = prog(&[native, stdafx, module, vertex]);
         let vidx = p.modules.iter().position(|m| m.path.ends_with("Vertex.hx")).unwrap();
         let incs = p.header_includes(vidx);
         // StdAfx (present in this package) first, the inherited native include,
         // then the user-class header.
-        assert_eq!(incs, vec!["StdAfx.h", "../src/Mucus.h", "Module.h"]);
+        assert_eq!(incs, vec!["StdAfx.h", "../src/Native.h", "Module.h"]);
     }
 
     #[test]
@@ -712,10 +814,10 @@ mod tests {
         // A standalone, import-free project: B uses A (same package) with no
         // `import`. The header must pull in A.h (driven by the reference). StdAfx.h
         // is always present (Hatchet generates one for every output directory).
-        let a = ("/src/A.hx", "@:expose class A { public function new() {} }");
+        let a = ("/src/A.hx", "class A { public function new() {} }");
         let b = (
             "/src/B.hx",
-            "@:expose class B { var a:A; public function new() { this.a = new A(); } }",
+            "class B { var a:A; public function new() { this.a = new A(); } }",
         );
         let p = prog(&[a, b]);
         let bidx = p.modules.iter().position(|m| m.path.ends_with("B.hx")).unwrap();
@@ -725,11 +827,11 @@ mod tests {
 
     #[test]
     fn at_include_works_on_any_file_and_keeps_system_headers() {
-        // `@:include` is not exclusive to @:native API stubs: a pure @:expose
+        // `@:include` is not exclusive to @:native API stubs: a plain transpiled
         // class can pull in C/C++ headers, and a system header keeps its `<...>`.
         let w = (
             "/src/W.hx",
-            "@:include(\"<string>\")\n@:expose class W { public function new() {} }",
+            "@:include(\"<string>\")\nclass W { public function new() {} }",
         );
         let p = prog(&[w]);
         let idx = p.modules.iter().position(|m| m.path.ends_with("W.hx")).unwrap();
@@ -741,11 +843,11 @@ mod tests {
 
     #[test]
     fn native_only_module_emits_no_header() {
-        let mucus = (
-            "/src/mucus/api/Mucus.hx",
-            "package mucus.api;\n@:include(\"../../src/Mucus.h\")\ntypedef UInt8 = UInt;\n@:native interface IEngine {}",
+        let native = (
+            "/src/native/api/Native.hx",
+            "package native.api;\n@:include(\"../../src/Native.h\")\ntypedef UInt8 = UInt;\n@:native interface IEngine {}",
         );
-        let p = prog(&[mucus]);
+        let p = prog(&[native]);
         assert!(!p.generates_header(&p.modules[0]));
     }
 }

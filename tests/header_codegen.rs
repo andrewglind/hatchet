@@ -1,33 +1,8 @@
-//! Milestone-4 acceptance: header generation against the real corpus. Module.h
-//! and IModule.h are expected byte-for-byte; the richer headers are checked for
-//! the rules that matter (namespacing, pointer-ness, accessors, C++98 `> >`).
-//! Skipped when the corpus is absent.
-
-use std::path::PathBuf;
+//! Header-generation rules, checked against small self-contained programs built
+//! in a temp directory (no external dependencies).
 
 use hatchet::codegen::generate_header;
 use hatchet::sema::Program;
-
-/// A sibling corpus repo: `$env` if set, else `../<name>` next to this crate.
-fn repo_root(env: &str, name: &str) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var(env) {
-        let p = PathBuf::from(p);
-        return p.is_dir().then_some(p);
-    }
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let sibling = manifest.parent()?.join(name);
-    sibling.is_dir().then_some(sibling)
-}
-
-/// The `Modules` corpus (`modules/*.hx` + `mucus/Mucus.hx`).
-fn modules_root() -> Option<PathBuf> {
-    repo_root("HATCHET_CORPUS", "Modules")
-}
-
-/// The `Game` corpus (`game/*.hx` + native binding stubs).
-fn game_root() -> Option<PathBuf> {
-    repo_root("HATCHET_GAME_CORPUS", "Game")
-}
 
 fn module_index(prog: &Program, stem: &str) -> usize {
     prog.modules
@@ -50,150 +25,154 @@ fn decl_class_uses_the_portable_export_macro() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("Widget.hx"),
-        "package ui;\n@:decl @:expose class Widget {\n  public function new() {}\n}\n",
+        "package ui;\n@:decl class Widget {\n  public function new() {}\n}\n",
     )
     .unwrap();
     let mut prog = Program::from_src_dir(&dir).expect("build program");
-    prog.export_macro = "MUCUS".to_string();
+    prog.export_macro = "NATIVE".to_string();
     let idx = module_index(&prog, "Widget");
     let out = generate_header(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("class MUCUS_CLASS Widget"), "@:decl → macro-decorated class:\n{out}");
+    assert!(out.contains("class NATIVE_CLASS Widget"), "@:decl → macro-decorated class:\n{out}");
     assert!(!out.contains("__declspec"), "no raw MSVC token leaks into output:\n{out}");
 }
 
 #[test]
-fn headers_match_and_follow_rules() {
-    let (Some(mroot), Some(groot)) = (modules_root(), game_root()) else {
-        eprintln!("skipping: Modules/Game corpora not found (set HATCHET_CORPUS / HATCHET_GAME_CORPUS)");
-        return;
-    };
-    // Each repo is standalone (its own native binding stubs), so it transpiles as
-    // its own `Program`: the engine modules from `Modules`, the scenes from `Game`.
-    let prog = Program::from_src_dir(&mroot).expect("build Modules program");
-    let game = Program::from_src_dir(&groot).expect("build Game program");
+fn base_method_overridden_by_a_subclass_is_virtual() {
+    // Haxe methods are virtual by default. A base method that a subclass
+    // overrides must be emitted `virtual` in the base, or a call through a base
+    // pointer would static-bind to the base version. A base method that nobody
+    // overrides stays non-virtual.
+    let dir = std::env::temp_dir().join(format!("hatchet_virt_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Base.hx"),
+        "package demo;\nclass Base {\n  public function new() {}\n  \
+         public function area():Float { return 0.0; }\n  \
+         public function label():String { return \"base\"; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Derived.hx"),
+        "package demo;\nclass Derived extends Base {\n  public function new() { super(); }\n  \
+         override public function area():Float { return 1.0; }\n}\n",
+    )
+    .unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let base = header(&prog, "Base");
+    let _ = std::fs::remove_dir_all(&dir);
 
-    // Byte-for-byte against the committed goldens.
-    for stem in ["Module", "IModule"] {
-        let gen = header(&prog, stem);
-        let golden = std::fs::read_to_string(mroot.join("modules").join(format!("{stem}.h")))
-            .unwrap()
-            .replace("\r\n", "\n");
-        assert_eq!(gen, golden, "{stem}.h does not match golden");
-    }
+    assert!(base.contains("virtual float area();"), "overridden base method must be virtual:\n{base}");
+    assert!(
+        base.contains("std::string label();") && !base.contains("virtual std::string label();"),
+        "a method no subclass overrides stays non-virtual:\n{base}"
+    );
+}
 
-    // Vertex: accessor rules + optional-primitive defaults. `effects` is a
-    // non-optional value-typed `(default,set)` property (stored by value).
-    let vertex = header(&prog, "Vertex");
-    assert!(vertex.contains("class Vertex : public Module {"));
-    assert!(vertex.contains("uint32_t color = 0"), "optional UInt32 → value with 0 default");
-    assert!(vertex.contains("mucus::Effects effects;"), "non-optional struct → value field");
-    assert!(vertex.contains("const uint32_t GetColor() { return color; }"));
-    assert!(vertex.contains("void SetColor(uint32_t color) { this->color = color; }"));
-    assert!(
-        vertex.contains("void SetEffects(mucus::Effects effects) { this->effects = effects; }"),
-        "value (default,set) → by-value setter"
-    );
-    assert!(vertex.contains("private:"));
+#[test]
+fn int_enum_abstract_lowers_to_a_cpp_enum_with_values() {
+    // `enum abstract X(Int)` becomes the pre-C++11 `struct X_ { enum Enum { … } }`
+    // idiom: members with an explicit value emit `Name = <expr>` (including
+    // sibling-referencing bit-flag expressions), and a value-less member relies on
+    // C++ auto-increment, exactly as a plain enum would.
+    let dir = std::env::temp_dir().join(format!("hatchet_ea_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Flag.hx"),
+        "package p;\nenum abstract Flag(Int) {\n  var None;\n  var A = 1;\n  var B = 2;\n  var AB = A | B;\n  var Shift = 1 << 4;\n}\n",
+    )
+    .unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let out = header(&prog, "Flag");
+    let _ = std::fs::remove_dir_all(&dir);
 
-    // AlienBeach (game): module types resolve to modules::, native to mucus::.
-    let alien = header(&game, "AlienBeach");
-    assert!(alien.contains("class AlienBeach : public mucus::IScene {"));
-    assert!(alien.contains("modules::Backdrop* backdrop;"), "module class → modules:: pointer");
-    assert!(
-        alien.contains("OnMouseClick(mucus::MouseButton button, int x, int y)"),
-        "native enum param → mucus:: namespace"
-    );
-    // Public `final` → `static const` inside the namespace (not a `#define`).
-    assert!(
-        alien.contains("static const int ALIENBEACH_SCENE_ID = 1;"),
-        "public final → static const inside the namespace"
-    );
-    assert!(!alien.contains("#define ALIENBEACH_SCENE_ID"), "no #define for finals");
+    assert!(out.contains("struct Flag_ {") && out.contains("enum Enum {"), "enum struct idiom:\n{out}");
+    assert!(out.contains("typedef Flag_::Enum Flag;"), "enum typedef:\n{out}");
+    assert!(out.contains("A = 1") && out.contains("B = 2"), "explicit values emitted:\n{out}");
+    assert!(out.contains("AB = A | B"), "sibling bit-flag expression emitted:\n{out}");
+    assert!(out.contains("Shift = 1 << 4"), "shift expression emitted:\n{out}");
+    // A value-less member is emitted bare (auto-increment), with no `= ` suffix.
+    assert!(out.contains("None,") || out.contains("None\n"), "value-less member emitted bare:\n{out}");
+}
 
-    // Graph: nested template must use `> >` for C++98.
-    let graph = header(&prog, "Graph");
-    assert!(
-        graph.contains("std::vector<std::vector<Edge> >"),
-        "nested template needs a space before the outer '>'"
-    );
+#[test]
+fn abstract_function_is_a_pure_virtual_method() {
+    // `abstract function f():T;` (in an `abstract class`) has no body, so it must be
+    // emitted as a pure virtual `virtual T f() = 0;` — declared, never defined —
+    // rather than a plain `virtual T f();` (which would be an undefined symbol).
+    let dir = std::env::temp_dir().join(format!("hatchet_absfn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Shape.hx"),
+        "package p;\nabstract class Shape {\n  public function new() {}\n  \
+         public abstract function area():Float;\n  \
+         public function describe():String { return \"shape\"; }\n}\n",
+    )
+    .unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let out = header(&prog, "Shape");
+    let _ = std::fs::remove_dir_all(&dir);
 
-    // Destructors free owned pointers. AlienBeach `new`s its module fields, so it
-    // deletes them; it does not delete a borrowed/value member.
+    assert!(out.contains("virtual float area() = 0;"), "abstract method → pure virtual:\n{out}");
+    // A concrete method is not made pure virtual.
     assert!(
-        alien.contains("delete this->fogEffect;") && alien.contains("delete this->backdrop;"),
-        "scene destructor frees the modules it allocated"
+        out.contains("std::string describe();") && !out.contains("describe() = 0"),
+        "concrete method stays defined:\n{out}"
     );
+}
 
-    // FogEffect forwards a `Null<FogEffectData>` into Effect's `void* data`, so it
-    // deletes it with the concrete type; the base Effect owns nothing.
-    let effect = header(&prog, "Effect");
-    assert!(
-        effect.contains("delete (mucus::FogEffectData*)this->data;"),
-        "subclass frees the typed pointer it handed to the base's void* field"
-    );
-    assert!(effect.contains("virtual ~Effect() {}"), "base with no owned pointers has an empty dtor");
+#[test]
+fn string_enum_abstract_lowers_to_namespaced_static_consts() {
+    // A `String`-backed `enum abstract` has no integral enum representation, so it
+    // becomes a namespace of typed `static const` constants (header-only); the type
+    // itself maps to `std::string`, and members are referenced as `Suit_::Member`.
+    let dir = std::env::temp_dir().join(format!("hatchet_eas_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Suit.hx"),
+        "package p;\nenum abstract Suit(String) {\n  var Hearts = \"H\";\n  var Spades = \"S\";\n}\n\
+         class Use {\n  public function new() {}\n  public function f():Suit { return Hearts; }\n}\n",
+    )
+    .unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let out = header(&prog, "Suit");
+    let _ = std::fs::remove_dir_all(&dir);
 
-    // Backdrop's `new Array<...>()` is a value container, never `delete`d as a
-    // whole — but it owns the `Tile*`s `new`ed into it, so the destructor walks
-    // the nested vectors and frees each leaf.
-    let backdrop = header(&prog, "Backdrop");
-    assert!(!backdrop.contains("delete this->tilesets;"), "value containers are not deleted");
+    assert!(out.contains("namespace Suit_ {"), "members live in a `Suit_` namespace:\n{out}");
     assert!(
-        backdrop.contains("delete this->tilesets[_i0][_i1];"),
-        "owned container frees each pointer it allocated"
+        out.contains("static const std::string Hearts = \"H\";"),
+        "string member → static const std::string:\n{out}"
     );
+    assert!(!out.contains("enum Enum"), "no C++ enum for a non-integral backing:\n{out}");
+    assert!(!out.contains("typedef"), "no typedef — the type maps straight to std::string:\n{out}");
+    // The method returns `Suit`, which maps to the underlying `std::string`.
+    assert!(out.contains("std::string f();"), "Suit maps to std::string in signatures:\n{out}");
+}
 
-    // Camera's `observers` container is borrowed (added via a parameter), so it
-    // is never freed.
-    let camera = header(&prog, "Camera");
-    assert!(camera.contains("virtual ~Camera() {}"), "borrowed container is not freed");
+#[test]
+fn plain_module_function_is_declared_after_the_types_it_uses() {
+    // A plain module-level `function f(...)` becomes a namespace free function: a
+    // PUBLIC one is declared in the header, AFTER the type definitions its signature
+    // references (so `function makeVec():Vec2` sees `struct Vec2`); a `private` one
+    // is `static` in the `.cpp` and must NOT appear in the header.
+    let dir = std::env::temp_dir().join(format!("hatchet_modfn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Geom.hx"),
+        "package p;\ntypedef Vec2 = { x:Float, y:Float };\n\
+         function makeVec(x:Float, y:Float):Vec2 { return { x: x, y: y }; }\n\
+         private function helper(v:Float):Float { return v * v; }\n",
+    )
+    .unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let out = header(&prog, "Geom");
+    let _ = std::fs::remove_dir_all(&dir);
 
-    // Tile: base-from-member idiom — `super(...)` is not the first statement, so
-    // an intermediate `TileHolder` struct precedes the class and is a private base.
-    let tile = header(&prog, "Tile");
-    assert!(tile.contains("struct TileHolder {"), "Holder struct emitted");
-    assert!(
-        tile.contains("class Tile : private TileHolder, public TexturedQuad {"),
-        "class privately inherits its Holder"
-    );
-    assert!(
-        tile.contains("TileHolder(mucus::IEngine* engine, int tilesetId, int x, int y, const std::string& textureName);"),
-        "Holder ctor mirrors the class ctor params"
-    );
-
-    // Utilities: public top-level functions are declared (definitions in the .cpp);
-    // file-local (`private`) ones are not exposed in the header.
-    let utilities = header(&prog, "Utilities");
-    assert!(
-        utilities.contains("float Distance(const Vector& a, const Vector& b);"),
-        "public free fn declared in header"
-    );
-    assert!(
-        utilities.contains("bool PointInsidePolygon(const Point& point, const Polygon& polygon, float epsilon = 0.00001f);"),
-        "free fn declaration keeps default arguments"
-    );
-    assert!(!utilities.contains("CrossProduct"), "private free fn not in header");
-
-    // Enum form and typedef-struct default ctor.
-    let modules = header(&prog, "Modules");
-    assert!(modules.contains("struct Direction_ {"));
-    assert!(modules.contains("typedef Direction_::Enum Direction;"));
-    assert!(
-        modules.contains("EffectOptions() :"),
-        "struct with optional fields gets a default constructor"
-    );
-
-    // SceneFactory: an `extern inline function` becomes an `extern "C"` export at
-    // GLOBAL scope (no namespace wrapper), declared with the portable export /
-    // calling-convention macros and fully-qualified types.
-    let factory = header(&game, "SceneFactory");
-    assert!(
-        factory.contains(
-            "HATCHET_EXPORT mucus::IScene* HATCHET_CALL MCreateScene(mucus::IEngine* engine, int sceneId);"
-        ),
-        "extern inline → macro-wrapped extern \"C\" declaration:\n{factory}"
-    );
-    assert!(!factory.contains("namespace game"), "extern \"C\" export has no namespace block:\n{factory}");
+    assert!(out.contains("Vec2 makeVec(float x, float y);"), "public function declared in header:\n{out}");
+    assert!(!out.contains("helper"), "private function is static in the .cpp, not in the header:\n{out}");
+    // The `struct Vec2` definition must precede the function that returns it.
+    let struct_at = out.find("struct Vec2").expect("Vec2 struct emitted");
+    let fn_at = out.find("Vec2 makeVec").expect("makeVec declared");
+    assert!(struct_at < fn_at, "the type must be defined before the function that uses it:\n{out}");
 }

@@ -53,6 +53,13 @@ pub fn unresolved_type_errors(prog: &Program, mi: usize) -> Vec<Diagnostic> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for r in collect_refs(prog, mi) {
         if prog.resolve_type(&r.path, mi).is_none() {
+            // Types Hatchet recognises but does not support (the macro `Expr`, the
+            // regex `EReg`) are reported as `Unsupported` (with the contribution
+            // invite) by `unsupported_construct_errors`, not as a plain unresolved
+            // type — skip them here to avoid a double report.
+            if unsupported_type_label(&r.path).is_some() {
+                continue;
+            }
             // De-duplicate identical (name, line, context) reports.
             let key = format!("{}|{}|{}", r.path.join("."), r.line, r.ctx);
             if seen.insert(key) {
@@ -83,11 +90,125 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
     let m = &prog.modules[mi];
     let file = m.path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
     let mut out = Vec::new();
-    let mut w = UnsupportedWalker { file, line: 0, out: &mut out };
+    {
+        let mut w = UnsupportedWalker { file: file.clone(), line: 0, out: &mut out };
+        for d in &m.file.decls {
+            w.decl(d);
+        }
+    }
+    // Haxe macros are compile-time metaprogramming with no C++ runtime lowering:
+    // a `macro` function, or any use of the macro AST type `Expr`, is unsupported.
     for d in &m.file.decls {
-        w.decl(d);
+        flag_macro_functions(d, &file, &mut out);
+    }
+    // `using` static extensions rewrite `a.f(b)` into `Module.f(a, b)` at the call
+    // site, chosen by `a`'s type. Hatchet has no such call-site rewriting, so a
+    // `using` would be silently ignored — flag it rather than drop it.
+    for u in &m.file.usings {
+        out.push(Diagnostic::unsupported(
+            file.clone(),
+            u.line,
+            format!("the `using` static-extension declaration `{}`", u.path.join(".")),
+        ));
+    }
+    // Top-level declarations Hatchet recognised but skipped at parse time (an
+    // `abstract` type or `enum abstract`) — flag each with the label the parser set.
+    for d in &m.file.decls {
+        if let Decl::Unsupported { feature, line } = d {
+            out.push(Diagnostic::unsupported(file.clone(), *line, feature.clone()));
+        }
+    }
+    // Enum variants that take constructor parameters (`Move(dx:Int, dy:Int)`) need a
+    // tagged-union lowering Hatchet does not implement — it emits plain C++ enums, so
+    // the payload would be lost. Flag each parameterized variant.
+    for d in &m.file.decls {
+        if let Decl::Enum(e) = d {
+            for v in &e.variants {
+                if !v.params.is_empty() {
+                    let line = v.params.iter().find_map(|p| p.ty.as_ref().map(type_line)).unwrap_or(0);
+                    out.push(Diagnostic::unsupported(
+                        file.clone(),
+                        line,
+                        format!("the parameterized enum variant `{}`", v.name),
+                    ));
+                }
+            }
+        }
+    }
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for r in collect_refs(prog, mi) {
+        if let Some(label) = unsupported_type_label(&r.path) {
+            if seen.insert(format!("{}|{}", r.line, r.ctx)) {
+                out.push(Diagnostic::unsupported(
+                    file.clone(),
+                    r.line,
+                    format!("{label} `{}` {}", r.path.join("."), r.ctx),
+                ));
+            }
+        }
     }
     out
+}
+
+/// If a type path names a Haxe construct Hatchet does not support, return a human
+/// label for it (used in the diagnostic). Currently the macro AST type `Expr`
+/// (`haxe.macro.Expr`) and the regular-expression type `EReg`. These are reported
+/// as `Unsupported` rather than as plain unresolved types.
+fn unsupported_type_label(path: &[String]) -> Option<&'static str> {
+    match path.last().map(|s| s.as_str()) {
+        Some("Expr") => Some("the Haxe macro type"),
+        Some("EReg") => Some("the Haxe regular-expression type"),
+        _ => None,
+    }
+}
+
+/// The source line a type was written on (`0` if synthesized).
+fn type_line(t: &Type) -> usize {
+    match t {
+        Type::Named { line, .. } => *line,
+        Type::Anon(fields) => fields.first().map(|f| type_line(&f.ty)).unwrap_or(0),
+        Type::Func { ret, .. } => type_line(ret),
+    }
+}
+
+/// A representative source line for a function (from its signature types).
+fn signature_line(f: &Function) -> usize {
+    f.ret
+        .as_ref()
+        .map(type_line)
+        .or_else(|| f.params.iter().find_map(|p| p.ty.as_ref().map(type_line)))
+        .unwrap_or(0)
+}
+
+/// Flag every `macro` function declared in `d` as unsupported.
+fn flag_macro_functions(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
+    fn flag(f: &Function, file: &str, out: &mut Vec<Diagnostic>) {
+        if f.modifiers.is_macro {
+            let who = f.name.clone().unwrap_or_else(|| "new".to_string());
+            out.push(Diagnostic::unsupported(
+                file.to_string(),
+                signature_line(f),
+                format!("the Haxe `macro` function `{who}`"),
+            ));
+        }
+    }
+    match d {
+        Decl::Class(c) => {
+            for m in &c.methods {
+                flag(m, file, out);
+            }
+            if let Some(ct) = &c.ctor {
+                flag(ct, file, out);
+            }
+        }
+        Decl::Interface(i) => {
+            for m in &i.methods {
+                flag(m, file, out);
+            }
+        }
+        Decl::Function(f) => flag(f, file, out),
+        _ => {}
+    }
 }
 
 /// Walks bodies flagging lambdas in unsupported positions. `line` tracks the
@@ -103,7 +224,23 @@ impl<'a> UnsupportedWalker<'a> {
         self.out.push(Diagnostic::unsupported(
             self.file.clone(),
             self.line,
-            "a lambda (arrow function) used outside a top-level `final` binding or an `Array.map(...)` call",
+            "a lambda (arrow function) used outside a top-level `final` binding or an `Array.map`/`filter`/`sort(...)` call",
+        ));
+    }
+
+    fn flag_regex(&mut self) {
+        self.out.push(Diagnostic::unsupported(
+            self.file.clone(),
+            self.line,
+            "a regular-expression literal (`~/.../`)",
+        ));
+    }
+
+    fn flag_is(&mut self) {
+        self.out.push(Diagnostic::unsupported(
+            self.file.clone(),
+            self.line,
+            "the `is` runtime type-check operator (Haxe 4.2)",
         ));
     }
 
@@ -130,6 +267,8 @@ impl<'a> UnsupportedWalker<'a> {
                 Some(e) => self.expr(e),
                 None => {}
             },
+            // Flagged directly in `unsupported_construct_errors` from its label.
+            Decl::Unsupported { .. } => {}
             Decl::Enum(_) | Decl::Typedef(_) => {}
         }
     }
@@ -218,6 +357,14 @@ impl<'a> UnsupportedWalker<'a> {
                 self.line = *line;
                 self.expr(e);
             }
+            Stmt::Try { body, catches, .. } => {
+                self.stmt(body);
+                for c in catches {
+                    for s in &c.body {
+                        self.stmt(s);
+                    }
+                }
+            }
             Stmt::Block(stmts) => {
                 for s in stmts {
                     self.stmt(s);
@@ -231,11 +378,31 @@ impl<'a> UnsupportedWalker<'a> {
         match e {
             // A lambda reaching any ordinary expression position is unsupported.
             Expr::Lambda { .. } => self.flag_lambda(),
+            Expr::Regex { .. } => self.flag_regex(),
+            Expr::Switch { subject, cases, default } => {
+                self.expr(subject);
+                for c in cases {
+                    for p in &c.patterns {
+                        self.expr(p);
+                    }
+                    for s in &c.body {
+                        self.stmt(s);
+                    }
+                }
+                if let Some(d) = default {
+                    for s in d {
+                        self.stmt(s);
+                    }
+                }
+            }
             Expr::Call(target, args) => {
-                // `recv.map(lambda)` — the first-argument lambda is supported; walk
-                // the receiver and the lambda's body, but do not flag the lambda.
+                // `recv.map/filter/sort(lambda)` — the first-argument lambda is
+                // supported; walk the receiver and the lambda's body, but do not
+                // flag the lambda itself.
                 if let Expr::Field(recv, method) = &**target {
-                    if method == "map" && matches!(args.first(), Some(Expr::Lambda { .. })) {
+                    if matches!(method.as_str(), "map" | "filter" | "sort")
+                        && matches!(args.first(), Some(Expr::Lambda { .. }))
+                    {
                         self.expr(recv);
                         if let Some(Expr::Lambda { body, .. }) = args.first() {
                             self.lambda_body(body);
@@ -255,6 +422,10 @@ impl<'a> UnsupportedWalker<'a> {
                 for a in args {
                     self.expr(a);
                 }
+            }
+            Expr::Is { expr, .. } => {
+                self.flag_is();
+                self.expr(expr);
             }
             Expr::Cast { expr, .. }
             | Expr::TypeCheck { expr, .. }
@@ -314,6 +485,7 @@ impl<'a> UnsupportedWalker<'a> {
             | Expr::Null
             | Expr::This
             | Expr::Super
+            | Expr::Verbatim(_)
             | Expr::Ident(_) => {}
         }
     }
@@ -435,6 +607,9 @@ impl Collector {
                 }
             }
             Decl::Function(f) => self.func(f),
+            // Skipped at parse time (body discarded) and flagged elsewhere — nothing
+            // to collect type references from.
+            Decl::Unsupported { .. } => {}
         }
     }
 
@@ -496,6 +671,17 @@ impl Collector {
             }
             Stmt::Return(Some(e), _) => self.expr(e, ctx),
             Stmt::Throw(e, _) => self.expr(e, ctx),
+            // try/catch is transpiled: walk the body, and validate each (typed)
+            // catch's exception type — an unresolved one would not compile.
+            Stmt::Try { body, catches, .. } => {
+                self.stmt(body, ctx);
+                for c in catches {
+                    self.opt(&c.ty, ctx);
+                    for s in &c.body {
+                        self.stmt(s, ctx);
+                    }
+                }
+            }
             Stmt::Block(stmts) => {
                 for s in stmts {
                     self.stmt(s, ctx);
@@ -519,6 +705,22 @@ impl Collector {
     /// sub-expression so `new`/`cast`/type-checks anywhere are validated.
     fn expr(&mut self, e: &Expr, ctx: &str) {
         match e {
+            Expr::Switch { subject, cases, default } => {
+                self.expr(subject, ctx);
+                for c in cases {
+                    for p in &c.patterns {
+                        self.expr(p, ctx);
+                    }
+                    for s in &c.body {
+                        self.stmt(s, ctx);
+                    }
+                }
+                if let Some(d) = default {
+                    for s in d {
+                        self.stmt(s, ctx);
+                    }
+                }
+            }
             Expr::New(ty, args) => {
                 self.check(ty, ctx);
                 for a in args {
@@ -533,6 +735,10 @@ impl Collector {
                 self.check(ty, ctx);
                 self.expr(expr, ctx);
             }
+            // Unsupported (flagged elsewhere). Walk the operand for nested refs, but
+            // skip the checked type — it is the construct we do not support, so a
+            // separate "unresolved type" report on it would be misleading.
+            Expr::Is { expr, .. } => self.expr(expr, ctx),
             Expr::Lambda { params, ret, body } => {
                 for p in params {
                     self.opt(&p.ty, ctx);
@@ -609,6 +815,8 @@ impl Collector {
             | Expr::Null
             | Expr::This
             | Expr::Super
+            | Expr::Verbatim(_)
+            | Expr::Regex { .. }
             | Expr::Ident(_) => {}
         }
     }

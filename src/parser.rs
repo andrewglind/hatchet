@@ -8,7 +8,7 @@
 use std::fmt;
 
 use crate::ast::*;
-use crate::lexer::{lex, Kw, Sym, TokKind, Token};
+use crate::lexer::{lex, Kw, PpKind, Sym, TokKind, Token};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
@@ -26,6 +26,10 @@ impl std::error::Error for ParseError {}
 
 /// Parse a full Haxe source file.
 pub fn parse(src: &str) -> Result<File, ParseError> {
+    // Strip a leading UTF-8 BOM (U+FEFF) that some editors prepend — it is not source.
+    // Done here (not in `lex`) so the lexer and the parser's source slice — used to
+    // capture `untyped`/verbatim spans — share the same byte offsets.
+    let src = src.strip_prefix('\u{FEFF}').unwrap_or(src);
     let tokens = lex(src).map_err(|e| ParseError {
         message: e.message,
         line: e.line,
@@ -143,6 +147,104 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Validate that a `#if` condition is a single bare flag (an identifier).
+    /// Boolean conditions (`!X`, `A && B`, parentheses) are rejected: they map
+    /// to `#ifdef`, which only takes one macro name.
+    fn bare_flag(&self, cond: &str) -> PResult<String> {
+        let ok = !cond.is_empty()
+            && cond.bytes().enumerate().all(|(i, b)| {
+                if i == 0 {
+                    b == b'_' || b.is_ascii_alphabetic()
+                } else {
+                    b == b'_' || b.is_ascii_alphanumeric()
+                }
+            });
+        if ok {
+            Ok(cond.to_string())
+        } else {
+            Err(self.err(&format!(
+                "only a bare conditional-compilation flag is supported \
+                 (e.g. `#if DREAMCAST`); `{cond}` is not a single flag"
+            )))
+        }
+    }
+
+    /// The next token if it is an identifier (consuming it), else `None`. Used to
+    /// pick up the optional name of a skipped declaration for its diagnostic.
+    fn opt_ident(&mut self) -> Option<String> {
+        if let TokKind::Ident(n) = self.peek() {
+            let n = n.clone();
+            self.bump();
+            Some(n)
+        } else {
+            None
+        }
+    }
+
+    /// Skip a declaration body: advance to the next `{`, then consume the balanced
+    /// `{ … }` group. Used for declarations Hatchet recognises but does not yet
+    /// transpile (`abstract` / `enum abstract`), so the rest of the file still parses.
+    fn skip_braced_body(&mut self) -> PResult<()> {
+        while !self.at_sym(Sym::LBrace) {
+            if self.at_eof() {
+                return Err(self.err("expected `{` to begin the declaration body"));
+            }
+            self.bump();
+        }
+        let mut depth = 0usize;
+        loop {
+            if self.at_eof() {
+                return Err(self.err("unterminated declaration body"));
+            }
+            match self.peek() {
+                TokKind::Sym(Sym::LBrace) => depth += 1,
+                TokKind::Sym(Sym::RBrace) => depth -= 1,
+                _ => {}
+            }
+            self.bump();
+            if depth == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Capture the raw source of an `untyped` operand: everything up to the end
+    /// of the current statement — the next top-level `;`, `,`, or an unmatched
+    /// closing `)`/`]`/`}`. The text is returned exactly as written (no
+    /// transpilation), so it must already be valid C++.
+    fn capture_verbatim_operand(&mut self) -> PResult<String> {
+        if self.at_eof() {
+            return Err(self.err("`untyped` must be followed by an expression"));
+        }
+        let from = self.toks[self.pos].start;
+        let mut last_end = from;
+        let mut depth = 0i32;
+        loop {
+            match self.peek() {
+                TokKind::Eof => break,
+                TokKind::Sym(Sym::Semi) if depth == 0 => break,
+                TokKind::Sym(Sym::Comma) if depth == 0 => break,
+                TokKind::Sym(Sym::LParen | Sym::LBracket | Sym::LBrace) => depth += 1,
+                TokKind::Sym(Sym::RParen | Sym::RBracket | Sym::RBrace) => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+            last_end = self.toks[self.pos].end;
+            self.bump();
+        }
+        let raw = String::from_utf8_lossy(&self.src[from..last_end])
+            .trim()
+            .to_string();
+        if raw.is_empty() {
+            return Err(self.err("`untyped` must be followed by an expression"));
+        }
+        Ok(raw)
+    }
+
     // ---- metadata -------------------------------------------------------
 
     fn parse_meta_list(&mut self) -> PResult<Vec<Meta>> {
@@ -183,6 +285,30 @@ impl<'a> Parser<'a> {
     }
 
     /// Advance over one argument, stopping before a top-level `,` or `)`.
+    /// Consume a balanced `{ ... }` block without parsing its contents. Used to
+    /// skip the body of constructs Hatchet does not transpile (e.g. `macro`
+    /// functions), which may contain syntax the expression parser rejects.
+    fn skip_braced_block(&mut self) -> PResult<()> {
+        self.expect_sym(Sym::LBrace)?;
+        let mut depth = 1i32;
+        loop {
+            match self.peek() {
+                TokKind::Eof => return Err(self.err("unterminated block")),
+                TokKind::Sym(Sym::LBrace) => depth += 1,
+                TokKind::Sym(Sym::RBrace) => {
+                    depth -= 1;
+                    self.bump();
+                    if depth == 0 {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            self.bump();
+        }
+    }
+
     fn skip_balanced_until_arg_end(&mut self) -> PResult<()> {
         let mut depth = 0i32;
         loop {
@@ -228,7 +354,12 @@ impl<'a> Parser<'a> {
         };
 
         if self.eat_kw(Kw::Package) {
-            file.package = self.parse_dotted()?;
+            // `package;` (empty package) is valid Haxe and means the root
+            // package — identical to omitting the declaration. Only parse a
+            // dotted path when a name actually follows the keyword.
+            if !self.at_sym(Sym::Semi) {
+                file.package = self.parse_dotted()?;
+            }
             self.expect_sym(Sym::Semi)?;
         }
 
@@ -239,10 +370,11 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.at_kw(Kw::Using) {
+                let line = self.line();
                 self.bump();
                 let path = self.parse_dotted()?;
                 self.expect_sym(Sym::Semi)?;
-                file.usings.push(path);
+                file.usings.push(Using { path, line });
                 continue;
             }
             if self.at_eof() {
@@ -340,6 +472,7 @@ impl<'a> Parser<'a> {
             self.bump();
         }
 
+        let line = self.line();
         match self.peek().clone() {
             TokKind::Kw(Kw::Class) => Ok(Decl::Class(self.parse_class(
                 meta,
@@ -348,7 +481,23 @@ impl<'a> Parser<'a> {
                 is_abstract_class,
             )?)),
             TokKind::Kw(Kw::Interface) => Ok(Decl::Interface(self.parse_interface(meta)?)),
+            // `enum abstract X(T) { … }` — Haxe's typed-constant idiom. An integral
+            // backing lowers to a plain C++ `enum` (with explicit member values); a
+            // `String`/`Float` backing lowers to a namespace of `static const`s.
+            TokKind::Kw(Kw::Enum) if matches!(self.peek2(), TokKind::Kw(Kw::Abstract)) => {
+                self.bump(); // enum
+                self.bump(); // abstract
+                Ok(Decl::Enum(self.parse_enum_abstract(meta)?))
+            }
             TokKind::Kw(Kw::Enum) => Ok(Decl::Enum(self.parse_enum(meta)?)),
+            // A bare `abstract X(Int) { … }` type (the `abstract class` form is
+            // handled by the modifier loop above). Skip the body and flag it.
+            TokKind::Kw(Kw::Abstract) => {
+                self.bump(); // abstract
+                let name = self.opt_ident();
+                self.skip_braced_body()?;
+                Ok(Decl::Unsupported { feature: labelled("an `abstract` type", name), line })
+            }
             TokKind::Kw(Kw::Typedef) => Ok(Decl::Typedef(self.parse_typedef(meta)?)),
             TokKind::Kw(Kw::Function) => {
                 // top-level function, e.g. `extern inline function f(...) {}`
@@ -483,16 +632,77 @@ impl<'a> Parser<'a> {
                 params = self.parse_params()?;
             }
             self.eat_sym(Sym::Semi);
-            variants.push(EnumVariant { name: vname, params });
+            variants.push(EnumVariant { name: vname, params, value: None });
         }
         self.expect_sym(Sym::RBrace)?;
-        Ok(Enum { name, meta, variants })
+        Ok(Enum { name, meta, variants, underlying: None })
+    }
+
+    /// Parse `enum abstract X(T) { var A [= expr]; ... }`. The leading
+    /// `enum abstract` keywords are already consumed. The returned `Enum` carries
+    /// the underlying type `T` and each member's explicit value; codegen lowers an
+    /// integral backing to a C++ `enum` and a `String`/`Float` backing to a
+    /// namespace of typed `static const` constants.
+    fn parse_enum_abstract(&mut self, meta: Vec<Meta>) -> PResult<Enum> {
+        let name = self.expect_ident()?;
+        // The underlying type `(T)`.
+        self.expect_sym(Sym::LParen)?;
+        let underlying = self.parse_type()?;
+        self.expect_sym(Sym::RParen)?;
+        // Skip any `from`/`to` cast clauses up to the body.
+        while !self.at_sym(Sym::LBrace) && !self.at_eof() {
+            self.bump();
+        }
+        self.expect_sym(Sym::LBrace)?;
+        let mut variants = Vec::new();
+        while !self.at_sym(Sym::RBrace) && !self.at_eof() {
+            // Member-level metadata/modifiers (`public`, `inline`, `final`, …) carry
+            // no meaning for the C++ enum — skip them.
+            while matches!(self.peek(), TokKind::Meta(_)) {
+                self.bump();
+            }
+            while matches!(
+                self.peek(),
+                TokKind::Kw(Kw::Public) | TokKind::Kw(Kw::Private) | TokKind::Kw(Kw::Inline)
+                    | TokKind::Kw(Kw::Static) | TokKind::Kw(Kw::Final)
+            ) {
+                self.bump();
+            }
+            // A method inside an `enum abstract` (`function …`) is not transpiled —
+            // skip its signature and body and move on.
+            if self.at_kw(Kw::Function) {
+                while !self.at_sym(Sym::LBrace) && !self.at_eof() {
+                    self.bump();
+                }
+                self.skip_braced_body()?;
+                self.eat_sym(Sym::Semi);
+                continue;
+            }
+            if !self.eat_kw(Kw::Var) {
+                // Anything unexpected: stop trying to extract members cleanly.
+                break;
+            }
+            let vname = self.expect_ident()?;
+            // Optional `: Type` annotation on the member (ignored).
+            if self.eat_sym(Sym::Colon) {
+                let _ = self.parse_type()?;
+            }
+            let value = if self.eat_sym(Sym::Assign) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            self.eat_sym(Sym::Semi);
+            variants.push(EnumVariant { name: vname, params: Vec::new(), value });
+        }
+        self.expect_sym(Sym::RBrace)?;
+        Ok(Enum { name, meta, variants, underlying: Some(underlying) })
     }
 
     fn parse_typedef(&mut self, meta: Vec<Meta>) -> PResult<Typedef> {
         self.expect_sym_kw(Kw::Typedef)?;
         let name = self.expect_ident()?;
-        self.parse_type_params()?; // discard (corpus typedefs are not generic)
+        self.parse_type_params()?; // discard (supported typedefs are not generic)
         self.expect_sym(Sym::Assign)?;
         let target = if self.at_sym(Sym::LBrace) {
             TypedefTarget::Struct(self.parse_struct_fields()?)
@@ -662,7 +872,16 @@ impl<'a> Parser<'a> {
             None
         };
         let body = if self.at_sym(Sym::LBrace) {
-            Some(self.parse_block()?)
+            if modifiers.is_macro {
+                // A `macro` function's body is Haxe macro-reification syntax
+                // (`macro`, `$x`, ...) that Hatchet does not transpile. Skip it
+                // verbatim so the reification doesn't trip up the expression
+                // parser; sema reports the function itself as unsupported.
+                self.skip_braced_block()?;
+                None
+            } else {
+                Some(self.parse_block()?)
+            }
         } else {
             self.eat_sym(Sym::Semi);
             None
@@ -861,31 +1080,39 @@ impl<'a> Parser<'a> {
         Ok(stmts)
     }
 
+    /// Parse a `var`/`final` local declaration (the keyword is current). `delete`
+    /// carries an `@delete` marker requesting a scope-close free.
+    fn parse_var_stmt(&mut self, line: usize, delete: bool) -> PResult<Stmt> {
+        let is_final = self.at_kw(Kw::Final);
+        self.bump();
+        let name = self.expect_ident()?;
+        let ty = if self.eat_sym(Sym::Colon) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        let init = if self.eat_sym(Sym::Assign) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        self.eat_sym(Sym::Semi);
+        Ok(Stmt::Var { name, ty, init, is_final, delete, line })
+    }
+
     fn parse_stmt(&mut self) -> PResult<Stmt> {
         let line = self.line();
         match self.peek().clone() {
-            TokKind::Kw(Kw::Var) | TokKind::Kw(Kw::Final) => {
-                let is_final = self.at_kw(Kw::Final);
+            TokKind::Kw(Kw::Var) | TokKind::Kw(Kw::Final) => self.parse_var_stmt(line, false),
+            // `@delete var x = …` — the developer asks for `x` to be freed at the
+            // end of this scope (the local-scope counterpart to `@owned`). It must
+            // sit immediately before a local `var`/`final`.
+            TokKind::Meta(name) if name == "delete" => {
                 self.bump();
-                let name = self.expect_ident()?;
-                let ty = if self.eat_sym(Sym::Colon) {
-                    Some(self.parse_type()?)
-                } else {
-                    None
-                };
-                let init = if self.eat_sym(Sym::Assign) {
-                    Some(self.parse_expr()?)
-                } else {
-                    None
-                };
-                self.eat_sym(Sym::Semi);
-                Ok(Stmt::Var {
-                    name,
-                    ty,
-                    init,
-                    is_final,
-                    line,
-                })
+                if !(self.at_kw(Kw::Var) || self.at_kw(Kw::Final)) {
+                    return Err(self.err("@delete must immediately precede a local `var` declaration"));
+                }
+                self.parse_var_stmt(line, true)
             }
             TokKind::Kw(Kw::If) => self.parse_if(),
             TokKind::Kw(Kw::For) => self.parse_for(),
@@ -944,6 +1171,7 @@ impl<'a> Parser<'a> {
                 self.eat_sym(Sym::Semi);
                 Ok(Stmt::Throw(e, line))
             }
+            TokKind::Kw(Kw::Try) => self.parse_try(line),
             TokKind::Sym(Sym::LBrace) => Ok(Stmt::Block(self.parse_block()?)),
             // Statement-level `@:cppFileCode('...')` injects verbatim C++ here.
             TokKind::Meta(name) if name == "cppFileCode" => {
@@ -955,6 +1183,41 @@ impl<'a> Parser<'a> {
                 };
                 let code = args.into_iter().next().unwrap_or_default();
                 self.eat_sym(Sym::Semi);
+                Ok(Stmt::Verbatim { code, line })
+            }
+            // Statement-level `@:include("X")` emits an `#include` directive at
+            // this point (so it can sit inside a `#if`/`#end` block). Angle-form
+            // (`<...>`) is emitted unquoted; everything else is quoted, matching
+            // the header include convention.
+            TokKind::Meta(name) if name == "include" => {
+                self.bump();
+                let args = if self.at_sym(Sym::LParen) {
+                    self.parse_meta_args()?
+                } else {
+                    Vec::new()
+                };
+                let path = args.into_iter().next().unwrap_or_default();
+                self.eat_sym(Sym::Semi);
+                let code = if path.starts_with('<') {
+                    format!("#include {path}")
+                } else {
+                    format!("#include \"{path}\"")
+                };
+                Ok(Stmt::Verbatim { code, line })
+            }
+            // Conditional-compilation directives, repurposed as a front end for
+            // the C++ preprocessor. Only a bare flag is supported (`#if FLAG` →
+            // `#ifdef FLAG`, `#elseif FLAG` → `#elif defined(FLAG)`); negation /
+            // boolean conditions raise an error, per the "raise, do not guess" rule.
+            // C++98 has no `#elifdef`, so `#elseif` lowers via `#elif defined(...)`.
+            TokKind::Pp(kind, cond) => {
+                self.bump();
+                let code = match kind {
+                    PpKind::If => format!("#ifdef {}", self.bare_flag(&cond)?),
+                    PpKind::ElseIf => format!("#elif defined({})", self.bare_flag(&cond)?),
+                    PpKind::Else => "#else".to_string(),
+                    PpKind::End => "#endif".to_string(),
+                };
                 Ok(Stmt::Verbatim { code, line })
             }
             _ => {
@@ -981,16 +1244,46 @@ impl<'a> Parser<'a> {
         Ok(Stmt::If { cond, then, els, line })
     }
 
+    /// Parse `try <stmt> (catch (name[:Type]) <block>)*`. The structure is captured
+    /// so the validation pass can flag it as unsupported with a location (Hatchet
+    /// does not transpile exception handling yet).
+    fn parse_try(&mut self, line: usize) -> PResult<Stmt> {
+        self.expect_sym_kw(Kw::Try)?;
+        let body = Box::new(self.parse_stmt()?);
+        let mut catches = Vec::new();
+        while self.at_kw(Kw::Catch) {
+            self.bump(); // catch
+            self.expect_sym(Sym::LParen)?;
+            let name = self.expect_ident()?;
+            // The exception type is optional in Haxe 4.2 (`catch (e)`).
+            let ty = if self.eat_sym(Sym::Colon) {
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            self.expect_sym(Sym::RParen)?;
+            let body = self.parse_block()?;
+            catches.push(Catch { name, ty, body });
+        }
+        Ok(Stmt::Try { body, catches, line })
+    }
+
     fn parse_for(&mut self) -> PResult<Stmt> {
         let line = self.line();
         self.expect_sym_kw(Kw::For)?;
         self.expect_sym(Sym::LParen)?;
         let var = self.expect_ident()?;
+        // `for (key => value in map)` — the optional value binding.
+        let value_var = if self.eat_sym(Sym::FatArrow) {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
         self.expect_sym_kw(Kw::In)?;
         let iter = self.parse_iterable()?;
         self.expect_sym(Sym::RParen)?;
         let body = Box::new(self.parse_stmt()?);
-        Ok(Stmt::For { var, iter, body, line })
+        Ok(Stmt::For { var, value_var, iter, body, line })
     }
 
     fn parse_iterable(&mut self) -> PResult<Iterable> {
@@ -1005,6 +1298,18 @@ impl<'a> Parser<'a> {
 
     fn parse_switch(&mut self) -> PResult<Stmt> {
         let line = self.line();
+        let (subject, cases, default) = self.parse_switch_parts()?;
+        Ok(Stmt::Switch {
+            subject,
+            cases,
+            default,
+            line,
+        })
+    }
+
+    /// Parse `switch (subject) { case …: …; default: … }`, shared by the statement
+    /// and expression forms. The leading `switch` keyword is current.
+    fn parse_switch_parts(&mut self) -> PResult<(Expr, Vec<Case>, Option<Vec<Stmt>>)> {
         self.expect_sym_kw(Kw::Switch)?;
         let paren = self.eat_sym(Sym::LParen);
         let subject = self.parse_expr()?;
@@ -1031,16 +1336,11 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_sym(Sym::RBrace)?;
-        Ok(Stmt::Switch {
-            subject,
-            cases,
-            default,
-            line,
-        })
+        Ok((subject, cases, default))
     }
 
     /// Case bodies run until the next `case`/`default`/`}`. A single brace-block
-    /// body (as in the corpus) is unwrapped into its statements.
+    /// body is unwrapped into its statements.
     fn parse_case_body(&mut self) -> PResult<Vec<Stmt>> {
         if self.at_sym(Sym::LBrace) {
             return self.parse_block();
@@ -1134,7 +1434,17 @@ impl<'a> Parser<'a> {
 
     fn parse_binary(&mut self, min_prec: u8) -> PResult<Expr> {
         let mut lhs = self.parse_unary()?;
-        while let Some((op, prec)) = self.peek_binop() {
+        loop {
+            // Haxe 4.2 `expr is Type`. `is` is a *soft* keyword — it lexes as an
+            // identifier so that ordinary variables named `is` keep working — so it
+            // is recognised here, in operator position, rather than in the lexer.
+            if matches!(self.peek(), TokKind::Ident(n) if n == "is") {
+                self.bump();
+                let ty = self.parse_type()?;
+                lhs = Expr::Is { expr: Box::new(lhs), ty };
+                continue;
+            }
+            let Some((op, prec)) = self.peek_binop() else { break };
             if prec < min_prec {
                 break;
             }
@@ -1178,6 +1488,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) -> PResult<Expr> {
+        if self.eat_kw(Kw::Untyped) {
+            // `untyped <rest of statement>` — capture the operand as raw source
+            // and pass it straight through to C++ (no transpilation).
+            let code = self.capture_verbatim_operand()?;
+            return Ok(Expr::Verbatim(code));
+        }
         if self.eat_kw(Kw::Cast) {
             // cast(expr, Type) | cast expr
             if self.at_sym(Sym::LParen) {
@@ -1314,6 +1630,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok(Expr::Str { raw, interpolated })
             }
+            TokKind::Regex { pattern, flags } => {
+                self.bump();
+                Ok(Expr::Regex { pattern, flags })
+            }
             TokKind::Kw(Kw::True) => {
                 self.bump();
                 Ok(Expr::Bool(true))
@@ -1337,9 +1657,11 @@ impl<'a> Parser<'a> {
             TokKind::Kw(Kw::New) => self.parse_new(),
             TokKind::Kw(Kw::Function) => self.parse_anon_function(),
             TokKind::Kw(Kw::Switch) => {
-                // switch as an expression: parse as statement form, wrap.
-                // (Not used by the corpus; supported for completeness.)
-                Err(self.err("switch expressions are not yet supported"))
+                // `switch` in value position (`var x = switch (e) { … }`): same shape
+                // as the statement form, carried as an expression for codegen to
+                // desugar into a hoisted temp + statement switch.
+                let (subject, cases, default) = self.parse_switch_parts()?;
+                Ok(Expr::Switch { subject: Box::new(subject), cases, default })
             }
             TokKind::Ident(name) => {
                 // single-parameter lambda `x -> expr`
@@ -1600,6 +1922,15 @@ fn set_access(current: Access, new: Access) -> Access {
     }
 }
 
+/// Append a parsed name to an unsupported-feature label, e.g.
+/// `labelled("an `abstract` type", Some("Color"))` → "an `abstract` type (`Color`)".
+fn labelled(base: &str, name: Option<String>) -> String {
+    match name {
+        Some(n) => format!("{base} (`{n}`)"),
+        None => base.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1610,10 +1941,19 @@ mod tests {
 
     #[test]
     fn parses_package_and_imports() {
-        let f = file("package modules;\nimport mucus.api.Mucus;\nimport modules.Module;\nclass X {}");
+        let f = file("package modules;\nimport native.api.Native;\nimport modules.Module;\nclass X {}");
         assert_eq!(f.package, vec!["modules"]);
         assert_eq!(f.imports.len(), 2);
-        assert_eq!(f.imports[0].path, vec!["mucus", "api", "Mucus"]);
+        assert_eq!(f.imports[0].path, vec!["native", "api", "Native"]);
+    }
+
+    #[test]
+    fn parses_empty_package_as_root() {
+        // `package;` is valid Haxe and equivalent to omitting the declaration:
+        // the file lives in the root package.
+        let f = file("package;\nclass X {}");
+        assert!(f.package.is_empty(), "empty package should be the root");
+        assert_eq!(f.decls.len(), 1);
     }
 
     #[test]
@@ -1646,6 +1986,78 @@ mod tests {
             Stmt::Verbatim { code, .. } => assert_eq!(code, "#ifdef DREAMCAST"),
             other => panic!("expected verbatim statement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_conditional_compilation_into_verbatim_statements() {
+        // `#if FLAG`/`#else`/`#end` and a statement-level `@:include` lower to
+        // `Stmt::Verbatim` carrying the C++ preprocessor lines; `untyped` captures
+        // its operand verbatim to the end of the statement.
+        let f = file(
+            "package p;\nclass X {\n\
+               function f(d:Float):Float {\n\
+             #if DREAMCAST\n\
+                 @:include('<dc/fmath.h>');\n\
+                 return untyped fsqrtf(d * d);\n\
+             #else\n\
+                 return d;\n\
+             #end\n\
+               }\n\
+             }",
+        );
+        let cls = match &f.decls[0] {
+            Decl::Class(c) => c,
+            _ => panic!("expected class"),
+        };
+        let body = cls.methods[0].body.as_ref().expect("body");
+        let verbatims: Vec<&str> = body
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Verbatim { code, .. } => Some(code.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            verbatims,
+            vec!["#ifdef DREAMCAST", "#include <dc/fmath.h>", "#else", "#endif"]
+        );
+        // The DREAMCAST `return` carries the verbatim `untyped` operand.
+        match &body[2] {
+            Stmt::Return(Some(Expr::Verbatim(code)), _) => assert_eq!(code, "fsqrtf(d * d)"),
+            other => panic!("expected verbatim return, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strips_a_leading_utf8_bom_keeping_offsets_aligned() {
+        // A leading UTF-8 BOM (U+FEFF) some editors prepend is stripped before lexing.
+        // Because it is stripped in `parse` (not `lex`), the parser's source slice stays
+        // byte-aligned with the token offsets, so a verbatim `untyped` capture — which
+        // slices the raw source — comes out exact, not shifted by the 3 BOM bytes.
+        let f = file(
+            "\u{FEFF}package p;\nclass X {\n  function f(d:Float):Float { return untyped fsqrtf(d * d); }\n}",
+        );
+        assert_eq!(f.package, vec!["p"]);
+        let cls = match &f.decls[0] {
+            Decl::Class(c) => c,
+            _ => panic!("expected class"),
+        };
+        let body = cls.methods[0].body.as_ref().expect("body");
+        match &body[0] {
+            Stmt::Return(Some(Expr::Verbatim(code)), _) => assert_eq!(code, "fsqrtf(d * d)"),
+            other => panic!("expected verbatim return, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_non_bare_conditional_compilation_flags() {
+        // `#ifdef` only takes a single macro name, so boolean conditions error.
+        assert!(parse("package p;\nclass X {\n function f():Void {\n#if !DEBUG\n#end\n }\n}").is_err());
+        assert!(parse("package p;\nclass X {\n function f():Void {\n#if (A && B)\n#end\n }\n}").is_err());
+        // A bare `#elseif FLAG` is supported (→ `#elif defined(FLAG)`)...
+        assert!(parse("package p;\nclass X {\n function f():Void {\n#if A\n#elseif B\n#end\n }\n}").is_ok());
+        // ...but a non-bare `#elseif` condition is rejected, like `#if`.
+        assert!(parse("package p;\nclass X {\n function f():Void {\n#if A\n#elseif (B && C)\n#end\n }\n}").is_err());
     }
 
     #[test]
@@ -1694,7 +2106,7 @@ mod tests {
     fn parses_class_with_accessors_and_ctor() {
         let f = file(
             "package modules;\n\
-             @:expose class Vertex extends Module {\n\
+             class Vertex extends Module {\n\
                public var x(default, set):Float;\n\
                public function new(engine:IEngine, x:Float) { this.x = x; }\n\
                public function set_x(x:Float) { return this.x = x; }\n\
@@ -1702,7 +2114,6 @@ mod tests {
         );
         let Decl::Class(c) = &f.decls[0] else { panic!() };
         assert_eq!(c.name, "Vertex");
-        assert!(has_meta(&c.meta, "expose"));
         assert_eq!(c.extends.as_ref().unwrap().base_name(), Some("Module"));
         assert_eq!(c.fields[0].name, "x");
         assert_eq!(c.fields[0].set, PropAccess::Set);
@@ -1713,8 +2124,8 @@ mod tests {
     #[test]
     fn parses_enum_and_typedef_and_native_meta() {
         let f = file(
-            "package mucus.api;\n\
-             @:include(\"../../src/Mucus.h\")\n\
+            "package native.api;\n\
+             @:include(\"../../src/Native.h\")\n\
              @:native enum EffectType { Unknown; Fog; }\n\
              @:native typedef Vertex = { x:Float, ?color:UInt32 };\n\
              @:native typedef Cursor = TexturedQuad;",
@@ -1723,7 +2134,7 @@ mod tests {
         assert_eq!(e.name, "EffectType");
         assert_eq!(e.variants.len(), 2);
         assert!(has_meta(&e.meta, "native"));
-        assert_eq!(e.meta.iter().find(|m| m.name == "include").unwrap().first_arg(), Some("../../src/Mucus.h"));
+        assert_eq!(e.meta.iter().find(|m| m.name == "include").unwrap().first_arg(), Some("../../src/Native.h"));
 
         let Decl::Typedef(t) = &f.decls[1] else { panic!() };
         let TypedefTarget::Struct(fields) = &t.target else { panic!() };
@@ -1737,7 +2148,7 @@ mod tests {
     #[test]
     fn parses_interface_with_overloads() {
         let f = file(
-            "package mucus.api;\n\
+            "package native.api;\n\
              @:native interface ISceneManager {\n\
                @:overload(function(s:Int):Void {})\n\
                public function SetScene(s:Dynamic):Void;\n\

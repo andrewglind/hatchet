@@ -19,6 +19,9 @@ pub fn map_primitive(name: &str) -> Option<&'static str> {
         "Bool" => "bool",
         "Void" => "void",
         "String" => "std::string",
+        // `StringBuf` lowers to a `std::string` accumulator: `new StringBuf()` →
+        // `std::string()`, `add`/`addChar` → `+=`, `toString()` → the string itself.
+        "StringBuf" => "std::string",
         "UInt8" => "uint8_t",
         "UInt16" => "uint16_t",
         "UInt32" => "uint32_t",
@@ -27,11 +30,25 @@ pub fn map_primitive(name: &str) -> Option<&'static str> {
     })
 }
 
-/// The fixed-width unsigned aliases (`UInt8`/`UInt16`/`UInt32`). In the corpus
-/// these are declared as `typedef UInt8 = UInt;` purely to keep the Haxe valid;
+/// The fixed-width unsigned aliases (`UInt8`/`UInt16`/`UInt32`). These are
+/// commonly declared as `typedef UInt8 = UInt;` purely to keep the Haxe valid;
 /// Hatchet maps them directly to `<stdint.h>` types and never emits the typedef.
 pub fn is_uint_shim(name: &str) -> bool {
     matches!(name, "UInt8" | "UInt16" | "UInt32")
+}
+
+/// Whether an `enum abstract`'s underlying type is integral — i.e. lowers to a C++
+/// `enum` (`Int`/`UInt`/`UInt8/16/32`). A non-integral backing (`String`/`Float`)
+/// lowers instead to a namespace of typed `static const` constants.
+pub fn is_integral_underlying(ty: &crate::ast::Type) -> bool {
+    matches!(
+        ty,
+        crate::ast::Type::Named { path, .. }
+            if matches!(
+                path.last().map(|s| s.as_str()),
+                Some("Int") | Some("UInt") | Some("UInt8") | Some("UInt16") | Some("UInt32")
+            )
+    )
 }
 
 /// The container heads that map onto C++ standard containers.

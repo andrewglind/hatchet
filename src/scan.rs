@@ -112,8 +112,8 @@ mod tests {
     fn reads_package() {
         assert_eq!(package_parts("package modules;\nclass X {}"), vec!["modules"]);
         assert_eq!(
-            package_parts("// c\npackage mucus.api;\n"),
-            vec!["mucus", "api"]
+            package_parts("// c\npackage native.api;\n"),
+            vec!["native", "api"]
         );
         assert!(package_parts("class X {}").is_empty());
     }

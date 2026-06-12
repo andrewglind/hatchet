@@ -3,7 +3,7 @@
 //! When a constructor's `super(...)` call is **not** the first statement — because
 //! locals must be computed first, or because the super arguments themselves are
 //! non-trivial creation expressions — C++ cannot express it as a plain base
-//! initialiser list. The fix (per `SKILL.md`) is an intermediate base `XHolder`:
+//! initialiser list. The fix is an intermediate base `XHolder`:
 //! the class derives `class X : private XHolder, public Base`, the `XHolder`
 //! constructor runs the pre-`super` logic and stores whatever the `super` call
 //! needs, and `Base(...)` then reads those members.

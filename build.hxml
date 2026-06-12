@@ -1,0 +1,4 @@
+-cp examples
+-D dll_link
+-cpp build
+-main examples.Main

@@ -2,8 +2,8 @@
 //!
 //! The tree models the Haxe subset Hatchet supports, independent of any particular
 //! project. Metadata is attached to the construct it decorates; semantic meaning
-//! (e.g. `@:expose`, `@:native`, `@:include`) is interpreted later in the `sema`
-//! layer, not here.
+//! (e.g. `@:native`, `@:include`) is interpreted later in the `sema` layer, not
+//! here.
 
 // ---------------------------------------------------------------------------
 // Metadata
@@ -148,8 +148,29 @@ pub enum Expr {
     Cast { expr: Box<Expr>, ty: Option<Type> },
     /// `(expr : Type)`.
     TypeCheck { expr: Box<Expr>, ty: Type },
+    /// The Haxe 4.2 `expr is Type` runtime type-check operator. Hatchet does not
+    /// transpile it yet; this is carried only so the validation pass can flag it as
+    /// `Unsupported` with a precise location (a class-type check would need
+    /// `dynamic_cast` / RTTI, which is a separate, target-sensitive feature).
+    Is { expr: Box<Expr>, ty: Type },
+
+    /// A `switch` used in value position (`var x = switch (e) { … }`). Carries the
+    /// same shape as the statement form; codegen desugars it to a hoisted temporary
+    /// plus a statement `switch` whose arms assign their trailing value to the temp.
+    Switch { subject: Box<Expr>, cases: Vec<Case>, default: Option<Vec<Stmt>> },
     /// Parenthesised expression (grouping preserved for fidelity).
     Paren(Box<Expr>),
+
+    /// `untyped <rest of statement>` — the operand is captured as raw source and
+    /// emitted to C++ verbatim, bypassing all type checking and transpilation.
+    /// Used to drop down to C/C++ APIs the Haxe side cannot see (e.g. a
+    /// platform intrinsic inside a `#if`/`#end` block).
+    Verbatim(String),
+
+    /// A regular-expression literal `~/pattern/flags`. Hatchet does not transpile
+    /// regex; this is carried only so the validation pass can flag it as
+    /// `Unsupported` with a precise location.
+    Regex { pattern: String, flags: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -200,6 +221,10 @@ pub enum Stmt {
         ty: Option<Type>,
         init: Option<Expr>,
         is_final: bool,
+        /// `@delete var x = …`: the developer's explicit request to free `x` at the
+        /// end of this scope (the local-scope counterpart to `@owned` on a field).
+        /// Overrides the ownership analysis for this local.
+        delete: bool,
         /// Source line (1-based) of the `var`/`final`, for diagnostics.
         line: usize,
     },
@@ -212,7 +237,11 @@ pub enum Stmt {
         line: usize,
     },
     For {
+        /// The loop binding. For `for (v in coll)` this is the element/value; for
+        /// the key/value form `for (k => v in map)` this is the **key**.
         var: String,
+        /// The value binding of a `for (k => v in map)` loop; `None` otherwise.
+        value_var: Option<String>,
         iter: Iterable,
         body: Box<Stmt>,
         line: usize,
@@ -234,6 +263,11 @@ pub enum Stmt {
     Break,
     Continue,
     Throw(Expr, usize),
+    /// A `try { … } catch (e:T) { … }` block. Hatchet does not transpile exception
+    /// handling yet; the structure is parsed (so the validation pass can flag it as
+    /// `Unsupported` with a location, and so a future lowering has the AST it needs)
+    /// but no C++ is emitted for it.
+    Try { body: Box<Stmt>, catches: Vec<Catch>, line: usize },
     Block(Vec<Stmt>),
     /// Verbatim C++ injected at this point in the body, from `@:cppFileCode('...')`
     /// statement-level metadata. The code is emitted exactly as written (at column
@@ -245,6 +279,15 @@ pub enum Stmt {
 pub struct Case {
     /// One or more patterns share a body: `case A, B:`.
     pub patterns: Vec<Expr>,
+    pub body: Vec<Stmt>,
+}
+
+/// One `catch (name:Type) { … }` clause of a [`Stmt::Try`]. `ty` is `None` for the
+/// Haxe 4.2 type-less `catch (e)` form.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Catch {
+    pub name: String,
+    pub ty: Option<Type>,
     pub body: Vec<Stmt>,
 }
 
@@ -326,6 +369,11 @@ pub struct Interface {
 pub struct EnumVariant {
     pub name: String,
     pub params: Vec<Param>,
+    /// The explicit constant value of an `enum abstract` member (`var Red = 0;`).
+    /// Always `None` for a plain Haxe `enum` (whose variants are nominal); `None`
+    /// for an `enum abstract` member that omits its value (the C++ enum then
+    /// auto-increments, matching Haxe).
+    pub value: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -333,6 +381,10 @@ pub struct Enum {
     pub name: String,
     pub meta: Vec<Meta>,
     pub variants: Vec<EnumVariant>,
+    /// The underlying type of an `enum abstract X(T)` (`None` for a plain `enum`).
+    /// An integral backing lowers to a C++ `enum`; a `String`/`Float` backing
+    /// lowers to a `namespace X_ { static const T … }` of typed constants.
+    pub underlying: Option<Type>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -367,6 +419,11 @@ pub enum Decl {
     Global(GlobalVar),
     /// Top-level function (e.g. `extern inline function MCreateScene(...) {}`).
     Function(Function),
+    /// A recognised but not-yet-transpiled top-level declaration (an `abstract`
+    /// type or `enum abstract`). Its body is skipped at parse time; `feature` is a
+    /// human label and `line` its location, so the validation pass can flag it as
+    /// `Unsupported` rather than dying with a parse error.
+    Unsupported { feature: String, line: usize },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -377,11 +434,20 @@ pub struct Import {
     pub alias: Option<String>,
 }
 
+/// A `using` static-extension declaration. Hatchet has no lowering for static
+/// extensions (they rewrite `a.f(b)` into `Module.f(a, b)` at the call site by
+/// type), so the `line` is retained to report it as unsupported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Using {
+    pub path: Vec<String>,
+    pub line: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct File {
     pub package: Vec<String>,
     pub imports: Vec<Import>,
-    pub usings: Vec<Vec<String>>,
+    pub usings: Vec<Using>,
     pub decls: Vec<Decl>,
     /// File-level metadata that precedes no declaration — a class-less Haxe file
     /// (e.g. a `StdAfx.hx` carrying only `@:headerCode`). Empty for ordinary files.
