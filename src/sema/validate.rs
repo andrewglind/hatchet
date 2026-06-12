@@ -8,7 +8,7 @@
 //! into a hard [`Diagnostic`], so the run fails with an actionable message rather
 //! than quietly guessing.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::*;
 use crate::diag::Diagnostic;
@@ -25,24 +25,36 @@ struct TypeUse {
 
 /// Walk every type a module references (in signatures and bodies) and collect the
 /// non-built-in named uses — the raw material for both the unresolved-type check
-/// and the referenced-module (include) computation.
-fn collect_refs(prog: &Program, mi: usize) -> Vec<TypeUse> {
+/// and the referenced-module (include) computation — plus every **function type**
+/// in an unsupported position (first-class function values have no lowering).
+fn collect_refs(prog: &Program, mi: usize) -> Collector {
     let m = &prog.modules[mi];
     // Generic parameters declared on any type in this module are valid names even
     // though the symbol table has no entry for them.
     let mut type_params: BTreeSet<String> = BTreeSet::new();
     for d in &m.file.decls {
         match d {
-            Decl::Class(c) => type_params.extend(c.type_params.iter().cloned()),
-            Decl::Interface(i) => type_params.extend(i.type_params.iter().cloned()),
+            Decl::Class(c) => {
+                type_params.extend(c.type_params.iter().cloned());
+                for f in c.methods.iter().chain(c.ctor.iter()) {
+                    type_params.extend(f.type_params.iter().cloned());
+                }
+            }
+            Decl::Interface(i) => {
+                type_params.extend(i.type_params.iter().cloned());
+                for f in &i.methods {
+                    type_params.extend(f.type_params.iter().cloned());
+                }
+            }
+            Decl::Function(f) => type_params.extend(f.type_params.iter().cloned()),
             _ => {}
         }
     }
-    let mut c = Collector { type_params, refs: Vec::new() };
+    let mut c = Collector { type_params, refs: Vec::new(), func_uses: Vec::new() };
     for d in &m.file.decls {
         c.decl(d);
     }
-    c.refs
+    c
 }
 
 /// Every "unresolved type" error for the declarations in module `mi`.
@@ -51,7 +63,7 @@ pub fn unresolved_type_errors(prog: &Program, mi: usize) -> Vec<Diagnostic> {
     let file = m.path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
     let mut out = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for r in collect_refs(prog, mi) {
+    for r in collect_refs(prog, mi).refs {
         if prog.resolve_type(&r.path, mi).is_none() {
             // Types Hatchet recognises but does not support (the macro `Expr`, the
             // regex `EReg`) are reported as `Unsupported` (with the contribution
@@ -90,8 +102,20 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
     let m = &prog.modules[mi];
     let file = m.path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
     let mut out = Vec::new();
+    // Every enum (and `enum abstract`) declared anywhere in the program, with its
+    // member names — the constants a `switch` pattern may legitimately name. Any
+    // other bare identifier in a pattern is a Haxe capture variable, which has no
+    // lowering (it would be emitted as a bare C++ `case` label).
+    let mut enums: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for module in &prog.modules {
+        for d in &module.file.decls {
+            if let Decl::Enum(e) = d {
+                enums.insert(e.name.clone(), e.variants.iter().map(|v| v.name.clone()).collect());
+            }
+        }
+    }
     {
-        let mut w = UnsupportedWalker { file: file.clone(), line: 0, out: &mut out };
+        let mut w = UnsupportedWalker { file: file.clone(), line: 0, enums: &enums, out: &mut out };
         for d in &m.file.decls {
             w.decl(d);
         }
@@ -100,6 +124,18 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
     // a `macro` function, or any use of the macro AST type `Expr`, is unsupported.
     for d in &m.file.decls {
         flag_macro_functions(d, &file, &mut out);
+    }
+    // Type parameters have no C++98 template lowering. Without this check a
+    // generic class would be emitted with `T` spelled as a bare unknown type —
+    // failing far away in the C++ compiler — exactly the silent guess this pass
+    // exists to prevent.
+    for d in &m.file.decls {
+        flag_generics(d, &file, &mut out);
+    }
+    // Property accessor pairs Hatchet cannot lower (custom `get_x`/`set_x`
+    // accessor logic) — codegen only generates trivial `GetX`/`SetX` bodies.
+    for d in &m.file.decls {
+        flag_properties(d, &file, &mut out);
     }
     // `using` static extensions rewrite `a.f(b)` into `Module.f(a, b)` at the call
     // site, chosen by `a`'s type. Hatchet has no such call-site rewriting, so a
@@ -118,25 +154,37 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
             out.push(Diagnostic::unsupported(file.clone(), *line, feature.clone()));
         }
     }
-    // Enum variants that take constructor parameters (`Move(dx:Int, dy:Int)`) need a
-    // tagged-union lowering Hatchet does not implement — it emits plain C++ enums, so
-    // the payload would be lost. Flag each parameterized variant.
+    // Parameterized enum variants (`Move(dx:Int, dy:Int)`) lower to the tagged
+    // value class — no flagging needed. The one shape that cannot be expressed
+    // by value is a *recursive* payload (a variant carrying its own enum), which
+    // would be an incomplete-type member in C++ — flag it here rather than let
+    // the C++ compiler report it far from the cause.
     for d in &m.file.decls {
         if let Decl::Enum(e) = d {
             for v in &e.variants {
-                if !v.params.is_empty() {
-                    let line = v.params.iter().find_map(|p| p.ty.as_ref().map(type_line)).unwrap_or(0);
-                    out.push(Diagnostic::unsupported(
-                        file.clone(),
-                        line,
-                        format!("the parameterized enum variant `{}`", v.name),
-                    ));
+                for p in &v.params {
+                    let recursive = matches!(
+                        &p.ty,
+                        Some(Type::Named { path, .. }) if path.last().map(|s| s.as_str()) == Some(e.name.as_str())
+                    );
+                    if recursive {
+                        let line = p.ty.as_ref().map(type_line).unwrap_or(0);
+                        out.push(Diagnostic::unsupported(
+                            file.clone(),
+                            line,
+                            format!(
+                                "the recursive enum payload `{}` in variant `{}` (a by-value tagged class cannot contain itself; box it behind a class)",
+                                e.name, v.name
+                            ),
+                        ));
+                    }
                 }
             }
         }
     }
+    let collected = collect_refs(prog, mi);
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for r in collect_refs(prog, mi) {
+    for r in &collected.refs {
         if let Some(label) = unsupported_type_label(&r.path) {
             if seen.insert(format!("{}|{}", r.line, r.ctx)) {
                 out.push(Diagnostic::unsupported(
@@ -147,7 +195,56 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
             }
         }
     }
+    // Function types (`A -> B`) outside the top-level `final` lambda binding —
+    // they would lower to a bare `void*` and a call through it would fail far
+    // away in the C++ compiler.
+    let mut seen_fn: BTreeSet<String> = BTreeSet::new();
+    for (line, ctx) in &collected.func_uses {
+        if seen_fn.insert(format!("{line}|{ctx}")) {
+            out.push(Diagnostic::unsupported(
+                file.clone(),
+                *line,
+                format!(
+                    "a function type {ctx} (first-class function values have no C++98 lowering; only a top-level `final` lambda binding is lowered, to a free function)"
+                ),
+            ));
+        }
+    }
+    // Rest parameters (`...vals:Int`, Haxe 4.2) — varargs have no lowering.
+    for d in &m.file.decls {
+        flag_rest_params(d, &file, &mut out);
+    }
     out
+}
+
+/// Flag every rest parameter (`...vals`) declared in `d` as unsupported.
+fn flag_rest_params(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
+    fn flag(f: &Function, file: &str, out: &mut Vec<Diagnostic>) {
+        for p in &f.params {
+            if p.rest {
+                let who = f.name.clone().unwrap_or_else(|| "new".to_string());
+                out.push(Diagnostic::unsupported(
+                    file.to_string(),
+                    signature_line(f),
+                    format!("the rest parameter `...{}` of `{who}` (Haxe 4.2 varargs)", p.name),
+                ));
+            }
+        }
+    }
+    match d {
+        Decl::Class(c) => {
+            for m in c.methods.iter().chain(c.ctor.iter()) {
+                flag(m, file, out);
+            }
+        }
+        Decl::Interface(i) => {
+            for m in &i.methods {
+                flag(m, file, out);
+            }
+        }
+        Decl::Function(f) => flag(f, file, out),
+        _ => {}
+    }
 }
 
 /// If a type path names a Haxe construct Hatchet does not support, return a human
@@ -158,6 +255,7 @@ fn unsupported_type_label(path: &[String]) -> Option<&'static str> {
     match path.last().map(|s| s.as_str()) {
         Some("Expr") => Some("the Haxe macro type"),
         Some("EReg") => Some("the Haxe regular-expression type"),
+        Some("Rest") => Some("the rest-arguments type"),
         _ => None,
     }
 }
@@ -211,11 +309,184 @@ fn flag_macro_functions(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
     }
 }
 
+/// Flag every generic (type-parameterized) class, interface, method, or function
+/// declared in `d` as unsupported — Hatchet has no C++98 template lowering.
+fn flag_generics(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
+    fn flag_fn(f: &Function, label: &str, file: &str, fallback: usize, out: &mut Vec<Diagnostic>) {
+        if f.type_params.is_empty() {
+            return;
+        }
+        let who = f.name.clone().unwrap_or_else(|| "new".to_string());
+        let line = match signature_line(f) {
+            0 => fallback,
+            l => l,
+        };
+        out.push(Diagnostic::unsupported(
+            file.to_string(),
+            line,
+            format!(
+                "the generic {label} `{who}<{}>` (type parameters have no C++98 template lowering)",
+                f.type_params.join(", ")
+            ),
+        ));
+    }
+    match d {
+        Decl::Class(c) => {
+            if !c.type_params.is_empty() {
+                out.push(Diagnostic::unsupported(
+                    file.to_string(),
+                    c.line,
+                    format!(
+                        "the generic class `{}<{}>` (type parameters have no C++98 template lowering)",
+                        c.name,
+                        c.type_params.join(", ")
+                    ),
+                ));
+            }
+            for f in c.methods.iter().chain(c.ctor.iter()) {
+                flag_fn(f, "method", file, c.line, out);
+            }
+        }
+        Decl::Interface(i) => {
+            if !i.type_params.is_empty() {
+                out.push(Diagnostic::unsupported(
+                    file.to_string(),
+                    i.line,
+                    format!(
+                        "the generic interface `{}<{}>` (type parameters have no C++98 template lowering)",
+                        i.name,
+                        i.type_params.join(", ")
+                    ),
+                ));
+            }
+            for f in &i.methods {
+                flag_fn(f, "method", file, i.line, out);
+            }
+        }
+        Decl::Function(f) => flag_fn(f, "function", file, 0, out),
+        _ => {}
+    }
+}
+
+/// Flag property accessor declarations Hatchet cannot lower. Supported:
+///
+/// * any pair drawn from `default`/`null`/`never` — pure access control, lowered
+///   to direct field access with C++ visibility approximating the Haxe rule;
+/// * `set` write access — with a user-written `set_x`, every write (external,
+///   internal, compound) routes through it (real Haxe semantics); without one,
+///   Hatchet's dialect generates a trivial `SetX`;
+/// * `(get, …)` read access — the user's `get_x` method is emitted and every
+///   read routes through it.
+///
+/// Unsupported: `(get, default)` (a custom getter over an externally-writable
+/// raw field has no coherent C++ visibility) and any `dynamic` access kind.
+fn flag_properties(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
+    use PropAccess::*;
+    fn kind(p: PropAccess) -> &'static str {
+        match p {
+            Default => "default",
+            Null => "null",
+            Get => "get",
+            Set => "set",
+            Never => "never",
+            Dynamic => "dynamic",
+        }
+    }
+    fn pair_supported(f: &Field) -> bool {
+        matches!(
+            (f.get, f.set),
+            (Default | Null | Never, Default | Set | Null | Never) | (Get, Set | Null | Never)
+        )
+    }
+    fn field_line(f: &Field) -> usize {
+        f.ty.as_ref().map(type_line).unwrap_or(0)
+    }
+    fn has_accessor(f: &Field) -> bool {
+        f.get != Default || f.set != Default
+    }
+    fn flag_pair(f: &Field, fallback: usize, file: &str, out: &mut Vec<Diagnostic>) {
+        if pair_supported(f) {
+            return;
+        }
+        let line = match field_line(f) {
+            0 => fallback,
+            l => l,
+        };
+        out.push(Diagnostic::unsupported(
+            file.to_string(),
+            line,
+            format!(
+                "the `({}, {})` property accessor pair on `{}` (supported: `default`/`null`/`never` pairs, `set` write access, and `(get, …)` custom getters)",
+                kind(f.get),
+                kind(f.set),
+                f.name
+            ),
+        ));
+    }
+    match d {
+        Decl::Class(c) => {
+            for f in &c.fields {
+                flag_pair(f, c.line, file, out);
+                // A custom getter requires its `get_x` method — without it every
+                // routed read would call a method that does not exist.
+                if f.get == Get
+                    && !c.methods.iter().any(|m| m.name.as_deref() == Some(&format!("get_{}", f.name)))
+                {
+                    let line = match field_line(f) {
+                        0 => c.line,
+                        l => l,
+                    };
+                    out.push(Diagnostic::error(
+                        file.to_string(),
+                        line,
+                        format!(
+                            "property `{}` declares `get` access but no `get_{}()` method is defined",
+                            f.name, f.name
+                        ),
+                    ));
+                }
+                // A user-written accessor body codegen would silently suppress is
+                // flagged: a `get_x` on a field without `get` access, or a `set_x`
+                // on a field without `set` access — neither would ever be called
+                // or emitted.
+                if has_accessor(f) {
+                    for m in &c.methods {
+                        let mname = m.name.as_deref().unwrap_or("");
+                        let stray_get = f.get != Get && mname == format!("get_{}", f.name);
+                        let stray_set = f.set != Set && mname == format!("set_{}", f.name);
+                        if stray_get || stray_set {
+                            let line = match signature_line(m) {
+                                0 => c.line,
+                                l => l,
+                            };
+                            out.push(Diagnostic::unsupported(
+                                file.to_string(),
+                                line,
+                                format!(
+                                    "the user-defined property accessor `{mname}` (its field does not declare the matching `get`/`set` access, so it would never be called)"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Decl::Interface(i) => {
+            for f in &i.fields {
+                flag_pair(f, i.line, file, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Walks bodies flagging lambdas in unsupported positions. `line` tracks the
 /// enclosing statement so a flagged lambda gets a source location.
 struct UnsupportedWalker<'a> {
     file: String,
     line: usize,
+    /// Enum name → member names, program-wide (see `unsupported_construct_errors`).
+    enums: &'a BTreeMap<String, BTreeSet<String>>,
     out: &'a mut Vec<Diagnostic>,
 }
 
@@ -242,6 +513,106 @@ impl<'a> UnsupportedWalker<'a> {
             self.line,
             "the `is` runtime type-check operator (Haxe 4.2)",
         ));
+    }
+
+    /// Is `p` a `switch` pattern codegen can lower to a C++ `case` label (or an
+    /// equality test, for string/float subjects)? Constants only: literals, a
+    /// negated numeric literal, and enum members (bare or `EnumType.Member` —
+    /// checked against every enum declared in the program, since the walker does
+    /// not infer the subject's type).
+    fn pattern_supported(&self, p: &Expr) -> bool {
+        match p {
+            Expr::Int(_) | Expr::Float(_) | Expr::Str { .. } | Expr::Bool(_) => true,
+            Expr::Unary { op: UnOp::Neg, expr, prefix: true } => {
+                matches!(&**expr, Expr::Int(_) | Expr::Float(_))
+            }
+            Expr::Paren(inner) => self.pattern_supported(inner),
+            // A bare identifier is a constant pattern only when it names a known
+            // enum member; in Haxe anything else is a capture variable.
+            Expr::Ident(name) => self.enums.values().any(|vs| vs.contains(name)),
+            // `EnumType.Member` (possibly package-qualified: `pack.EnumType.Member`).
+            Expr::Field(recv, member) => {
+                let ty = match &**recv {
+                    Expr::Ident(t) => Some(t.as_str()),
+                    Expr::Field(_, t) => Some(t.as_str()),
+                    _ => None,
+                };
+                ty.and_then(|t| self.enums.get(t)).is_some_and(|vs| vs.contains(member))
+            }
+            _ => false,
+        }
+    }
+
+    /// Validate one case's pattern list. A destructuring pattern must be its
+    /// case's *only* pattern — `case Add(a, b), Halt:` would leave the bindings
+    /// undefined on the `Halt` path.
+    fn case_patterns(&mut self, patterns: &[Expr]) {
+        if patterns.len() > 1 && patterns.iter().any(|p| matches!(p, Expr::Call(..))) {
+            self.out.push(Diagnostic::unsupported(
+                self.file.clone(),
+                self.line,
+                "a destructuring enum pattern combined with other patterns in one `case` (its captures would be undefined on the other alternatives)".to_string(),
+            ));
+        }
+        for p in patterns {
+            self.pattern(p);
+        }
+    }
+
+    /// Validate one `switch` pattern, flagging the unsupported shapes with a
+    /// message tailored to what the developer most likely meant.
+    fn pattern(&mut self, p: &Expr) {
+        // Destructuring enum pattern `case Add(a, b):` — supported when the
+        // callee names a known enum variant and every payload position is a
+        // plain capture or `_` (literal/nested sub-patterns have no lowering).
+        if let Expr::Call(target, args) = p {
+            let head = match &**target {
+                Expr::Ident(n) => Some(n.clone()),
+                Expr::Field(_, n) => Some(n.clone()),
+                _ => None,
+            };
+            let known = head
+                .as_ref()
+                .is_some_and(|h| self.enums.values().any(|vs| vs.contains(h)));
+            if !known {
+                self.out.push(Diagnostic::unsupported(
+                    self.file.clone(),
+                    self.line,
+                    format!(
+                        "the `case {}(…):` pattern (its callee is not a known enum variant — extractors and call patterns are not lowered)",
+                        head.unwrap_or_else(|| "…".to_string())
+                    ),
+                ));
+                return;
+            }
+            for a in args {
+                if !matches!(a, Expr::Ident(_)) {
+                    self.out.push(Diagnostic::unsupported(
+                        self.file.clone(),
+                        self.line,
+                        format!(
+                            "a non-capture payload sub-pattern in `case {}(…):` (only plain captures and `_` are lowered in enum payload positions)",
+                            head.unwrap_or_default()
+                        ),
+                    ));
+                    return;
+                }
+            }
+            return;
+        }
+        if self.pattern_supported(p) {
+            return;
+        }
+        let what = match p {
+            Expr::Ident(name) => format!(
+                "the capture pattern `case {name}:` (binds the subject to a variable; only constant patterns — literals and enum members — are lowered)"
+            ),
+            Expr::ObjectLit(_) => "a structure pattern in `switch` (`case { … }:`)".to_string(),
+            Expr::ArrayLit(_) => "an array pattern in `switch` (`case [ … ]:`)".to_string(),
+            _ => "a non-constant `switch` pattern (only literals and enum members are lowered)"
+                .to_string(),
+        };
+        self.out.push(Diagnostic::unsupported(self.file.clone(), self.line, what));
     }
 
     fn decl(&mut self, d: &Decl) {
@@ -336,9 +707,7 @@ impl<'a> UnsupportedWalker<'a> {
                 self.line = *line;
                 self.expr(subject);
                 for c in cases {
-                    for p in &c.patterns {
-                        self.expr(p);
-                    }
+                    self.case_patterns(&c.patterns);
                     for s in &c.body {
                         self.stmt(s);
                     }
@@ -382,9 +751,7 @@ impl<'a> UnsupportedWalker<'a> {
             Expr::Switch { subject, cases, default } => {
                 self.expr(subject);
                 for c in cases {
-                    for p in &c.patterns {
-                        self.expr(p);
-                    }
+                    self.case_patterns(&c.patterns);
                     for s in &c.body {
                         self.stmt(s);
                     }
@@ -495,7 +862,7 @@ impl<'a> UnsupportedWalker<'a> {
 /// headers can be `#include`d). Excludes `mi` itself.
 pub fn referenced_modules(prog: &Program, mi: usize) -> BTreeSet<usize> {
     let mut out = BTreeSet::new();
-    for r in collect_refs(prog, mi) {
+    for r in collect_refs(prog, mi).refs {
         if let Some(ti) = prog.resolve_type(&r.path, mi) {
             if ti.module_index != mi {
                 out.insert(ti.module_index);
@@ -508,6 +875,9 @@ pub fn referenced_modules(prog: &Program, mi: usize) -> BTreeSet<usize> {
 struct Collector {
     type_params: BTreeSet<String>,
     refs: Vec<TypeUse>,
+    /// Function-type (`A -> B`) annotations found outside the one supported
+    /// position (a top-level `final` lambda binding), with line and context.
+    func_uses: Vec<(usize, String)>,
 }
 
 impl Collector {
@@ -540,12 +910,31 @@ impl Collector {
                     self.check(&f.ty, ctx);
                 }
             }
+            // A function type anywhere but a top-level `final` lambda binding (a
+            // field, parameter, return, local, or typedef alias) would lower to a
+            // bare `void*` — a silent guess. Record it for an `Unsupported` flag.
             Type::Func { params, ret } => {
+                self.func_uses.push((type_line(ty), ctx.to_string()));
                 for p in params {
                     self.check(p, ctx);
                 }
                 self.check(ret, ctx);
             }
+        }
+    }
+
+    /// Like [`check`], but for the annotation of a top-level `final` lambda
+    /// binding — the one position where a function type *is* lowered (to a free
+    /// function). The outer function type itself is allowed; its parameter and
+    /// return types are still validated.
+    fn check_fn_binding(&mut self, ty: &Type, ctx: &str) {
+        if let Type::Func { params, ret } = ty {
+            for p in params {
+                self.check(p, ctx);
+            }
+            self.check(ret, ctx);
+        } else {
+            self.check(ty, ctx);
         }
     }
 
@@ -601,9 +990,16 @@ impl Collector {
                 }
             }
             Decl::Global(g) => {
-                self.opt(&g.ty, &format!("in `{}`", g.name));
+                let ctx = format!("in `{}`", g.name);
+                // A `final = <lambda>` binding's function-type annotation is the
+                // supported free-function form — its outer function type is not
+                // flagged (the param/return types still are).
+                match (&g.ty, &g.init) {
+                    (Some(t), Some(Expr::Lambda { .. })) => self.check_fn_binding(t, &ctx),
+                    _ => self.opt(&g.ty, &ctx),
+                }
                 if let Some(init) = &g.init {
-                    self.expr(init, &format!("in `{}`", g.name));
+                    self.expr(init, &ctx);
                 }
             }
             Decl::Function(f) => self.func(f),

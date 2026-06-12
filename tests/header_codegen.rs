@@ -63,7 +63,7 @@ fn base_method_overridden_by_a_subclass_is_virtual() {
     let base = header(&prog, "Base");
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(base.contains("virtual float area();"), "overridden base method must be virtual:\n{base}");
+    assert!(base.contains("virtual double area();"), "overridden base method must be virtual:\n{base}");
     assert!(
         base.contains("std::string label();") && !base.contains("virtual std::string label();"),
         "a method no subclass overrides stays non-virtual:\n{base}"
@@ -114,7 +114,7 @@ fn abstract_function_is_a_pure_virtual_method() {
     let out = header(&prog, "Shape");
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("virtual float area() = 0;"), "abstract method → pure virtual:\n{out}");
+    assert!(out.contains("virtual double area() = 0;"), "abstract method → pure virtual:\n{out}");
     // A concrete method is not made pure virtual.
     assert!(
         out.contains("std::string describe();") && !out.contains("describe() = 0"),
@@ -169,10 +169,32 @@ fn plain_module_function_is_declared_after_the_types_it_uses() {
     let out = header(&prog, "Geom");
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("Vec2 makeVec(float x, float y);"), "public function declared in header:\n{out}");
+    assert!(out.contains("Vec2 makeVec(double x, double y);"), "public function declared in header:\n{out}");
     assert!(!out.contains("helper"), "private function is static in the .cpp, not in the header:\n{out}");
     // The `struct Vec2` definition must precede the function that returns it.
     let struct_at = out.find("struct Vec2").expect("Vec2 struct emitted");
     let fn_at = out.find("Vec2 makeVec").expect("makeVec declared");
     assert!(struct_at < fn_at, "the type must be defined before the function that uses it:\n{out}");
+}
+
+#[test]
+fn deeply_nested_generic_type_splits_the_unsigned_shift_token() {
+    // `Array<Array<Array<Int>>>` ends in `>>>`, which the lexer greedily merges
+    // into the unsigned-shift token — the type parser must split it back into
+    // closing angle brackets (C++98 also requires a space between the `>`s).
+    let dir = std::env::temp_dir().join(format!("hatchet_nested_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Grid.hx"),
+        "class Grid {\n  public var cells:Array<Array<Array<Int>>>;\n  public function new() {}\n}\n",
+    )
+    .unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let out = header(&prog, "Grid");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        out.contains("std::vector<std::vector<std::vector<int> > > cells;"),
+        "triple-nested array field must parse and map:\n{out}"
+    );
 }

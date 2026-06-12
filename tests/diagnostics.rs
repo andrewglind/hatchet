@@ -179,27 +179,17 @@ fn using_static_extension_is_unsupported() {
 }
 
 #[test]
-fn parameterized_enum_variant_is_unsupported() {
-    // A variant with constructor parameters needs a tagged union; Hatchet emits a
-    // plain C++ enum, so the payload would be lost. The parameterized variant
-    // `Move` is on line 3; the bare variant `Stop` must NOT be flagged.
+fn parameterized_enum_variant_is_supported() {
+    // `Move(dx:Int, dy:Int)` lowers to the tagged value class — not flagged.
     let (prog, idx) = program_from(
         "Cmd",
-        "package p;\nenum Cmd {\n  Move(dx:Int, dy:Int);\n  Stop;\n}\n",
+        "enum Cmd {\n  Stop;\n  Move(dx:Int, dy:Int);\n}\nclass CmdUse {\n  public function new() {}\n}\n",
     );
     let errs = unsupported_construct_errors(&prog, idx);
     assert!(
-        errs.iter().any(|d| d.severity == Severity::Unsupported
-            && d.message.contains("parameterized enum variant")
-            && d.message.contains("Move")
-            && d.line == 3),
-        "expected an Unsupported parameterized-variant diagnostic for Move on line 3, got: {:?}",
+        !errs.iter().any(|d| d.message.contains("Move")),
+        "parameterized variants must not be flagged, got: {:?}",
         errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
-    );
-    assert!(
-        !errs.iter().any(|d| d.message.contains("Stop")),
-        "the bare variant Stop must not be flagged, got: {:?}",
-        errs.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
 
@@ -336,4 +326,303 @@ fn primitives_containers_and_declared_types_are_not_flagged() {
     );
     let errs = unresolved_type_errors(&prog, idx);
     assert!(errs.is_empty(), "no errors expected, got: {:?}", errs.iter().map(|d| &d.message).collect::<Vec<_>>());
+}
+
+// ---------------------------------------------------------------------------
+// Generics — no C++98 template lowering, so every type-parameterized
+// declaration must fail loudly instead of emitting `T` as a bare unknown type.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn generic_class_is_unsupported() {
+    let (prog, idx) = program_from(
+        "Box",
+        "class Box<T> {\n  public function new() {}\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("generic class `Box<T>`")
+            && d.line == 1),
+        "expected an Unsupported generic-class diagnostic on line 1, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn generic_interface_is_unsupported() {
+    let (prog, idx) = program_from(
+        "Cmp",
+        "interface Cmp<A, B> {\n  function compare(a:A, b:B):Int;\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("generic interface `Cmp<A, B>`")
+            && d.line == 1),
+        "expected an Unsupported generic-interface diagnostic on line 1, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn generic_method_is_unsupported_and_t_is_not_double_reported() {
+    // The method is flagged once; its `T` uses must not also surface as
+    // unresolved types (that would be a misleading double report).
+    let (prog, idx) = program_from(
+        "Util",
+        "class Util {\n  public function new() {}\n  public function first<T>(items:Array<T>):T {\n    return items[0];\n  }\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("generic method `first<T>`")),
+        "expected an Unsupported generic-method diagnostic, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+    let unresolved = unresolved_type_errors(&prog, idx);
+    assert!(
+        unresolved.is_empty(),
+        "`T` must not double-report as unresolved, got: {:?}",
+        unresolved.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn generic_typedef_is_unsupported() {
+    let (prog, idx) = program_from(
+        "Pairs",
+        "typedef Pair<T> = { var a:T; var b:T; }\nclass Pairs {\n  public function new() {}\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("generic typedef `Pair<T>`")
+            && d.line == 1),
+        "expected an Unsupported generic-typedef diagnostic on line 1, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Property accessors — only `(default, set)`, `(default, null)` and
+// `(default, never)` have a lowering; custom accessor logic must fail loudly
+// rather than be silently replaced by trivial generated accessors.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn get_set_property_pair_is_supported() {
+    // Full `(get, set)`: both accessors are real methods; reads route through
+    // `get_celsius()`, writes through `set_celsius()` — nothing is flagged.
+    let (prog, idx) = program_from(
+        "Temp",
+        "class Temp {\n  public var celsius(get, set):Float;\n  function get_celsius():Float { return 0.0; }\n  function set_celsius(v:Float):Float { return v; }\n  public function new() {}\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.is_empty(),
+        "(get, set) with both accessors must not be flagged, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn user_defined_setter_body_is_supported() {
+    // `(default, set)` with a user-written `set_x`: real Haxe semantics — every
+    // write routes through it — so nothing is flagged. (Without a `set_x`,
+    // Hatchet's dialect generates a trivial `SetX` instead.)
+    let (prog, idx) = program_from(
+        "Gauge",
+        "class Gauge {\n  public var level(default, set):Int;\n  function set_level(v:Int):Int {\n    level = v > 0 ? v : 0;\n    return level;\n  }\n  public function new() {}\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.is_empty(),
+        "(default, set) with a custom set_x must not be flagged, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn supported_property_pairs_are_not_flagged() {
+    // `(default, set)`, `(default, null)` and `(default, never)` (without custom
+    // accessor bodies) all lower today — none may be flagged.
+    let (prog, idx) = program_from(
+        "Props",
+        "class Props {\n  public var a(default, set):Int;\n  public var b(default, null):Int;\n  public var c(default, never):Int;\n  public function new() {}\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        !errs.iter().any(|d| d.message.contains("property")),
+        "supported pairs must not be flagged, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Switch patterns — only constant patterns (literals, enum members) lower to
+// C++ case labels; captures and destructuring must fail loudly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn capture_pattern_is_unsupported() {
+    let (prog, idx) = program_from(
+        "Cap",
+        "class Cap {\n  public function new() {}\n  public function run(n:Int):Int {\n    switch (n) {\n      case 0: return 0;\n      case x: return x + 1;\n    }\n  }\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("capture pattern `case x:`")),
+        "expected an Unsupported capture-pattern diagnostic, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn destructuring_enum_pattern_is_supported() {
+    // Parameterized variants lower to the tagged value class; `case Add(a, b):`
+    // binds the payload — nothing is flagged.
+    let (prog, idx) = program_from(
+        "Ev",
+        "enum Op { Halt; Add(a:Int, b:Int); }\nclass Ev {\n  public function new() {}\n  public function eval(o:Op):Int {\n    switch (o) {\n      case Add(a, b): return a + b;\n      default: return 0;\n    }\n  }\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.is_empty(),
+        "destructuring a parameterized variant must not be flagged, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn literal_payload_subpattern_is_unsupported() {
+    // Only plain captures and `_` are lowered in payload positions.
+    let (prog, idx) = program_from(
+        "Lit",
+        "enum Op { Halt; Add(a:Int, b:Int); }\nclass Lit {\n  public function new() {}\n  public function eval(o:Op):Int {\n    switch (o) {\n      case Add(0, b): return b;\n      default: return 0;\n    }\n  }\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("non-capture payload sub-pattern")),
+        "expected a payload-sub-pattern diagnostic, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn recursive_enum_payload_is_unsupported() {
+    // A by-value tagged class cannot contain itself (incomplete type in C++).
+    let (prog, idx) = program_from(
+        "Trees2",
+        "enum Tree2 {\n  Leaf;\n  Node(value:Int, child:Tree2);\n}\nclass Trees2 {\n  public function new() {}\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("recursive enum payload `Tree2` in variant `Node`")),
+        "expected a recursive-payload diagnostic, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn constant_patterns_are_not_flagged() {
+    // Literals (incl. negative), bare enum members, and qualified enum members
+    // are all constant patterns with a lowering — none may be flagged.
+    let (prog, idx) = program_from(
+        "Konst",
+        "enum Color { Red; Green; Blue; }\nclass Konst {\n  public function new() {}\n  public function hue(c:Color, n:Int, s:String):Int {\n    switch (c) {\n      case Red: return 0;\n      case Color.Green: return 120;\n      default: return 240;\n    }\n    switch (n) {\n      case -1: return 0;\n      case 0 | 1: return 1;\n      case _: return 2;\n    }\n    switch (s) {\n      case \"on\": return 1;\n      default: return 0;\n    }\n  }\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        !errs.iter().any(|d| d.message.contains("pattern")),
+        "constant patterns must not be flagged, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn generic_enum_is_unsupported() {
+    let (prog, idx) = program_from(
+        "Trees",
+        "enum Tree<T> {\n  Leaf;\n  Node(v:T);\n}\nclass Trees {\n  public function new() {}\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("generic enum `Tree<T>`")
+            && d.line == 1),
+        "expected an Unsupported generic-enum diagnostic on line 1, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Property accessors, tiers 1 & 2: access-control pairs and computed
+// `(get, null)` / `(get, never)` getters are supported; custom setters and
+// `dynamic` access stay flagged; `get` without a `get_x` method is an error.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn access_control_property_pairs_are_not_flagged() {
+    let (prog, idx) = program_from(
+        "Acc",
+        "class Acc {\n  public var a(null, default):Int;\n  var b(null, null):Int;\n  public var c(never, default):Int;\n  var d(never, null):Int;\n  public var e(null, set):Int;\n  public function new() {}\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        !errs.iter().any(|d| d.message.contains("property")),
+        "access-control pairs must not be flagged, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn computed_getter_property_is_not_flagged() {
+    let (prog, idx) = program_from(
+        "Comp",
+        "class Comp {\n  public var area(get, never):Float;\n  public var perim(get, null):Float;\n  function get_area():Float { return 1.0; }\n  function get_perim():Float { return 2.0; }\n  public function new() {}\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.is_empty(),
+        "computed (get, never)/(get, null) must not be flagged, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn get_default_pair_is_unsupported() {
+    // `(get, default)` has no coherent lowering: a custom getter implies a
+    // private backing field, but `default` write access needs it directly
+    // writable from outside. It stays flagged.
+    let (prog, idx) = program_from(
+        "Gd",
+        "class Gd {\n  public var x(get, default):Int;\n  function get_x():Int { return 0; }\n  public function new() {}\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("`(get, default)` property accessor pair on `x`")),
+        "expected (get, default) to stay flagged, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn get_access_without_get_method_is_an_error() {
+    let (prog, idx) = program_from(
+        "NoGet",
+        "class NoGet {\n  public var area(get, never):Float;\n  public function new() {}\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Error
+            && d.message.contains("declares `get` access but no `get_area()` method")
+            && d.line == 2),
+        "expected a missing-get_area error on line 2, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
 }

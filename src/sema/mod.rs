@@ -738,7 +738,7 @@ mod tests {
             optional: false,
             line: 0,
         };
-        assert_eq!(p.map_type_use(&array_float, 0, &ns), "std::vector<float>");
+        assert_eq!(p.map_type_use(&array_float, 0, &ns), "std::vector<double>");
         assert_eq!(p.map_type_use(&named(&["UInt32"]), 0, &ns), "uint32_t");
         assert_eq!(p.map_type_use(&named(&["String"]), 0, &ns), "std::string");
         // Only the empty structure `{}` erases to `void*`; `Dynamic`/`Any` no longer

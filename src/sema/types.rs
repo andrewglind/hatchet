@@ -15,7 +15,14 @@
 pub fn map_primitive(name: &str) -> Option<&'static str> {
     Some(match name {
         "Int" => "int",
-        "Float" => "float",
+        // Haxe `Float` is a 64-bit double on every official target; C `float`
+        // would silently halve the precision.
+        "Float" => "double",
+        // Genuine single-precision: the standard `Single`, and hxcpp's
+        // `cpp.Float32`/`cpp.Float64` (matched by their last path segment).
+        "Single" => "float",
+        "Float32" => "float",
+        "Float64" => "double",
         "Bool" => "bool",
         "Void" => "void",
         "String" => "std::string",
@@ -67,7 +74,10 @@ mod tests {
     #[test]
     fn primitives() {
         assert_eq!(map_primitive("Int"), Some("int"));
-        assert_eq!(map_primitive("Float"), Some("float"));
+        assert_eq!(map_primitive("Float"), Some("double"));
+        assert_eq!(map_primitive("Float32"), Some("float"));
+        assert_eq!(map_primitive("Single"), Some("float"));
+        assert_eq!(map_primitive("Float64"), Some("double"));
         assert_eq!(map_primitive("String"), Some("std::string"));
         assert_eq!(map_primitive("UInt32"), Some("uint32_t"));
         // `Dynamic`/`Any` are no longer primitives — they are the overload marker.

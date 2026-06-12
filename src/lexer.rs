@@ -68,8 +68,8 @@ pub enum Sym {
     PlusEq, MinusEq, StarEq, SlashEq, PercentEq,
     PlusPlus, MinusMinus,
     AmpAmp, PipePipe, Bang,
-    Amp, Pipe, Caret, Tilde, Shl, Shr,
-    AmpEq, PipeEq, CaretEq, ShlEq, ShrEq,
+    Amp, Pipe, Caret, Tilde, Shl, Shr, UShr,
+    AmpEq, PipeEq, CaretEq, ShlEq, ShrEq, UShrEq,
     At,
     Dollar,     // $ — only appears in Haxe macro reification, which is unsupported
 }
@@ -381,7 +381,14 @@ impl<'a> Lexer<'a> {
         let c = self.bytes[self.i];
         let c1 = if self.i + 1 < n { self.bytes[self.i + 1] } else { 0 };
         let c2 = if self.i + 2 < n { self.bytes[self.i + 2] } else { 0 };
+        let c3 = if self.i + 3 < n { self.bytes[self.i + 3] } else { 0 };
         use Sym::*;
+
+        // four-character (`>>>=` must win over `>>>`)
+        if (c, c1, c2, c3) == (b'>', b'>', b'>', b'=') {
+            self.i += 4;
+            return Ok(TokKind::Sym(UShrEq));
+        }
 
         // three-character
         let three = match (c, c1, c2) {
@@ -389,6 +396,7 @@ impl<'a> Lexer<'a> {
             (b'?', b'?', b'=') => Some(QuestionQuestionEq),
             (b'<', b'<', b'=') => Some(ShlEq),
             (b'>', b'>', b'=') => Some(ShrEq),
+            (b'>', b'>', b'>') => Some(UShr),
             _ => None,
         };
         if let Some(s) = three {
