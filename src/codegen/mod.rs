@@ -84,21 +84,6 @@ impl<'a> HeaderGen<'a> {
         if emitted_const {
             ns_body.push('\n');
         }
-        let mut emitted_fn = false;
-        for decl in &m.file.decls {
-            if let Decl::Global(g) = decl {
-                if g.access != Access::Private && !has_meta(&g.meta, "native") {
-                    if let Some(sig) = self.free_fn_decl(g) {
-                        let _ = writeln!(ns_body, "{}{sig};", tabs(base));
-                        emitted_fn = true;
-                    }
-                }
-            }
-        }
-        if emitted_fn {
-            ns_body.push('\n');
-        }
-
         let mut first = true;
         for decl in &m.file.decls {
             let chunk = match decl {
@@ -114,6 +99,37 @@ impl<'a> HeaderGen<'a> {
                 }
                 first = false;
                 ns_body.push_str(&text);
+            }
+        }
+
+        // Free-function declarations come **after** the type definitions above, since
+        // their signatures may reference those types (`function makeVec():Vec2`).
+        // Public functions only — private ones are `static` in the `.cpp`.
+        let mut emitted_fn = false;
+        for decl in &m.file.decls {
+            if let Decl::Global(g) = decl {
+                if g.access != Access::Private && !has_meta(&g.meta, "native") {
+                    if let Some(sig) = self.free_fn_decl(g) {
+                        if !emitted_fn && !first {
+                            ns_body.push('\n');
+                        }
+                        let _ = writeln!(ns_body, "{}{sig};", tabs(base));
+                        emitted_fn = true;
+                    }
+                }
+            }
+            // Plain module-level `function`s are declared in the header so other
+            // translation units can call them.
+            if let Decl::Function(f) = decl {
+                if f.access != Access::Private {
+                    if let Some(sig) = self.plain_fn_decl(f) {
+                        if !emitted_fn && !first {
+                            ns_body.push('\n');
+                        }
+                        let _ = writeln!(ns_body, "{}{sig};", tabs(base));
+                        emitted_fn = true;
+                    }
+                }
             }
         }
 
@@ -179,16 +195,55 @@ impl<'a> HeaderGen<'a> {
     // ---- enums ---------------------------------------------------------
 
     fn emit_enum(&self, e: &Enum, ind: usize) -> String {
+        // A non-integral `enum abstract` (String/Float backing) is a namespace of
+        // typed `static const` constants, not a C++ enum.
+        if let Some(u) = &e.underlying {
+            if !crate::sema::types::is_integral_underlying(u) {
+                return self.emit_enum_abstract(e, u, ind);
+            }
+        }
         let t = tabs(ind);
         let mut s = String::new();
         let _ = writeln!(s, "{t}struct {}_ {{", e.name);
         let _ = writeln!(s, "{t}\tenum Enum {{");
-        let names: Vec<String> = e.variants.iter().map(|v| format!("{t}\t\t{}", v.name)).collect();
+        // An `enum abstract` member carries an explicit value (`Red = 0`); a plain
+        // Haxe enum variant has none and relies on C++'s auto-increment.
+        let names: Vec<String> = e
+            .variants
+            .iter()
+            .map(|v| match v.value.as_ref().and_then(enum_member_value) {
+                Some(val) => format!("{t}\t\t{} = {val}", v.name),
+                None => format!("{t}\t\t{}", v.name),
+            })
+            .collect();
         s.push_str(&names.join(",\n"));
         s.push('\n');
         let _ = writeln!(s, "{t}\t}};");
         let _ = writeln!(s, "{t}}};");
         let _ = writeln!(s, "{t}typedef {}_::Enum {};", e.name, e.name);
+        s
+    }
+
+    /// A `String`/`Float`-backed `enum abstract` → a namespace of typed
+    /// `static const` constants: `namespace X_ { static const T A = v; … }`. The
+    /// members are referenced as `X_::A` — the same spelling as the enum form — and
+    /// the type `X` itself maps to the underlying C++ type `T` (see `map_type_base`).
+    /// No `typedef` is emitted; `static const` at namespace scope keeps it
+    /// header-only (each translation unit gets its own copy).
+    fn emit_enum_abstract(&self, e: &Enum, underlying: &Type, ind: usize) -> String {
+        let t = tabs(ind);
+        let ucpp = self.prog.map_type_use(underlying, self.mi, &self.ns);
+        let mut s = String::new();
+        let _ = writeln!(s, "{t}namespace {}_ {{", e.name);
+        for v in &e.variants {
+            let val = v
+                .value
+                .as_ref()
+                .and_then(enum_abstract_value)
+                .unwrap_or_else(|| "0".to_string());
+            let _ = writeln!(s, "{t}\tstatic const {ucpp} {} = {val};", v.name);
+        }
+        let _ = writeln!(s, "{t}}}");
         s
     }
 
@@ -331,7 +386,14 @@ impl<'a> HeaderGen<'a> {
                 ""
             };
             let stat = if m.modifiers.is_static { "static " } else { "" };
-            let line = format!("{t}\t{virt}{stat}{sig};\n");
+            // An `abstract function` is a pure virtual method (`= 0`): always
+            // virtual, never defined (its `.cpp` body is correctly absent). Concrete
+            // methods keep the override-driven `virtual` decision above.
+            let line = if m.modifiers.is_abstract {
+                format!("{t}\tvirtual {sig} = 0;\n")
+            } else {
+                format!("{t}\t{virt}{stat}{sig};\n")
+            };
             match m.access {
                 Access::Protected => protected.push_str(&line),
                 Access::Private => private.push_str(&line),
@@ -423,6 +485,28 @@ impl<'a> HeaderGen<'a> {
     }
 
     /// Declaration (`ret name(params)`) for a public top-level free function.
+    /// Header declaration for a plain module-level `function name(...) {...}`:
+    /// `ret name(params)`. Skips `extern`/`@:native` (handled elsewhere) and the
+    /// bodyless / `macro` forms. Defaults are kept on the declaration.
+    fn plain_fn_decl(&self, f: &Function) -> Option<String> {
+        if f.modifiers.is_extern || f.modifiers.is_macro || has_meta(&f.meta, "native") {
+            return None;
+        }
+        f.body.as_ref()?;
+        let name = f.name.as_ref()?;
+        let ret = match &f.ret {
+            Some(t) => self.prog.map_type_use(t, self.mi, &self.ns),
+            None => "void".to_string(),
+        };
+        let params = f
+            .params
+            .iter()
+            .map(|p| param_decl(self.prog, self.mi, &self.ns, p))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!("{ret} {name}({params})"))
+    }
+
     fn free_fn_decl(&self, g: &GlobalVar) -> Option<String> {
         if !g.is_final {
             return None;
@@ -626,6 +710,63 @@ fn default_value(prog: &Program, mi: usize, ns: &[String], ty: &Type) -> Option<
         Some("Bool") => Some("false".to_string()),
         _ => enum_default(prog, mi, ns, ty),
     }
+}
+
+/// Render an `enum abstract` member's value expression as a C++ integral constant
+/// expression for use inside an `enum { … }` body. Handles the forms a typed
+/// constant uses — integer/char literals, a sibling member by name (`AB = A | B`),
+/// and unary/binary/parenthesised combinations of those. Returns `None` for an
+/// expression that is not a compile-time integral constant.
+fn enum_member_value(e: &Expr) -> Option<String> {
+    Some(match e {
+        Expr::Int(s) => s.clone(),
+        Expr::Bool(b) => (if *b { "1" } else { "0" }).to_string(),
+        // A bare identifier is a sibling enumerator, valid inside the same `enum`.
+        Expr::Ident(n) => n.clone(),
+        Expr::Paren(inner) => format!("({})", enum_member_value(inner)?),
+        Expr::Unary { op, expr, prefix: true } => {
+            let o = match op {
+                UnOp::Neg => "-",
+                UnOp::BitNot => "~",
+                _ => return None,
+            };
+            format!("{o}{}", enum_member_value(expr)?)
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let o = match op {
+                BinOp::Add => "+",
+                BinOp::Sub => "-",
+                BinOp::Mul => "*",
+                BinOp::Div => "/",
+                BinOp::Mod => "%",
+                BinOp::BitAnd => "&",
+                BinOp::BitOr => "|",
+                BinOp::BitXor => "^",
+                BinOp::Shl => "<<",
+                BinOp::Shr => ">>",
+                _ => return None,
+            };
+            format!("{} {o} {}", enum_member_value(lhs)?, enum_member_value(rhs)?)
+        }
+        _ => return None,
+    })
+}
+
+/// Render a `String`/`Float`-backed `enum abstract` member's value as a C++
+/// constant: a string literal (`"H"`), a float/int literal, a bool, a sibling
+/// member by name, or a unary negation of those. Returns `None` for anything else.
+fn enum_abstract_value(e: &Expr) -> Option<String> {
+    use crate::codegen::source::{escape_str, float_lit};
+    Some(match e {
+        Expr::Str { raw, .. } => format!("\"{}\"", escape_str(raw)),
+        Expr::Float(s) => float_lit(s),
+        Expr::Int(s) => s.clone(),
+        Expr::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
+        // A sibling member, valid as `X_::Other` from inside the same namespace.
+        Expr::Ident(n) => n.clone(),
+        Expr::Unary { op: UnOp::Neg, expr, prefix: true } => format!("-{}", enum_abstract_value(expr)?),
+        _ => return None,
+    })
 }
 
 /// For an enum-typed value, `Name_::FirstVariant` (namespaced if needed).

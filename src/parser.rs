@@ -481,15 +481,13 @@ impl<'a> Parser<'a> {
                 is_abstract_class,
             )?)),
             TokKind::Kw(Kw::Interface) => Ok(Decl::Interface(self.parse_interface(meta)?)),
-            // `enum abstract X(Int) { … }` — Haxe's typed-constant idiom. Not yet
-            // transpiled: skip the body and flag it as unsupported (rather than dying
-            // inside `parse_enum`, which expects a name where `abstract` sits).
+            // `enum abstract X(T) { … }` — Haxe's typed-constant idiom. An integral
+            // backing lowers to a plain C++ `enum` (with explicit member values); a
+            // `String`/`Float` backing lowers to a namespace of `static const`s.
             TokKind::Kw(Kw::Enum) if matches!(self.peek2(), TokKind::Kw(Kw::Abstract)) => {
                 self.bump(); // enum
                 self.bump(); // abstract
-                let name = self.opt_ident();
-                self.skip_braced_body()?;
-                Ok(Decl::Unsupported { feature: labelled("an `enum abstract` type", name), line })
+                Ok(Decl::Enum(self.parse_enum_abstract(meta)?))
             }
             TokKind::Kw(Kw::Enum) => Ok(Decl::Enum(self.parse_enum(meta)?)),
             // A bare `abstract X(Int) { … }` type (the `abstract class` form is
@@ -634,10 +632,71 @@ impl<'a> Parser<'a> {
                 params = self.parse_params()?;
             }
             self.eat_sym(Sym::Semi);
-            variants.push(EnumVariant { name: vname, params });
+            variants.push(EnumVariant { name: vname, params, value: None });
         }
         self.expect_sym(Sym::RBrace)?;
-        Ok(Enum { name, meta, variants })
+        Ok(Enum { name, meta, variants, underlying: None })
+    }
+
+    /// Parse `enum abstract X(T) { var A [= expr]; ... }`. The leading
+    /// `enum abstract` keywords are already consumed. The returned `Enum` carries
+    /// the underlying type `T` and each member's explicit value; codegen lowers an
+    /// integral backing to a C++ `enum` and a `String`/`Float` backing to a
+    /// namespace of typed `static const` constants.
+    fn parse_enum_abstract(&mut self, meta: Vec<Meta>) -> PResult<Enum> {
+        let name = self.expect_ident()?;
+        // The underlying type `(T)`.
+        self.expect_sym(Sym::LParen)?;
+        let underlying = self.parse_type()?;
+        self.expect_sym(Sym::RParen)?;
+        // Skip any `from`/`to` cast clauses up to the body.
+        while !self.at_sym(Sym::LBrace) && !self.at_eof() {
+            self.bump();
+        }
+        self.expect_sym(Sym::LBrace)?;
+        let mut variants = Vec::new();
+        while !self.at_sym(Sym::RBrace) && !self.at_eof() {
+            // Member-level metadata/modifiers (`public`, `inline`, `final`, …) carry
+            // no meaning for the C++ enum — skip them.
+            while matches!(self.peek(), TokKind::Meta(_)) {
+                self.bump();
+            }
+            while matches!(
+                self.peek(),
+                TokKind::Kw(Kw::Public) | TokKind::Kw(Kw::Private) | TokKind::Kw(Kw::Inline)
+                    | TokKind::Kw(Kw::Static) | TokKind::Kw(Kw::Final)
+            ) {
+                self.bump();
+            }
+            // A method inside an `enum abstract` (`function …`) is not transpiled —
+            // skip its signature and body and move on.
+            if self.at_kw(Kw::Function) {
+                while !self.at_sym(Sym::LBrace) && !self.at_eof() {
+                    self.bump();
+                }
+                self.skip_braced_body()?;
+                self.eat_sym(Sym::Semi);
+                continue;
+            }
+            if !self.eat_kw(Kw::Var) {
+                // Anything unexpected: stop trying to extract members cleanly.
+                break;
+            }
+            let vname = self.expect_ident()?;
+            // Optional `: Type` annotation on the member (ignored).
+            if self.eat_sym(Sym::Colon) {
+                let _ = self.parse_type()?;
+            }
+            let value = if self.eat_sym(Sym::Assign) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            self.eat_sym(Sym::Semi);
+            variants.push(EnumVariant { name: vname, params: Vec::new(), value });
+        }
+        self.expect_sym(Sym::RBrace)?;
+        Ok(Enum { name, meta, variants, underlying: Some(underlying) })
     }
 
     fn parse_typedef(&mut self, meta: Vec<Meta>) -> PResult<Typedef> {
@@ -1239,6 +1298,18 @@ impl<'a> Parser<'a> {
 
     fn parse_switch(&mut self) -> PResult<Stmt> {
         let line = self.line();
+        let (subject, cases, default) = self.parse_switch_parts()?;
+        Ok(Stmt::Switch {
+            subject,
+            cases,
+            default,
+            line,
+        })
+    }
+
+    /// Parse `switch (subject) { case …: …; default: … }`, shared by the statement
+    /// and expression forms. The leading `switch` keyword is current.
+    fn parse_switch_parts(&mut self) -> PResult<(Expr, Vec<Case>, Option<Vec<Stmt>>)> {
         self.expect_sym_kw(Kw::Switch)?;
         let paren = self.eat_sym(Sym::LParen);
         let subject = self.parse_expr()?;
@@ -1265,12 +1336,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_sym(Sym::RBrace)?;
-        Ok(Stmt::Switch {
-            subject,
-            cases,
-            default,
-            line,
-        })
+        Ok((subject, cases, default))
     }
 
     /// Case bodies run until the next `case`/`default`/`}`. A single brace-block
@@ -1591,9 +1657,11 @@ impl<'a> Parser<'a> {
             TokKind::Kw(Kw::New) => self.parse_new(),
             TokKind::Kw(Kw::Function) => self.parse_anon_function(),
             TokKind::Kw(Kw::Switch) => {
-                // switch as an expression: parse as statement form, wrap.
-                // (Rare; noted here for completeness.)
-                Err(self.err("switch expressions are not yet supported"))
+                // `switch` in value position (`var x = switch (e) { … }`): same shape
+                // as the statement form, carried as an expression for codegen to
+                // desugar into a hoisted temp + statement switch.
+                let (subject, cases, default) = self.parse_switch_parts()?;
+                Ok(Expr::Switch { subject: Box::new(subject), cases, default })
             }
             TokKind::Ident(name) => {
                 // single-parameter lambda `x -> expr`

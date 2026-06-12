@@ -12,3 +12,13 @@ enum ShapeKind {
 	CircleKind;
 	RectKind;
 }
+
+// An `Int`-backed `enum abstract` lowers to the *same* C++ enum idiom, but its
+// members carry explicit values. `Tiny`/`Small` auto-increment from 0; `Big` is
+// given an explicit value (so this also shows the `Name = <value>` form). It is a
+// typed set of Int constants — `World` uses it to bucket shapes by area.
+enum abstract Bucket(Int) {
+	var Tiny:Bucket; 	// 0
+	var Small:Bucket; 	// 1
+	var Big:Bucket = 9;	// explicit value
+}

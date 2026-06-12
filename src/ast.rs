@@ -153,6 +153,11 @@ pub enum Expr {
     /// `Unsupported` with a precise location (a class-type check would need
     /// `dynamic_cast` / RTTI, which is a separate, target-sensitive feature).
     Is { expr: Box<Expr>, ty: Type },
+
+    /// A `switch` used in value position (`var x = switch (e) { … }`). Carries the
+    /// same shape as the statement form; codegen desugars it to a hoisted temporary
+    /// plus a statement `switch` whose arms assign their trailing value to the temp.
+    Switch { subject: Box<Expr>, cases: Vec<Case>, default: Option<Vec<Stmt>> },
     /// Parenthesised expression (grouping preserved for fidelity).
     Paren(Box<Expr>),
 
@@ -364,6 +369,11 @@ pub struct Interface {
 pub struct EnumVariant {
     pub name: String,
     pub params: Vec<Param>,
+    /// The explicit constant value of an `enum abstract` member (`var Red = 0;`).
+    /// Always `None` for a plain Haxe `enum` (whose variants are nominal); `None`
+    /// for an `enum abstract` member that omits its value (the C++ enum then
+    /// auto-increments, matching Haxe).
+    pub value: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -371,6 +381,10 @@ pub struct Enum {
     pub name: String,
     pub meta: Vec<Meta>,
     pub variants: Vec<EnumVariant>,
+    /// The underlying type of an `enum abstract X(T)` (`None` for a plain `enum`).
+    /// An integral backing lowers to a C++ `enum`; a `String`/`Float` backing
+    /// lowers to a `namespace X_ { static const T … }` of typed constants.
+    pub underlying: Option<Type>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

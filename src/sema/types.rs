@@ -37,6 +37,20 @@ pub fn is_uint_shim(name: &str) -> bool {
     matches!(name, "UInt8" | "UInt16" | "UInt32")
 }
 
+/// Whether an `enum abstract`'s underlying type is integral — i.e. lowers to a C++
+/// `enum` (`Int`/`UInt`/`UInt8/16/32`). A non-integral backing (`String`/`Float`)
+/// lowers instead to a namespace of typed `static const` constants.
+pub fn is_integral_underlying(ty: &crate::ast::Type) -> bool {
+    matches!(
+        ty,
+        crate::ast::Type::Named { path, .. }
+            if matches!(
+                path.last().map(|s| s.as_str()),
+                Some("Int") | Some("UInt") | Some("UInt8") | Some("UInt16") | Some("UInt32")
+            )
+    )
+}
+
 /// The container heads that map onto C++ standard containers.
 pub fn container_template(name: &str) -> Option<&'static str> {
     Some(match name {

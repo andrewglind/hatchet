@@ -247,20 +247,17 @@ fn ereg_type_is_unsupported_not_unresolved() {
 }
 
 #[test]
-fn try_catch_is_unsupported() {
-    // Exception handling is parsed (so the rest of the file still parses) but not
-    // transpiled; it must raise an `Unsupported` diagnostic on the `try` line (4),
-    // not a parse error.
+fn try_catch_with_an_unresolved_catch_type_is_an_error() {
+    // try/catch is transpiled (see `source_codegen` / the compile gate), but the
+    // caught type is real C++ — an unresolved one must still be flagged.
     let (prog, idx) = program_from(
         "Guard",
-        "class Guard {\n  public function new() {}\n  public function run():Void {\n    try { throw \"x\"; } catch (e:String) {}\n  }\n}\n",
+        "class Guard {\n  public function new() {}\n  public function run():Void {\n    try {} catch (e:Nope) {}\n  }\n}\n",
     );
-    let errs = unsupported_construct_errors(&prog, idx);
+    let errs = unresolved_type_errors(&prog, idx);
     assert!(
-        errs.iter().any(|d| d.severity == Severity::Unsupported
-            && d.message.contains("exception handling")
-            && d.line == 4),
-        "expected an Unsupported try/catch diagnostic on line 4, got: {:?}",
+        errs.iter().any(|d| d.message.contains("Nope") && d.line == 4),
+        "expected an unresolved-type error for the catch type `Nope` on line 4, got: {:?}",
         errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
     );
 }
@@ -284,20 +281,21 @@ fn is_operator_is_unsupported() {
 }
 
 #[test]
-fn enum_abstract_is_unsupported() {
-    // `enum abstract` is parsed-and-skipped (so the file still parses) and flagged
-    // as unsupported on its declaration line (2), with the type name in the message.
+fn is_is_a_contextual_keyword_not_reserved() {
+    // Haxe 4 treats `is` as a *contextual* keyword: only `expr is Type` is the
+    // operator (flagged above). `is` otherwise remains an ordinary identifier — a
+    // local variable or a field/method name — and must NOT be flagged. This pins the
+    // contextual behavior so it can't regress into a reserved keyword by accident.
     let (prog, idx) = program_from(
-        "Color",
-        "package p;\nenum abstract Color(Int) {\n  var Red = 0;\n  var Green = 1;\n}\n",
+        "Ctx",
+        "class Ctx {\n  public function new() {}\n  \
+         public function f():Int { var is = 5; return is; }\n  \
+         public function g(o:Dynamic):Dynamic { return o.is; }\n}\n",
     );
     let errs = unsupported_construct_errors(&prog, idx);
     assert!(
-        errs.iter().any(|d| d.severity == Severity::Unsupported
-            && d.message.contains("enum abstract")
-            && d.message.contains("Color")
-            && d.line == 2),
-        "expected an Unsupported `enum abstract` diagnostic on line 2, got: {:?}",
+        !errs.iter().any(|d| d.message.contains("type-check operator")),
+        "`is` as an identifier/field must not be flagged as the operator, got: {:?}",
         errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
     );
 }

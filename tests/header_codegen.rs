@@ -69,3 +69,110 @@ fn base_method_overridden_by_a_subclass_is_virtual() {
         "a method no subclass overrides stays non-virtual:\n{base}"
     );
 }
+
+#[test]
+fn int_enum_abstract_lowers_to_a_cpp_enum_with_values() {
+    // `enum abstract X(Int)` becomes the pre-C++11 `struct X_ { enum Enum { … } }`
+    // idiom: members with an explicit value emit `Name = <expr>` (including
+    // sibling-referencing bit-flag expressions), and a value-less member relies on
+    // C++ auto-increment, exactly as a plain enum would.
+    let dir = std::env::temp_dir().join(format!("hatchet_ea_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Flag.hx"),
+        "package p;\nenum abstract Flag(Int) {\n  var None;\n  var A = 1;\n  var B = 2;\n  var AB = A | B;\n  var Shift = 1 << 4;\n}\n",
+    )
+    .unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let out = header(&prog, "Flag");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(out.contains("struct Flag_ {") && out.contains("enum Enum {"), "enum struct idiom:\n{out}");
+    assert!(out.contains("typedef Flag_::Enum Flag;"), "enum typedef:\n{out}");
+    assert!(out.contains("A = 1") && out.contains("B = 2"), "explicit values emitted:\n{out}");
+    assert!(out.contains("AB = A | B"), "sibling bit-flag expression emitted:\n{out}");
+    assert!(out.contains("Shift = 1 << 4"), "shift expression emitted:\n{out}");
+    // A value-less member is emitted bare (auto-increment), with no `= ` suffix.
+    assert!(out.contains("None,") || out.contains("None\n"), "value-less member emitted bare:\n{out}");
+}
+
+#[test]
+fn abstract_function_is_a_pure_virtual_method() {
+    // `abstract function f():T;` (in an `abstract class`) has no body, so it must be
+    // emitted as a pure virtual `virtual T f() = 0;` — declared, never defined —
+    // rather than a plain `virtual T f();` (which would be an undefined symbol).
+    let dir = std::env::temp_dir().join(format!("hatchet_absfn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Shape.hx"),
+        "package p;\nabstract class Shape {\n  public function new() {}\n  \
+         public abstract function area():Float;\n  \
+         public function describe():String { return \"shape\"; }\n}\n",
+    )
+    .unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let out = header(&prog, "Shape");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(out.contains("virtual float area() = 0;"), "abstract method → pure virtual:\n{out}");
+    // A concrete method is not made pure virtual.
+    assert!(
+        out.contains("std::string describe();") && !out.contains("describe() = 0"),
+        "concrete method stays defined:\n{out}"
+    );
+}
+
+#[test]
+fn string_enum_abstract_lowers_to_namespaced_static_consts() {
+    // A `String`-backed `enum abstract` has no integral enum representation, so it
+    // becomes a namespace of typed `static const` constants (header-only); the type
+    // itself maps to `std::string`, and members are referenced as `Suit_::Member`.
+    let dir = std::env::temp_dir().join(format!("hatchet_eas_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Suit.hx"),
+        "package p;\nenum abstract Suit(String) {\n  var Hearts = \"H\";\n  var Spades = \"S\";\n}\n\
+         class Use {\n  public function new() {}\n  public function f():Suit { return Hearts; }\n}\n",
+    )
+    .unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let out = header(&prog, "Suit");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(out.contains("namespace Suit_ {"), "members live in a `Suit_` namespace:\n{out}");
+    assert!(
+        out.contains("static const std::string Hearts = \"H\";"),
+        "string member → static const std::string:\n{out}"
+    );
+    assert!(!out.contains("enum Enum"), "no C++ enum for a non-integral backing:\n{out}");
+    assert!(!out.contains("typedef"), "no typedef — the type maps straight to std::string:\n{out}");
+    // The method returns `Suit`, which maps to the underlying `std::string`.
+    assert!(out.contains("std::string f();"), "Suit maps to std::string in signatures:\n{out}");
+}
+
+#[test]
+fn plain_module_function_is_declared_after_the_types_it_uses() {
+    // A plain module-level `function f(...)` becomes a namespace free function: a
+    // PUBLIC one is declared in the header, AFTER the type definitions its signature
+    // references (so `function makeVec():Vec2` sees `struct Vec2`); a `private` one
+    // is `static` in the `.cpp` and must NOT appear in the header.
+    let dir = std::env::temp_dir().join(format!("hatchet_modfn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Geom.hx"),
+        "package p;\ntypedef Vec2 = { x:Float, y:Float };\n\
+         function makeVec(x:Float, y:Float):Vec2 { return { x: x, y: y }; }\n\
+         private function helper(v:Float):Float { return v * v; }\n",
+    )
+    .unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let out = header(&prog, "Geom");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(out.contains("Vec2 makeVec(float x, float y);"), "public function declared in header:\n{out}");
+    assert!(!out.contains("helper"), "private function is static in the .cpp, not in the header:\n{out}");
+    // The `struct Vec2` definition must precede the function that returns it.
+    let struct_at = out.find("struct Vec2").expect("Vec2 struct emitted");
+    let fn_at = out.find("Vec2 makeVec").expect("makeVec declared");
+    assert!(struct_at < fn_at, "the type must be defined before the function that uses it:\n{out}");
+}

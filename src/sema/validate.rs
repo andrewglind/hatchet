@@ -224,7 +224,7 @@ impl<'a> UnsupportedWalker<'a> {
         self.out.push(Diagnostic::unsupported(
             self.file.clone(),
             self.line,
-            "a lambda (arrow function) used outside a top-level `final` binding or an `Array.map(...)` call",
+            "a lambda (arrow function) used outside a top-level `final` binding or an `Array.map`/`filter`/`sort(...)` call",
         ));
     }
 
@@ -233,14 +233,6 @@ impl<'a> UnsupportedWalker<'a> {
             self.file.clone(),
             self.line,
             "a regular-expression literal (`~/.../`)",
-        ));
-    }
-
-    fn flag_try(&mut self) {
-        self.out.push(Diagnostic::unsupported(
-            self.file.clone(),
-            self.line,
-            "a `try`/`catch` block (exception handling)",
         ));
     }
 
@@ -365,9 +357,7 @@ impl<'a> UnsupportedWalker<'a> {
                 self.line = *line;
                 self.expr(e);
             }
-            Stmt::Try { body, catches, line } => {
-                self.line = *line;
-                self.flag_try();
+            Stmt::Try { body, catches, .. } => {
                 self.stmt(body);
                 for c in catches {
                     for s in &c.body {
@@ -389,11 +379,30 @@ impl<'a> UnsupportedWalker<'a> {
             // A lambda reaching any ordinary expression position is unsupported.
             Expr::Lambda { .. } => self.flag_lambda(),
             Expr::Regex { .. } => self.flag_regex(),
+            Expr::Switch { subject, cases, default } => {
+                self.expr(subject);
+                for c in cases {
+                    for p in &c.patterns {
+                        self.expr(p);
+                    }
+                    for s in &c.body {
+                        self.stmt(s);
+                    }
+                }
+                if let Some(d) = default {
+                    for s in d {
+                        self.stmt(s);
+                    }
+                }
+            }
             Expr::Call(target, args) => {
-                // `recv.map(lambda)` — the first-argument lambda is supported; walk
-                // the receiver and the lambda's body, but do not flag the lambda.
+                // `recv.map/filter/sort(lambda)` — the first-argument lambda is
+                // supported; walk the receiver and the lambda's body, but do not
+                // flag the lambda itself.
                 if let Expr::Field(recv, method) = &**target {
-                    if method == "map" && matches!(args.first(), Some(Expr::Lambda { .. })) {
+                    if matches!(method.as_str(), "map" | "filter" | "sort")
+                        && matches!(args.first(), Some(Expr::Lambda { .. }))
+                    {
                         self.expr(recv);
                         if let Some(Expr::Lambda { body, .. }) = args.first() {
                             self.lambda_body(body);
@@ -662,12 +671,12 @@ impl Collector {
             }
             Stmt::Return(Some(e), _) => self.expr(e, ctx),
             Stmt::Throw(e, _) => self.expr(e, ctx),
-            // Unsupported (flagged elsewhere). Walk the bodies for nested type refs,
-            // but not the catch parameter types — those are the exception types we do
-            // not support, and reporting them as "unresolved" would be misleading.
+            // try/catch is transpiled: walk the body, and validate each (typed)
+            // catch's exception type — an unresolved one would not compile.
             Stmt::Try { body, catches, .. } => {
                 self.stmt(body, ctx);
                 for c in catches {
+                    self.opt(&c.ty, ctx);
                     for s in &c.body {
                         self.stmt(s, ctx);
                     }
@@ -696,6 +705,22 @@ impl Collector {
     /// sub-expression so `new`/`cast`/type-checks anywhere are validated.
     fn expr(&mut self, e: &Expr, ctx: &str) {
         match e {
+            Expr::Switch { subject, cases, default } => {
+                self.expr(subject, ctx);
+                for c in cases {
+                    for p in &c.patterns {
+                        self.expr(p, ctx);
+                    }
+                    for s in &c.body {
+                        self.stmt(s, ctx);
+                    }
+                }
+                if let Some(d) = default {
+                    for s in d {
+                        self.stmt(s, ctx);
+                    }
+                }
+            }
             Expr::New(ty, args) => {
                 self.check(ty, ctx);
                 for a in args {

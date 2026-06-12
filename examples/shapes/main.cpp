@@ -2,7 +2,8 @@
 //
 // Hatchet never transpiles `Main.hx` (it is the hxcpp entry point), so a real
 // build supplies its own `main()`. This one constructs an `examples::shapes::World`,
-// prints its report, and walks the tally — exercising the generated C++ end to end.
+// prints its report, walks the tally, and prints the feature probe — exercising
+// the generated C++ end to end.
 //
 // It is deliberately written in plain, VC6-friendly C++98: C standard headers,
 // `printf`, and a loop variable declared outside the `for` (VC6 leaks the
@@ -23,6 +24,7 @@ int main() {
 	printf("%s\n", world.report().c_str());
 	printf("shape count: %d\n", world.count());
 	printf("area rms: %d\n", world.areaRms());
+	printf("features: %s\n", world.features().c_str());
 
 	std::map<std::string, int> counts = world.tally();
 	std::map<std::string, int>::iterator it;

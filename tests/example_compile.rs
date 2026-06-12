@@ -95,10 +95,21 @@ fn shapes_example_transpiles_compiles_and_runs() {
     let _ = std::fs::remove_dir_all(&out);
 
     assert!(stdout.contains("shape count: 3"), "unexpected output:\n{stdout}");
-    // Virtual dispatch reached the overrides: a non-zero total and the correct
-    // per-kind tally (2 circles + 1 rectangle), not the base `Shape` defaults.
+    // Virtual dispatch reached the overrides of the `abstract class Shape`'s pure
+    // virtual methods: a non-zero total and the correct per-kind tally (2 circles +
+    // 1 rectangle), not a base default.
     assert!(!stdout.contains("total area 0"), "virtual dispatch failed (base area used):\n{stdout}");
     assert!(stdout.contains("circle x2"), "enum switch / tally wrong:\n{stdout}");
     assert!(stdout.contains("rectangle x1"), "enum switch / tally wrong:\n{stdout}");
     assert!(stdout.contains("area rms: 10"), "Math.sqrt / Std.int wrong:\n{stdout}");
+    // The feature probe exercises the newer lowerings, segment by segment:
+    //   big       — `enum abstract` value + `switch` *expression* on an enum subject
+    //   C         — `switch` *expression* on a String subject (→ if/else chain)
+    //   shapes=3  — `StringBuf` + `StringTools.replace` + `substring`/`substr`
+    //   20,3,4    — `Array` concat/slice/shift/unshift/join
+    //   4         — `Array.lastIndexOf`
+    assert!(
+        stdout.contains("features: big|C|shapes=3|20,3,4|4"),
+        "newer-feature lowerings wrong:\n{stdout}"
+    );
 }

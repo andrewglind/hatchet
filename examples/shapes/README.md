@@ -10,7 +10,7 @@ checked for VC6 compatibility offline.
 | Feature | Where |
 |---------|-------|
 | Package → C++ `namespace` | every file is `package examples.shapes;` → `namespace examples { namespace shapes` |
-| Class inheritance + **virtual dispatch** | `Shape` ← `Circle`, `Rectangle` |
+| **`abstract class`** + **`abstract function`** (pure virtual) + **virtual dispatch** | `Shape` (abstract) ← `Circle`, `Rectangle` |
 | Auto virtual destructor on an owned base | `Shape` (deleted through `Shape*`) |
 | **Base-from-member "Holder" idiom** (work before `super`) | `Circle` → `CircleHolder` |
 | Normal `super(...)` initializer list | `Rectangle` |
@@ -19,10 +19,15 @@ checked for VC6 compatibility offline.
 | `typedef` anon struct → C++ `struct` (by value) | `Vec2` |
 | Object literal → struct temporary | `{ x: 0.0, y: 0.0 }` in `World` |
 | `enum` → pre-C++11 `struct E_ { enum … }` + `switch` | `ShapeKind`, `World.kindName` |
+| **`enum abstract`** (`Int`) → enum with explicit member values | `Bucket` |
+| **`switch` expression** (value position → hoisted temp) | `World.bucketName`, `World.code` |
+| **`switch` on a `String`** → `if`/`else if` chain | `World.code` |
 | **Owned container** freed element-by-element | `World.shapes : Array<Shape>` |
 | `Array` → `std::vector` + array comprehension | `World.areas` |
+| **`Array` methods** (`concat`/`slice`/`shift`/`unshift`/`lastIndexOf`/`join`) | `World.features` |
 | `Map` → `std::map` (`exists`/`get`/`set`) | `World.tally` |
 | `Math` / `Std` intrinsics (`sqrt`, `Std.int`) | `World.areaRms` |
+| **`StringBuf`** accumulator + **`StringTools`** (`replace`) + **`substr`/`substring`** | `World.features` |
 | String interpolation + `+` concatenation (overflow-safe) | `Shape.describe`, `World.report` |
 | Conditional compilation (`#if` → `#ifdef`) | `World.new` (`VERBOSE`) |
 | Auto-generated `StdAfx.h` prelude (no boilerplate) | produced on transpile |
@@ -52,6 +57,7 @@ Expected output:
 World "shapes": 3 shapes, total area 31.634937
 shape count: 3
 area rms: 10
+features: big|C|shapes=3|20,3,4|4
   circle x2
   rectangle x1
 ```

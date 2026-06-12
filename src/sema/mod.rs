@@ -17,7 +17,7 @@ use crate::ast::*;
 use crate::discover;
 use crate::parser;
 
-use types::{container_template, is_uint_shim, map_primitive};
+use types::{container_template, is_integral_underlying, is_uint_shim, map_primitive};
 
 /// What a declared name is, which determines value-vs-reference semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +25,10 @@ pub enum TypeKind {
     Class,
     Interface,
     Enum,
+    /// A non-integral `enum abstract X(String|Float)` — a set of typed `static
+    /// const` constants whose values *are* the underlying type. The type itself maps
+    /// to that underlying C++ type; members are referenced as `X_::Member`.
+    EnumAbstract,
     /// `typedef X = { ... }` — a C++ value struct.
     StructTypedef,
     /// `typedef X = Y` — an alias.
@@ -165,7 +169,15 @@ impl Program {
                 let (name, kind, meta) = match decl {
                     Decl::Class(c) => (&c.name, TypeKind::Class, &c.meta),
                     Decl::Interface(i) => (&i.name, TypeKind::Interface, &i.meta),
-                    Decl::Enum(e) => (&e.name, TypeKind::Enum, &e.meta),
+                    Decl::Enum(e) => {
+                        // A non-integral `enum abstract` is its own kind (it maps to
+                        // the underlying type, not a C++ enum).
+                        let kind = match &e.underlying {
+                            Some(u) if !is_integral_underlying(u) => TypeKind::EnumAbstract,
+                            _ => TypeKind::Enum,
+                        };
+                        (&e.name, kind, &e.meta)
+                    }
                     Decl::Typedef(t) => {
                         let kind = match t.target {
                             TypedefTarget::Struct(_) => TypeKind::StructTypedef,
@@ -339,6 +351,14 @@ impl Program {
             .find(|d| decl_name(d) == Some(ti.name.as_str()))
     }
 
+    /// The underlying type of an `enum abstract` (`None` for any other type).
+    pub fn enum_abstract_underlying(&self, ti: &TypeInfo) -> Option<Type> {
+        match self.type_decl(ti) {
+            Some(Decl::Enum(e)) => e.underlying.clone(),
+            _ => None,
+        }
+    }
+
     /// Does `class` (or any transitive base / implemented interface, including
     /// native ones) declare a method named `name`? Used to decide `virtual`.
     pub fn method_overrides_base(&self, class: &Class, ctx_module: usize, name: &str) -> bool {
@@ -445,6 +465,13 @@ impl Program {
                     return format!("{tmpl}<{inner}{pad}>");
                 }
                 match self.resolve_type(path, ctx_module) {
+                    // A non-integral `enum abstract` *is* its underlying type at
+                    // runtime (its members are typed constants), so it maps to that
+                    // type's C++ spelling rather than to a name of its own.
+                    Some(ti) if ti.kind == TypeKind::EnumAbstract => self
+                        .enum_abstract_underlying(ti)
+                        .map(|u| self.map_type_base(&u, ti.module_index, current_ns))
+                        .unwrap_or_else(|| qualify(ti, current_ns)),
                     Some(ti) => qualify(ti, current_ns),
                     // Unknown (e.g. a generic parameter) — emit the name verbatim.
                     None => name.to_string(),

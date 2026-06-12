@@ -1,3 +1,5 @@
+![Hatchy - the Hatchet mascot!](/images/hatchy-small.png)
+
 # Hatchet
 
 **Hatchet** is a transpiler from [Haxe](https://haxe.org) 4.x to **C++98** — portable source that
@@ -25,26 +27,37 @@ to a running legacy binary. Hatchet has additionally been validated against a la
 Supported today, end to end:
 
 - **Declarations** — classes, interfaces (pure-virtual), enums (pre-C++11 `struct E_ { enum … }`),
-  typedef structs and aliases, the fixed-width `UInt8/16/32` shims, and `@:native` interop wiring
-  (which emits no code of its own, only the includes it contributes).
+  `enum abstract` (an `Int` backing reuses the enum idiom with explicit member values, including
+  sibling-referencing bit-flag expressions like `AB = A | B`; a `String`/`Float` backing becomes a
+  namespace of typed `static const` constants, `namespace X_ { static const std::string A = "…"; }`,
+  with the type mapping straight to its underlying C++ type), typedef structs and aliases, the
+  fixed-width `UInt8/16/32` shims, and `@:native` interop wiring (which emits no code of its own,
+  only the includes it contributes).
 - **Members & access** — `(default,set)` / `(default,null)` property accessors (`GetX`/`SetX`, with
   the value-vs-pointer `const` rule), `@:protected`, `@:readOnly` (const-return), `@:decl` (DLL-export
   class), `@:overload(...)` (a call is resolved to the matching C++ overload by argument type, else a
-  hard error), `extern inline` (`extern "C"` export via a portable macro), and the base-from-member
-  `Holder` idiom for constructors whose `super(...)` is not the first statement.
+  hard error), `extern inline` (`extern "C"` export via a portable macro), `abstract class` and
+  `abstract function` (an abstract method becomes a pure virtual `virtual T f() = 0;`, declared and
+  never defined), and the base-from-member `Holder` idiom for constructors whose `super(...)` is not
+  the first statement.
 - **Statements & expressions** — `super(...)` initializer lists; `.`-vs-`->` selection via type
   inference (including inherited fields); anonymous-struct-to-temporary expansion (typed, untyped,
   nested); array / map / object literals; `Array`→`std::vector` and `Map`→`std::map` with their
   container ops — Array `push`/`insert`/`pop`/`shift`/`unshift`/`length`/`indexOf`/`lastIndexOf`/
-  `contains`/`remove`/`reverse`/`concat`/`slice`/`copy`/`join` and Map `get`/`exists`/`set`/`remove`/
-  `keys` (each an inline loop/expression, no `<algorithm>` dependency); Haxe's **auto-extending array
+  `contains`/`remove`/`reverse`/`concat`/`slice`/`copy`/`join`/`filter`/`sort` (the last two take a
+  lambda: `filter` builds a kept-elements vector, `sort` is an in-place insertion sort driven by the
+  comparator) and Map `get`/`exists`/`set`/`remove`/`keys` (each an inline loop/expression, no
+  `<algorithm>` dependency); Haxe's **auto-extending array
   writes** — `a[i] = v` past the end grows
   the vector first (an inline `resize`), matching Haxe rather than letting C++ `operator[]` run off
   the end; `for` over a range, an array, an anonymous array literal
   (`for (i in [1,2,3])`), or a map (`for (v in m)` over values, `for (k => v in m)` over key/value
-  pairs, via a `std::map` iterator); array & map comprehensions; closures / `Array.map` lowered to
-  free functions (an arrow param's type may be left off and taken from the binding's function-type
-  annotation — `Cross:(Vec, Vec) -> Float = (a, b) -> …` types `a`/`b` as `Vec`); `String` methods
+  pairs, via a `std::map` iterator); array & map comprehensions; **module-level functions**
+  (`function f(...) {...}` → a namespace free function, public ones declared in the header, `private`
+  ones `static` in the `.cpp`); closures inlined into a loop for
+  `Array.map`/`filter`/`sort`, or lowered to free functions for a top-level `final` binding (an arrow
+  param's type may be left off and taken from the binding's function-type annotation —
+  `Cross:(Vec, Vec) -> Float = (a, b) -> …` types `a`/`b` as `Vec`); `String` methods
   (`charAt`/`charCodeAt`/`indexOf`/`lastIndexOf`/`substr`/`substring`/`toUpperCase`/
   `toLowerCase`/`split`), `String.fromCharCode`, `StringBuf` (an `add`/`addChar`/`toString`
   accumulator over `std::string`), and the `StringTools` statics
@@ -54,7 +67,14 @@ Supported today, end to end:
   also supports the `$ident` shorthand); the `??` null-coalesce and
   NULL-guarded `?.`; `cast` (C-style cast for `cast(expr, T)`, passthrough for `cast expr`); the
   `(expr : Type)` type ascription (a compile-time hint that drives inference, e.g. `([] : Array<Int>)`);
-  `switch`/enum constants; `trace(...)` (with `--no-traces` to strip it); and the `Math` / `Std` /
+  `switch` (on an integer/enum subject → a C++ `switch`; on a `String` subject → an `if`/`else if`
+  chain, since C++ case labels must be integral) and its enum constants — including a `switch` used
+  in **value position** (`var x = switch (e) { … }`), which desugars to a hidden temporary assigned
+  inside a statement `switch`; `trace(...)` (with `--no-traces` to strip it); `throw` / `try` / `catch`
+  exception handling (a thrown `String` is coerced to `std::string`; a typed `catch (e:T)` maps the
+  exception type; an untyped/`Dynamic` catch becomes the non-binding `catch (...)` — so it may catch but
+  cannot *use* the value: referencing the caught name there is a hard error, since C++ `catch (...)`
+  binds nothing; see the ownership note below for unwind behaviour); and the `Math` / `Std` /
   `Sys` intrinsics (`Std.int`/`Std.string`/`Std.parseInt`/`Std.parseFloat`/`Std.random` → inline
   `(int)`/`sprintf`/`strtol`/`atof`/`rand()`).
 - **Conditional compilation & escape hatches** — Haxe `#if FLAG` / `#elseif FLAG` / `#else` / `#end`
@@ -81,7 +101,11 @@ Supported today, end to end:
   warns when a tag looks unsound (e.g. an `@owned` field that is also handed out); auto-inferring an
   injected pointer's ownership would need interprocedural call-site analysis and is a future improvement.
   A `new` passed to a constructor parameter the class owns is emitted **inline** — the constructed object
-  frees it — rather than hoisted into a scope-owned local that would double-free it.
+  frees it — rather than hoisted into a scope-owned local that would double-free it. **On exception
+  unwind** (a `throw` inside a `try`), the scope-close frees do not run, so owned objects created in
+  the `try` before the throw **leak** — a deliberate extension of the conservative bias (never a
+  double-free/use-after-free); free them in the `catch` if it matters. (Exceptions must be enabled on
+  the target — VC6 `/GX`; g++ enables them by default.)
 
 Hatchet **fails loudly rather than guessing** — an unresolvable type or an unsupported idiom is a
 hard error that skips that module and fails the run (see *Diagnostics*) — and it **always generates
@@ -190,11 +214,12 @@ PR). Currently flagged as unsupported: a **lambda** used outside a top-level `fi
 `Array.map(...)` argument; **Haxe macros** (a `macro` function, or the macro AST type `Expr`);
 **regular expressions** (both the `~/pattern/flags` literal and the `EReg` type); **`using` static
 extensions**; **parameterized enum variants** (a variant with constructor parameters, e.g.
-`Move(dx:Int, dy:Int)`, which would need a tagged-union lowering); **`try`/`catch`** exception
-handling; the **`is`** runtime type-check operator (Haxe 4.2); and **`abstract` types** (including
-`enum abstract`). These last three are parsed but not transpiled, so they are reported with a clean
-diagnostic rather than a parse error. Relatedly, a `for` loop over anything other than a range, an
-`Array`, or a `Map` (a custom `Iterator`/`Iterable`) is a hard error rather than a guess.
+`Move(dx:Int, dy:Int)`, which would need a tagged-union lowering); the **`is`** runtime type-check
+operator (Haxe 4.2); and ordinary **`abstract` types** (the `abstract X(T)` newtype form — distinct
+from `enum abstract`, which *is* supported, and from an `abstract class`, also supported). These are
+parsed but not transpiled, so they are reported with a clean diagnostic rather than a parse error.
+Relatedly, a `for` loop over anything other than a range,
+an `Array`, or a `Map` (a custom `Iterator`/`Iterable`) is a hard error rather than a guess.
 
 ## Standalone projects and the prelude
 

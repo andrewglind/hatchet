@@ -1511,3 +1511,129 @@ fn stringtools_statics_lower_without_using() {
     assert!(out.contains(".replace("), "StringTools.replace → std::string::replace loop:\n{out}");
     assert!(out.contains(".substr("), "StringTools.trim → substr of the trimmed range:\n{out}");
 }
+
+#[test]
+fn int_enum_abstract_members_qualify_in_bodies() {
+    // An `Int`-backed `enum abstract` member is a C++ enumerator: a bare member in
+    // a `switch` case or expression position qualifies to `X_::Member`, exactly
+    // like a plain enum constant — the enum machinery is reused wholesale.
+    let out = gen_one(
+        "enum abstract Dir(Int) { var North; var South; }\nclass Nav {\n  public function new() {}\n  public function code(d:Dir):Int {\n    switch (d) {\n      case North: return 0;\n      case South: return 1;\n    }\n    return -1;\n  }\n  public function home():Dir { return South; }\n}\n",
+        "Nav",
+    );
+    assert!(out.contains("case Dir_::North:"), "switch case qualifies the member:\n{out}");
+    assert!(out.contains("return Dir_::South;"), "bare member in return qualifies:\n{out}");
+}
+
+#[test]
+fn string_subject_switch_lowers_to_an_if_else_chain() {
+    // A `switch` on a `String` cannot use a C++ `switch` (case labels must be
+    // integral), so it lowers to an `if`/`else if`/`else` chain: the subject is
+    // hoisted into one `std::string`, multi-pattern cases become OR-ed equality
+    // tests, and `default` becomes the trailing `else`.
+    let out = gen_one(
+        "class Sw {\n  public function new() {}\n  public function f(s:String):Int {\n    switch (s) {\n      case \"one\": return 1;\n      case \"two\", \"deux\": return 2;\n      default: return -1;\n    }\n  }\n}\n",
+        "Sw",
+    );
+    assert!(!out.contains("switch ("), "no C++ switch on a string:\n{out}");
+    assert!(out.contains("std::string") && out.contains(" = s;"), "subject hoisted once:\n{out}");
+    assert!(out.contains("== \"one\""), "first pattern compared:\n{out}");
+    assert!(
+        out.contains("== \"two\" || ") && out.contains("== \"deux\""),
+        "multi-pattern case is OR-ed:\n{out}"
+    );
+    assert!(out.contains("} else {"), "default becomes the trailing else:\n{out}");
+}
+
+#[test]
+fn switch_expression_lowers_to_a_hoisted_temp() {
+    // A `switch` in value position desugars to a temporary declared before a
+    // statement `switch`, whose arms assign their trailing value to the temp; the
+    // expression then evaluates to that temp.
+    let out = gen_one(
+        "class E {\n  public function new() {}\n  public function pick(n:Int):String {\n    var s = switch (n) {\n      case 0: \"zero\";\n      default: \"other\";\n    }\n    return s;\n  }\n}\n",
+        "E",
+    );
+    // A hoisted std::string temp, assigned inside the switch, then bound to `s`.
+    assert!(out.contains("std::string _swx"), "result temp is declared:\n{out}");
+    assert!(out.contains("switch ("), "desugars to a statement switch:\n{out}");
+    assert!(out.contains("= \"zero\";") && out.contains("= \"other\";"), "arms assign the temp:\n{out}");
+    assert!(out.contains("std::string s = _swx"), "expression evaluates to the temp:\n{out}");
+}
+
+#[test]
+fn array_filter_lowers_to_a_predicate_loop() {
+    // `xs.filter(p)` → a fresh vector of the kept elements (same element type),
+    // the predicate lambda inlined with its parameter bound to each element.
+    let out = gen_one(
+        "class Flt {\n  public function new() {}\n  public function f(xs:Array<Int>):Array<Int> {\n    return xs.filter(n -> n > 2);\n  }\n}\n",
+        "Flt",
+    );
+    assert!(out.contains("std::vector<int >"), "result is a vector of the element type:\n{out}");
+    assert!(out.contains("int n = "), "predicate param bound to the element:\n{out}");
+    assert!(out.contains("if (n > 2)") && out.contains(".push_back(n)"), "predicate guards the push:\n{out}");
+}
+
+#[test]
+fn array_sort_lowers_to_an_inline_insertion_sort() {
+    // `xs.sort(cmp)` → an in-place insertion sort with no `<algorithm>` dependency;
+    // the comparator lambda's two params are bound to the compared elements.
+    let out = gen_one(
+        "class Srt {\n  public function new() {}\n  public function s():Void {\n    var xs = [3, 1, 2];\n    xs.sort((a, b) -> a - b);\n  }\n}\n",
+        "Srt",
+    );
+    assert!(!out.contains("std::sort") && !out.contains("<algorithm>"), "no <algorithm>:\n{out}");
+    assert!(out.contains("while (") && out.contains("break;"), "insertion-sort shift loop:\n{out}");
+    assert!(out.contains("int _cmp") && out.contains("= a - b;"), "comparator inlined over a/b:\n{out}");
+}
+
+#[test]
+fn try_catch_lowers_to_cpp_exception_handling() {
+    // `try { … } catch (e:T) { … }` → a C++ try/catch. A thrown String is coerced
+    // to `std::string` (so a `catch (e:String)` matches it), a typed catch maps the
+    // exception type via the parameter rules, and an untyped/`Dynamic` catch becomes
+    // the non-binding `catch (...)`.
+    let out = gen_one(
+        "class T {\n  public function new() {}\n  public function f(b:Bool):String {\n    try {\n      if (b) throw \"x\";\n      return \"ok\";\n    } catch (e:String) {\n      return e;\n    } catch (e:Dynamic) {\n      return \"any\";\n    }\n  }\n}\n",
+        "Tc",
+    );
+    assert!(out.contains("try {"), "emits a C++ try block:\n{out}");
+    assert!(out.contains("throw std::string(\"x\")"), "String throw is coerced:\n{out}");
+    assert!(out.contains("catch (const std::string& e)"), "typed catch maps the exception type:\n{out}");
+    assert!(out.contains("catch (...)"), "Dynamic catch is the non-binding catch-all:\n{out}");
+}
+
+#[test]
+fn untyped_catch_using_its_value_is_an_error() {
+    // An untyped/`Dynamic` catch lowers to the non-binding C++ `catch (...)`, which
+    // cannot bind the exception. Referencing the caught name in the body is a hard
+    // error rather than silently emitting an undeclared identifier.
+    let src = "class Tcc {\n  public function new() {}\n  public function run():Void {\n    try {} catch (e) { trace(e); }\n  }\n}\n";
+    let dir = std::env::temp_dir().join(format!("hatchet_catchval_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Tcc.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Tcc"))
+        .unwrap();
+    let (_, _, errors) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        errors.iter().any(|(_, e)| e.contains("untyped") && e.contains("catch")),
+        "expected an error for using an untyped catch's value, got: {errors:?}"
+    );
+}
+
+#[test]
+fn untyped_catch_ignoring_its_value_is_a_plain_catch_all() {
+    // The same untyped catch that does NOT reference the value is fine: it is the
+    // non-binding `catch (...)`, with no error.
+    let out = gen_one(
+        "class Tci {\n  public function new() {}\n  public function run():Void {\n    try {} catch (e) { trace(\"oops\"); }\n  }\n}\n",
+        "Tci",
+    );
+    assert!(out.contains("catch (...)"), "untyped catch ignoring the value → catch(...):\n{out}");
+}

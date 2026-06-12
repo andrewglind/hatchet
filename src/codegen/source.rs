@@ -65,7 +65,25 @@ pub fn generate_source_diagnostics(
             _ => None,
         })
         .collect();
-    if !has_class && free_fns.is_empty() && extern_fns.is_empty() {
+    // Plain module-level `function name(...) {...}` → namespace free functions
+    // (unlike the lambda form, these have a real signature and body).
+    let plain_fns: Vec<&Function> = m
+        .file
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Function(f)
+                if !f.modifiers.is_extern
+                    && !f.modifiers.is_macro
+                    && !has_meta(&f.meta, "native")
+                    && f.body.is_some() =>
+            {
+                Some(f)
+            }
+            _ => None,
+        })
+        .collect();
+    if !has_class && free_fns.is_empty() && extern_fns.is_empty() && plain_fns.is_empty() {
         return None; // headers-only (enums/typedefs/interfaces)
     }
 
@@ -77,7 +95,7 @@ pub fn generate_source_diagnostics(
     // The namespace wraps classes and `final`-lambda free functions. A file whose
     // only output is an `extern "C"` export has no namespace block at all (the
     // export lives at global scope, below).
-    let has_ns_body = has_class || !free_fns.is_empty();
+    let has_ns_body = has_class || !free_fns.is_empty() || !plain_fns.is_empty();
     if has_ns_body {
         for part in &m.package {
             let _ = writeln!(out, "namespace {part} {{");
@@ -148,6 +166,33 @@ pub fn generate_source_diagnostics(
         for g in &free_fns {
             let mut bg = BodyGen::new(prog, module_index, &empty, extract_depth, no_trace);
             out.push_str(&bg.free_fn_def(g));
+            warnings.append(&mut bg.warnings);
+            errors.append(&mut bg.errors);
+            out.push('\n');
+        }
+    }
+
+    // Plain module-level `function`s become namespace free functions. As with the
+    // lambda form, file-local (`private`) ones get a forward declaration so they can
+    // be called regardless of definition order; public ones are declared in the header.
+    if !plain_fns.is_empty() {
+        let empty = empty_class();
+        let mut fwd = String::new();
+        for f in &plain_fns {
+            if f.access == Access::Private {
+                let mut bg = BodyGen::new(prog, module_index, &empty, extract_depth, no_trace);
+                if let Some(sig) = bg.plain_fn_signature(f, false) {
+                    let _ = writeln!(fwd, "\tstatic {sig};");
+                }
+            }
+        }
+        if !fwd.is_empty() {
+            out.push_str(&fwd);
+            out.push('\n');
+        }
+        for f in &plain_fns {
+            let mut bg = BodyGen::new(prog, module_index, &empty, extract_depth, no_trace);
+            out.push_str(&bg.plain_fn_def(f));
             warnings.append(&mut bg.warnings);
             errors.append(&mut bg.errors);
             out.push('\n');
@@ -288,6 +333,11 @@ struct BodyGen<'a> {
     /// When set (`--no-traces`), `trace(...)` calls are stripped entirely (lowered
     /// to a no-op, arguments not evaluated), mirroring hxcpp's `-D no-traces`.
     no_trace: bool,
+    /// Catch-variable names bound by an enclosing **non-binding** catch
+    /// (`catch (...)`, from an untyped or `Dynamic` catch). C++ `catch (...)` cannot
+    /// bind the value, so a reference to one of these names is a hard error (rather
+    /// than silently emitting an undeclared identifier).
+    nonbinding_catch_vars: Vec<String>,
 }
 
 impl<'a> BodyGen<'a> {
@@ -342,6 +392,7 @@ impl<'a> BodyGen<'a> {
             owned_containers,
             expected: None,
             no_trace,
+            nonbinding_catch_vars: Vec::new(),
         }
     }
 
@@ -722,6 +773,59 @@ impl<'a> BodyGen<'a> {
         format!("{prefix}_EXPORT {ret_cpp} {prefix}_CALL {name}({plist}) {{\n{body_buf}}}\n")
     }
 
+    /// Signature (`ret name(params)`) for a plain module-level free function;
+    /// `with_defaults` keeps any ` = default` suffixes (the header declaration).
+    fn plain_fn_signature(&mut self, f: &Function, with_defaults: bool) -> Option<String> {
+        let name = f.name.clone()?;
+        self.push_scope();
+        self.bind_params(&f.params);
+        let ret_ty = match &f.ret {
+            Some(t) => self.ty_of(t),
+            None => Ty { base: "void".to_string(), ..Default::default() },
+        };
+        let ret_cpp = self.decl_spelling(&ret_ty);
+        let plist = if with_defaults {
+            f.params
+                .iter()
+                .map(|p| crate::codegen::param_decl(self.prog, self.mi, &self.ns, p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            self.header_params(&f.params)
+        };
+        self.pop_scope();
+        Some(format!("{ret_cpp} {name}({plist})"))
+    }
+
+    /// Full definition of a plain module-level `function name(...) {...}` as a
+    /// namespace free function (`static` when file-local). Unlike the lambda form,
+    /// this has a real signature and statement body.
+    fn plain_fn_def(&mut self, f: &Function) -> String {
+        let Some(name) = f.name.clone() else { return String::new() };
+        self.current_fn = name.clone();
+        self.push_scope();
+        self.bind_params(&f.params);
+        let ret_ty = match &f.ret {
+            Some(t) => self.ty_of(t),
+            None => Ty { base: "void".to_string(), ..Default::default() },
+        };
+        self.current_ret = ret_ty.clone();
+        let ret_cpp = self.decl_spelling(&ret_ty);
+        let plist = self.header_params(&f.params);
+        let prefix = if f.access == Access::Private { "static " } else { "" };
+
+        let mut body_buf = String::new();
+        if let Some(stmts) = &f.body {
+            self.begin_fn_body(stmts);
+            for st in stmts {
+                self.gen_stmt(st, 1, &mut body_buf);
+            }
+            self.emit_owned_deletes(&mut body_buf, 1);
+        }
+        self.pop_scope();
+        format!("\t{prefix}{ret_cpp} {name}({plist}) {{\n{body_buf}\t}}\n")
+    }
+
     /// Resolve a lambda's C++ return type from, in priority order: (1) the lambda's
     /// own explicit `:T` return annotation, (2) the **function-type annotation on
     /// the binding** — `Square:(Int, Int) -> Int = (a, b) -> a * b` — whose `-> R`
@@ -1053,9 +1157,16 @@ impl<'a> BodyGen<'a> {
             Stmt::Throw(e, line) => {
                 self.current_line = *line;
                 self.prelude_ind = ind;
-                let (c, _) = self.gen_expr(e);
+                let (c, ty) = self.gen_expr(e);
                 self.flush(out);
-                let _ = writeln!(out, "{t}throw {c};");
+                // Coerce a thrown `String` to `std::string`, so it matches a
+                // `catch (e:String)` (a bare literal would otherwise throw a
+                // `const char*`, which that catch would not catch).
+                if ty.base == "std::string" {
+                    let _ = writeln!(out, "{t}throw std::string({c});");
+                } else {
+                    let _ = writeln!(out, "{t}throw {c};");
+                }
             }
             Stmt::Verbatim { code, line } => {
                 self.current_line = *line;
@@ -1066,14 +1177,73 @@ impl<'a> BodyGen<'a> {
                 let code = code.replace("\r\n", "\n").replace('\r', "\n");
                 let _ = writeln!(out, "{code}");
             }
-            // Exception handling is not transpiled. `validate` flags any `try` as
-            // unsupported and skips the whole module, so this is never reached in a
-            // real run; emit a visible marker rather than silently nothing.
-            Stmt::Try { line, .. } => {
+            // `try { … } catch (e:T) { … }` → a C++ try/catch. Each block carries
+            // its normal scope, so owned locals are freed at the *normal* close of
+            // the block. On an exception the unwind skips those frees — a deliberate
+            // **conservative leak** (never a double-free/UAF); the developer frees in
+            // the catch if it matters. Haxe has no `finally`, so there is none to
+            // emulate. Requires exceptions enabled on the target (VC6 `/GX`).
+            Stmt::Try { body, catches, line } => {
                 self.current_line = *line;
-                let _ = writeln!(out, "{t}/* unsupported: try/catch */");
+                let _ = writeln!(out, "{t}try {{");
+                self.push_scope();
+                match &**body {
+                    Stmt::Block(stmts) => {
+                        for s in stmts {
+                            self.gen_stmt(s, ind + 1, out);
+                        }
+                    }
+                    other => self.gen_stmt(other, ind + 1, out),
+                }
+                self.emit_owned_deletes(out, ind + 1);
+                self.pop_scope();
+                for c in catches {
+                    let (header, binds) = self.catch_header(c);
+                    let _ = writeln!(out, "{t}}} {header} {{");
+                    self.push_scope();
+                    // Bind the caught value's name for a typed catch; an untyped /
+                    // `Dynamic` catch is `catch (...)`, which binds nothing — mark the
+                    // name so any use of it in the body is a hard error.
+                    if binds {
+                        if let Some(ht) = &c.ty {
+                            let ty = self.ty_of(ht);
+                            self.define_local(&c.name, ty);
+                        }
+                    } else {
+                        self.nonbinding_catch_vars.push(c.name.clone());
+                    }
+                    for s in &c.body {
+                        self.gen_stmt(s, ind + 1, out);
+                    }
+                    self.emit_owned_deletes(out, ind + 1);
+                    self.pop_scope();
+                    if !binds {
+                        self.nonbinding_catch_vars.pop();
+                    }
+                }
+                let _ = writeln!(out, "{t}}}");
             }
         }
+    }
+
+    /// The C++ `catch (...)` header for a Haxe catch clause, plus whether it binds a
+    /// local. A typed catch maps via `param_decl` (`catch (Foo* e)` / `catch (const
+    /// std::string& e)`); an untyped or `Dynamic`/`Any` catch is the non-binding
+    /// catch-all `catch (...)` (so referencing its name in the body will not compile
+    /// — by design, the developer should catch a concrete type to use the value).
+    fn catch_header(&self, c: &Catch) -> (String, bool) {
+        let dynamic = match &c.ty {
+            None => true,
+            Some(Type::Named { path, .. }) => {
+                matches!(path.last().map(|s| s.as_str()), Some("Dynamic") | Some("Any"))
+            }
+            Some(_) => false,
+        };
+        if dynamic {
+            return ("catch (...)".to_string(), false);
+        }
+        let p = Param { name: c.name.clone(), ty: c.ty.clone(), optional: false, default: None };
+        (format!("catch ({})", super::param_decl(self.prog, self.mi, &self.ns, &p)), true)
     }
 
     fn gen_block(&mut self, st: &Stmt, ind: usize, out: &mut String) {
@@ -1336,6 +1506,116 @@ impl<'a> BodyGen<'a> {
         (tmp, vec_ty)
     }
 
+    /// `Array.filter(p)` → a hoisted `std::vector<T>` (same element type as the
+    /// receiver) holding the elements for which the predicate is true. Mirrors
+    /// `gen_array_map`'s lambda inlining, but the body is a `bool` guard.
+    fn gen_array_filter(
+        &mut self,
+        rcode: &str,
+        rty: &Ty,
+        params: &[Param],
+        body: &LambdaBody,
+    ) -> (String, Ty) {
+        let ind = self.prelude_ind;
+        let t = "\t".repeat(ind);
+        let tmp = self.fresh("flt");
+        let idx = self.fresh("i");
+        let access = if rty.is_ptr { format!("(*{rcode})") } else { rcode.to_string() };
+        let elem = self.elem_member_ty(rty);
+        let spell = self.decl_spelling(&elem);
+        let var = params.first().map(|p| p.name.clone()).unwrap_or_else(|| "_x".to_string());
+
+        self.push_scope();
+        self.define_local(&var, elem.clone());
+        // Capture any prelude the predicate hoists so it lands inside the loop.
+        let saved = std::mem::take(&mut self.prelude);
+        let pred = match body {
+            LambdaBody::Expr(e) => self.gen_expr(e).0,
+            // A block-bodied predicate is not supported; bail to keep the match total.
+            LambdaBody::Block(_) => {
+                self.prelude = saved;
+                self.pop_scope();
+                return (tmp, Ty::default());
+            }
+        };
+        let pred_prelude = std::mem::replace(&mut self.prelude, saved);
+        self.pop_scope();
+
+        let vec_ty = Ty { base: format!("std::vector<{spell} >"), ..Default::default() };
+        let mut buf = String::new();
+        let _ = writeln!(buf, "{t}{} {tmp};", self.decl_spelling(&vec_ty));
+        let _ = writeln!(buf, "{t}for (size_t {idx} = 0; {idx} < {access}.size(); ++{idx}) {{");
+        let _ = writeln!(buf, "{t}\t{spell} {var} = {access}[{idx}];");
+        buf.push_str(&pred_prelude);
+        let _ = writeln!(buf, "{t}\tif ({pred}) {{ {tmp}.push_back({var}); }}");
+        let _ = writeln!(buf, "{t}}}");
+        self.prelude.push_str(&buf);
+
+        (tmp, vec_ty)
+    }
+
+    /// `Array.sort(cmp)` → an in-place insertion sort (no `<algorithm>`). The
+    /// comparator lambda takes two elements and returns an `Int` (`< 0` / `0` /
+    /// `> 0`, like Haxe). Mutates the receiver; the expression's value is Void.
+    fn gen_array_sort(
+        &mut self,
+        rcode: &str,
+        rty: &Ty,
+        params: &[Param],
+        body: &LambdaBody,
+    ) -> (String, Ty) {
+        let ind = self.prelude_ind;
+        let t = "\t".repeat(ind);
+        let access = if rty.is_ptr { format!("(*{rcode})") } else { rcode.to_string() };
+        let elem = self.elem_member_ty(rty);
+        let spell = self.decl_spelling(&elem);
+        let i = self.fresh("i");
+        let j = self.fresh("j");
+        let key = self.fresh("key");
+        let cmp = self.fresh("cmp");
+        // The comparator's two parameters (defaulted if the lambda omits them).
+        let a = params.first().map(|p| p.name.clone()).unwrap_or_else(|| "_a".to_string());
+        let b = params.get(1).map(|p| p.name.clone()).unwrap_or_else(|| "_b".to_string());
+
+        self.push_scope();
+        self.define_local(&a, elem.clone());
+        self.define_local(&b, elem.clone());
+        // Comparator body, capturing any prelude it hoists.
+        let saved = std::mem::take(&mut self.prelude);
+        let ccode = match body {
+            LambdaBody::Expr(e) => self.gen_expr(e).0,
+            LambdaBody::Block(_) => {
+                self.prelude = saved;
+                self.pop_scope();
+                return ("((void)0)".to_string(), Ty::default());
+            }
+        };
+        let cmp_prelude = std::mem::replace(&mut self.prelude, saved);
+        self.pop_scope();
+
+        // Insertion sort: shift elements while the comparator says they belong after
+        // `key`. `a` is bound to the element under test, `b` to `key`, so the
+        // comparator's parameter references resolve inside the loop body.
+        let mut buf = String::new();
+        let _ = writeln!(buf, "{t}for (size_t {i} = 1; {i} < {access}.size(); ++{i}) {{");
+        let _ = writeln!(buf, "{t}\t{spell} {key} = {access}[{i}];");
+        let _ = writeln!(buf, "{t}\tsize_t {j} = {i};");
+        let _ = writeln!(buf, "{t}\twhile ({j} > 0) {{");
+        let _ = writeln!(buf, "{t}\t\t{spell} {a} = {access}[{j} - 1];");
+        let _ = writeln!(buf, "{t}\t\t{spell} {b} = {key};");
+        buf.push_str(&cmp_prelude);
+        let _ = writeln!(buf, "{t}\t\tint {cmp} = {ccode};");
+        let _ = writeln!(buf, "{t}\t\tif ({cmp} <= 0) break;");
+        let _ = writeln!(buf, "{t}\t\t{access}[{j}] = {a};");
+        let _ = writeln!(buf, "{t}\t\t--{j};");
+        let _ = writeln!(buf, "{t}\t}}");
+        let _ = writeln!(buf, "{t}\t{access}[{j}] = {key};");
+        let _ = writeln!(buf, "{t}}}");
+        self.prelude.push_str(&buf);
+
+        ("((void)0)".to_string(), Ty::default())
+    }
+
     fn gen_block_inner(&mut self, st: &Stmt, ind: usize, out: &mut String) {
         match st {
             Stmt::Block(stmts) => {
@@ -1357,6 +1637,18 @@ impl<'a> BodyGen<'a> {
     ) {
         let t = "\t".repeat(ind);
         let (subj, sty) = self.gen_expr(subject);
+        // The subject may hoist statements (a call, a comprehension); emit them
+        // before the switch rather than leaving them for the next statement.
+        self.flush(out);
+        // A subject that cannot be a C++ `case` label — a `String`, or a
+        // floating-point value such as a non-integral `enum abstract` — lowers to an
+        // `if`/`else if` chain comparing the subject (hoisted once) against each
+        // case's pattern(s) with `==`.
+        if matches!(sty.base.as_str(), "std::string" | "float" | "double") {
+            let spell = self.decl_spelling(&sty);
+            self.gen_equality_switch(&subj, &spell, cases, default, ind, out);
+            return;
+        }
         let _ = writeln!(out, "{t}switch ({subj}) {{");
         for case in cases {
             for pat in &case.patterns {
@@ -1385,6 +1677,127 @@ impl<'a> BodyGen<'a> {
             let _ = writeln!(out, "{t}\tbreak;");
         }
         let _ = writeln!(out, "{t}}}");
+    }
+
+    /// Lower a `switch` on a non-integral subject (a `String`, or a float-backed
+    /// `enum abstract`) to an `if`/`else if`/`else` chain. The subject is hoisted
+    /// into one local of type `spell` (so a side-effecting subject runs once), and
+    /// each case's patterns become an OR-ed equality test. Haxe cases do not fall
+    /// through, which the chain matches naturally.
+    fn gen_equality_switch(
+        &mut self,
+        subj: &str,
+        spell: &str,
+        cases: &[Case],
+        default: Option<&[Stmt]>,
+        ind: usize,
+        out: &mut String,
+    ) {
+        let t = "\t".repeat(ind);
+        let sw = self.fresh("sw");
+        let _ = writeln!(out, "{t}{spell} {sw} = {subj};");
+        let mut started = false;
+        for case in cases {
+            // String case patterns are constants (literals), so they hoist nothing.
+            let cond = case
+                .patterns
+                .iter()
+                .map(|p| format!("{sw} == {}", self.gen_expr(p).0))
+                .collect::<Vec<_>>()
+                .join(" || ");
+            let kw = if started { "} else if" } else { "if" };
+            let _ = writeln!(out, "{t}{kw} ({cond}) {{");
+            self.push_scope();
+            for s in &case.body {
+                self.gen_stmt(s, ind + 1, out);
+            }
+            self.pop_scope();
+            started = true;
+        }
+        match default {
+            Some(d) if started => {
+                let _ = writeln!(out, "{t}}} else {{");
+                self.push_scope();
+                for s in d {
+                    self.gen_stmt(s, ind + 1, out);
+                }
+                self.pop_scope();
+                let _ = writeln!(out, "{t}}}");
+            }
+            // A `default` with no preceding `case` is just an unconditional block.
+            Some(d) => {
+                let _ = writeln!(out, "{t}{{");
+                self.push_scope();
+                for s in d {
+                    self.gen_stmt(s, ind + 1, out);
+                }
+                self.pop_scope();
+                let _ = writeln!(out, "{t}}}");
+            }
+            None if started => {
+                let _ = writeln!(out, "{t}}}");
+            }
+            None => {}
+        }
+    }
+
+    /// Desugar a value-position `switch` into a hoisted temporary plus a statement
+    /// `switch` (reusing the integer/string/enum lowering): each arm assigns its
+    /// trailing value expression to the temp, and the whole thing evaluates to it.
+    fn gen_switch_expr(
+        &mut self,
+        subject: &Expr,
+        cases: &[Case],
+        default: Option<&[Stmt]>,
+    ) -> (String, Ty) {
+        let tmp = self.fresh("swx");
+        // The result type comes from the first arm's (or default's) value.
+        let ty = self.switch_expr_ty(cases, default);
+        let spell = self.decl_spelling(&ty);
+        // Rewrite each arm so its trailing value expression assigns to the temp.
+        let cases2: Vec<Case> = cases
+            .iter()
+            .map(|c| Case { patterns: c.patterns.clone(), body: assign_last_to(&c.body, &tmp) })
+            .collect();
+        let default2: Option<Vec<Stmt>> = default.map(|d| assign_last_to(d, &tmp));
+
+        // Build the statement switch in an isolated prelude context so its internal
+        // flushing does not move unrelated, already-pending prelude into the middle.
+        let saved = std::mem::take(&mut self.prelude);
+        let ind = self.prelude_ind;
+        let mut buf = String::new();
+        self.gen_switch(subject, &cases2, default2.as_deref(), ind, &mut buf);
+        // `gen_switch` flushes its own prelude into `buf`; nothing should remain.
+        let leftover = std::mem::replace(&mut self.prelude, saved);
+        let t = "\t".repeat(ind);
+        self.prelude.push_str(&format!("{t}{spell} {tmp};\n"));
+        self.prelude.push_str(&leftover);
+        self.prelude.push_str(&buf);
+        (tmp, ty)
+    }
+
+    /// The result type of a value-position `switch`: the type of the first arm's
+    /// (or the default's) trailing value expression, inferred without emitting.
+    fn switch_expr_ty(&mut self, cases: &[Case], default: Option<&[Stmt]>) -> Ty {
+        let value = cases
+            .iter()
+            .find_map(|c| case_value_expr(&c.body))
+            .or_else(|| default.and_then(case_value_expr))
+            .cloned();
+        match value {
+            Some(e) => self.dry_ty(&e),
+            None => Ty::default(),
+        }
+    }
+
+    /// Infer an expression's type without emitting any code: the throwaway
+    /// generation's prelude is discarded (a value expression has no side effects we
+    /// need to keep). The fresh-name counter may advance, which is harmless.
+    fn dry_ty(&mut self, e: &Expr) -> Ty {
+        let saved = std::mem::take(&mut self.prelude);
+        let (_, ty) = self.gen_expr(e);
+        self.prelude = saved;
+        ty
     }
 
     fn case_label(&mut self, pat: &Expr, subj_ty: &Ty) -> String {
@@ -1555,6 +1968,9 @@ impl<'a> BodyGen<'a> {
             Expr::Is { .. } => {
                 self.err("the `is` type-check operator is not supported".to_string());
                 ("/* is unsupported */".into(), Ty { base: "bool".into(), ..Default::default() })
+            }
+            Expr::Switch { subject, cases, default } => {
+                self.gen_switch_expr(subject, cases, default.as_deref())
             }
             Expr::Str { raw, interpolated } => self.gen_string(raw, *interpolated),
             Expr::This => (
@@ -1862,19 +2278,40 @@ impl<'a> BodyGen<'a> {
         if let Some((qref, ty)) = self.enum_variant_ref(name) {
             return (qref, ty);
         }
+        // Reference to the value of a non-binding catch (`catch (...)` from an
+        // untyped/`Dynamic` catch): C++ cannot bind the value, so this can't be
+        // lowered. Fail loudly instead of emitting an undeclared identifier. (Only
+        // reached when `name` resolved to nothing else — a shadowing local would
+        // have been found above.)
+        if self.nonbinding_catch_vars.iter().any(|n| n == name) {
+            self.err(format!(
+                "the value `{name}` of an untyped/`Dynamic` catch cannot be used: C++ `catch (...)` \
+                 does not bind the exception — give the catch a concrete type (e.g. `catch ({name}:String)`)"
+            ));
+            return (name.to_string(), Ty::default());
+        }
         // free function / global / unknown — pass through
         (name.to_string(), Ty::default())
     }
 
     fn gen_field(&mut self, recv: &Expr, name: &str) -> (String, Ty) {
-        // Enum constant: `EnumType.Variant`
+        // Enum constant: `EnumType.Variant` (a plain/Int enum, or a non-integral
+        // `enum abstract` whose member is the underlying type).
         if let Expr::Ident(tname) = recv {
             if self.lookup_local(tname).is_none() && self.class_field(tname).is_none() {
                 if let Some(info) = self.prog.resolve_type(std::slice::from_ref(tname), self.mi).cloned() {
-                    if info.kind == TypeKind::Enum {
+                    if matches!(info.kind, TypeKind::Enum | TypeKind::EnumAbstract) {
+                        let base = if info.kind == TypeKind::EnumAbstract {
+                            self.prog
+                                .enum_abstract_underlying(&info)
+                                .map(|u| self.prog.map_type_base(&u, self.mi, &self.ns))
+                                .unwrap_or_else(|| info.cpp_name().to_string())
+                        } else {
+                            info.cpp_name().to_string()
+                        };
                         return (
                             self.enum_constant(&info, name),
-                            Ty { base: info.cpp_name().to_string(), info: Some(info), ..Default::default() },
+                            Ty { base, info: Some(info), ..Default::default() },
                         );
                     }
                 }
@@ -2075,13 +2512,25 @@ impl<'a> BodyGen<'a> {
         (format!("{tc}({a})"), Ty::default())
     }
 
-    /// Return type of a top-level free function declared in this module.
+    /// Return type of a top-level free function — a lambda-form `final NAME = …` or
+    /// a plain `function NAME(...)`. Searched across all modules (a free function may
+    /// be imported from another file), so a `var x = f()` gets a typed declaration.
     fn free_fn_return(&self, name: &str) -> Option<Ty> {
-        for d in &self.prog.modules[self.mi].file.decls {
-            if let Decl::Global(g) = d {
-                if g.name == name {
-                    let (_, ret, body) = lambda_parts(g)?;
-                    return Some(self.resolve_lambda_ret(ret, body, g.ty.as_ref()));
+        for m in &self.prog.modules {
+            for d in &m.file.decls {
+                match d {
+                    Decl::Global(g) if g.name == name => {
+                        if let Some((_, ret, body)) = lambda_parts(g) {
+                            return Some(self.resolve_lambda_ret(ret, body, g.ty.as_ref()));
+                        }
+                    }
+                    Decl::Function(f) if f.name.as_deref() == Some(name) && f.body.is_some() => {
+                        return Some(match &f.ret {
+                            Some(t) => self.ty_of(t),
+                            None => Ty { base: "void".into(), ..Default::default() },
+                        });
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2293,6 +2742,24 @@ impl<'a> BodyGen<'a> {
             "map" if matches!(args.first(), Some(Expr::Lambda { .. })) => {
                 if let Some(Expr::Lambda { params, body, .. }) = args.first() {
                     Some(self.gen_array_map(rcode, _rty, params, body))
+                } else {
+                    None
+                }
+            }
+            // Array.filter(p) → a hoisted std::vector of the elements the predicate
+            // keeps (same element type as the receiver).
+            "filter" if matches!(args.first(), Some(Expr::Lambda { .. })) => {
+                if let Some(Expr::Lambda { params, body, .. }) = args.first() {
+                    Some(self.gen_array_filter(rcode, _rty, params, body))
+                } else {
+                    None
+                }
+            }
+            // Array.sort(cmp) → an in-place insertion sort (no `<algorithm>`) driven
+            // by the comparator lambda; mutates the receiver, returns Void.
+            "sort" if matches!(args.first(), Some(Expr::Lambda { .. })) => {
+                if let Some(Expr::Lambda { params, body, .. }) = args.first() {
+                    Some(self.gen_array_sort(rcode, _rty, params, body))
                 } else {
                     None
                 }
@@ -3740,20 +4207,31 @@ impl<'a> BodyGen<'a> {
     /// one). Returns `None` when no enum declares the variant — the caller then
     /// treats the identifier as an ordinary unknown.
     fn enum_variant_ref(&self, name: &str) -> Option<(String, Ty)> {
+        let is_enumish = |k: TypeKind| matches!(k, TypeKind::Enum | TypeKind::EnumAbstract);
         let mut order: Vec<&TypeInfo> = Vec::new();
         if let Some(info) = self.expected.as_ref().and_then(|t| t.info.as_ref()) {
-            if info.kind == TypeKind::Enum {
+            if is_enumish(info.kind) {
                 order.push(info);
             }
         }
         for info in &self.prog.types {
-            if info.kind == TypeKind::Enum {
+            if is_enumish(info.kind) {
                 order.push(info);
             }
         }
         for info in order {
             if self.enum_has_variant(info, name) {
-                let ty = Ty { base: info.name.clone(), info: Some(info.clone()), ..Default::default() };
+                // A plain/Int enum member has the enum type; a non-integral
+                // `enum abstract` member has the underlying type (String/Float).
+                let base = if info.kind == TypeKind::EnumAbstract {
+                    self.prog
+                        .enum_abstract_underlying(info)
+                        .map(|u| self.prog.map_type_base(&u, self.mi, &self.ns))
+                        .unwrap_or_else(|| info.name.clone())
+                } else {
+                    info.name.clone()
+                };
+                let ty = Ty { base, info: Some(info.clone()), ..Default::default() };
                 return Some((self.enum_constant(info, name), ty));
             }
         }
@@ -3863,6 +4341,35 @@ fn map_get_init(init: Option<&Expr>) -> Option<(&Expr, &Expr)> {
         }
     }
     None
+}
+
+/// The trailing value expression of a `switch`-expression arm: the last statement
+/// if it is a bare expression statement (the value the arm evaluates to). `None`
+/// for an arm that ends in control flow (`return`/`throw`) or is empty.
+fn case_value_expr(body: &[Stmt]) -> Option<&Expr> {
+    match body.last() {
+        Some(Stmt::Expr(e, _)) => Some(e),
+        _ => None,
+    }
+}
+
+/// A copy of a `switch`-expression arm body with its trailing value expression
+/// rewritten to assign to `tmp` (`… expr` → `… tmp = expr`). An arm that ends in
+/// control flow is left unchanged (it yields no value through fall-through).
+fn assign_last_to(body: &[Stmt], tmp: &str) -> Vec<Stmt> {
+    let mut out = body.to_vec();
+    if let Some(Stmt::Expr(e, line)) = out.last() {
+        let assign = Stmt::Expr(
+            Expr::Assign {
+                op: None,
+                target: Box::new(Expr::Ident(tmp.to_string())),
+                value: Box::new(e.clone()),
+            },
+            *line,
+        );
+        *out.last_mut().unwrap() = assign;
+    }
+    out
 }
 
 fn is_value_new(ty: &Type) -> bool {
@@ -4099,7 +4606,7 @@ fn unop(op: UnOp) -> &'static str {
     }
 }
 
-fn float_lit(s: &str) -> String {
+pub(crate) fn float_lit(s: &str) -> String {
     if s.ends_with('f') || s.ends_with('F') || s.contains('x') {
         s.to_string()
     } else {
@@ -4107,7 +4614,7 @@ fn float_lit(s: &str) -> String {
     }
 }
 
-fn escape_str(s: &str) -> String {
+pub(crate) fn escape_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 

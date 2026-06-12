@@ -55,7 +55,10 @@ class Demo {
 		var first = cat.shift();          // 1, cat=[2,3,4,5]
 		cat.unshift(9);                   // [9,2,3,4,5]
 		var li = [7, 3, 7, 1].lastIndexOf(7); // 2
-		return Std.string(cat.length) + "|" + Std.string(sl.length) + "|" + Std.string(first) + "|" + Std.string(li);
+		// filter (predicate lambda) then sort (comparator lambda, in-place).
+		var fs = [5, 2, 8, 1].filter(n -> n > 1); // [5, 2, 8]
+		fs.sort((a, b) -> a - b);                 // [2, 5, 8]
+		return Std.string(cat.length) + "|" + Std.string(sl.length) + "|" + Std.string(first) + "|" + Std.string(li) + "|" + fs.join(",");
 	}
 }
 "#;
@@ -140,5 +143,5 @@ fn stdlib_lowerings_compile_and_run() {
         stdout.contains("hello|world|world|world|x=42!|a-b-c|hi|TT|00FF"),
         "string lowerings wrong:\n{stdout}"
     );
-    assert!(stdout.contains("5|3|1|2"), "array lowerings wrong:\n{stdout}");
+    assert!(stdout.contains("5|3|1|2|2,5,8"), "array lowerings wrong:\n{stdout}");
 }
