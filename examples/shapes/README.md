@@ -39,7 +39,7 @@ from the `package examples.shapes;` declarations, so `--src` points at the
 folder holding the `.hx` sources):
 
 ```bash
-hatchet --src examples/shapes --out examples/shapes/out --force
+hatchet --src examples/shapes --out examples/shapes --force
 ```
 
 Then compile the generated C++ together with the hand-written `main.cpp`
@@ -47,7 +47,7 @@ Then compile the generated C++ together with the hand-written `main.cpp`
 
 ```bash
 cd examples/shapes
-g++ -std=c++98 -pedantic -Wall -I out main.cpp out/examples/shapes/*.cpp -o shapes
+g++ -std=c++98 -pedantic -Wall -I out main.cpp examples/shapes/*.cpp -o shapes
 ./shapes
 ```
 
