@@ -1,5 +1,3 @@
-![Hatchy - the Hatchet mascot!](/images/hatchy-small.png)
-
 # Hatchet
 
 **Hatchet** is a transpiler from [Haxe](https://haxe.org) 4.x to **C++98** — portable source that
@@ -271,3 +269,7 @@ backstop that enforces agreement with the native side.
 ## License
 
 This project is licensed under the MIT License — see the [LICENSE](LICENSE.md) file for details.
+
+![Hatchy - the Hatchet mascot!](/images/hatchy-small.png)
+
+(c) 2026 Andrew Grant Lind
