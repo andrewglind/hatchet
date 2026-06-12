@@ -1,10 +1,11 @@
 [package]
 name = "hatchet"
-version = "0.0.1-alpha"
+version = "0.1.0"
 edition = "2021"
 description = "Hatchet - a Haxe 4.x (focused subset) to C++98 transpiler for legacy platforms (Visual C++ 6.0, Windows 9x, older Unix)"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/andrewglind/hatchet"
 
 [[bin]]
 name = "hatchet"
@@ -16,3 +17,8 @@ path = "src/lib.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
