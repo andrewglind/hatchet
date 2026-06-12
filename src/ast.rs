@@ -442,7 +442,9 @@ pub struct GlobalVar {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decl {
-    Class(Class),
+    /// Boxed: `Class` is by far the largest declaration (fields + methods +
+    /// ctor), and `Decl`s live in per-file vectors — keep the enum small.
+    Class(Box<Class>),
     Interface(Interface),
     Enum(Enum),
     Typedef(Typedef),

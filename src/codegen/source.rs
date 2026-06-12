@@ -1761,7 +1761,7 @@ impl<'a> BodyGen<'a> {
         // post-check then sets the outer flag instead of breaking bare.)
         let needs_break_flag = self.loop_depth > 0
             && (cases.iter().any(|c| stmts_contain_loop_break(&c.body))
-                || default.map_or(false, stmts_contain_loop_break));
+                || default.is_some_and(stmts_contain_loop_break));
         let break_flag = if needs_break_flag {
             let f = self.fresh("brk");
             let _ = writeln!(out, "{t}bool {f} = false;");
@@ -2825,9 +2825,7 @@ impl<'a> BodyGen<'a> {
                 }
                 let info =
                     self.prog.resolve_type(std::slice::from_ref(tname), self.mi)?.clone();
-                if self.adt_enum(&info).is_none() {
-                    return None;
-                }
+                self.adt_enum(&info)?;
                 (info, n.clone())
             }
             _ => return None,
@@ -4822,12 +4820,12 @@ fn stmt_contains_loop_break(st: &Stmt) -> bool {
         Stmt::Break => true,
         Stmt::If { then, els, .. } => {
             stmt_contains_loop_break(then)
-                || els.as_deref().map_or(false, stmt_contains_loop_break)
+                || els.as_deref().is_some_and(stmt_contains_loop_break)
         }
         Stmt::Block(b) => stmts_contain_loop_break(b),
         Stmt::Switch { cases, default, .. } => {
             cases.iter().any(|c| stmts_contain_loop_break(&c.body))
-                || default.as_ref().map_or(false, |d| stmts_contain_loop_break(d))
+                || default.as_ref().is_some_and(|d| stmts_contain_loop_break(d))
         }
         Stmt::Try { body, catches, .. } => {
             stmt_contains_loop_break(body)

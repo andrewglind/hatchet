@@ -527,12 +527,12 @@ impl<'a> Parser<'a> {
 
         let line = self.line();
         match self.peek().clone() {
-            TokKind::Kw(Kw::Class) => Ok(Decl::Class(self.parse_class(
+            TokKind::Kw(Kw::Class) => Ok(Decl::Class(Box::new(self.parse_class(
                 meta,
                 modifiers.is_extern,
                 is_final_class,
                 is_abstract_class,
-            )?)),
+            )?))),
             TokKind::Kw(Kw::Interface) => Ok(Decl::Interface(self.parse_interface(meta)?)),
             // `enum abstract X(T) { … }` — Haxe's typed-constant idiom. An integral
             // backing lowers to a plain C++ `enum` (with explicit member values); a
