@@ -15,11 +15,11 @@ class Rectangle extends Shape {
 		this.height = height;
 	}
 
-	override public function area():Float {
+	public function area():Float {
 		return width * height;
 	}
 
-	override public function kind():ShapeKind {
+	public function kind():ShapeKind {
 		return RectKind;
 	}
 }

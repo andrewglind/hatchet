@@ -17,11 +17,11 @@ class Circle extends Shape {
 		this.radius = radius;
 	}
 
-	override public function area():Float {
+	public function area():Float {
 		return 3.14159 * radius * radius;
 	}
 
-	override public function kind():ShapeKind {
+	public function kind():ShapeKind {
 		return CircleKind;
 	}
 }
