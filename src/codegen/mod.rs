@@ -70,6 +70,23 @@ impl<'a> HeaderGen<'a> {
         // there is no `#define` form; native (`@:native`) finals come from the C++
         // engine and are not emitted.
         let mut ns_body = String::new();
+
+        // Forward declarations for classes/interfaces referenced *before* their
+        // own definition in this module (mutually-recursive types). Hatchet
+        // classes are reference types — every cross-class member/param/return is a
+        // pointer, which only needs a forward declaration — so this resolves all
+        // such cycles. Targeted: only the names actually referenced ahead of
+        // their definition, and never `@:native` types (whose real definition
+        // lives in the hand-written engine header). C++98 forbids forward-
+        // declaring an enum, so only class-kinded types are declared here.
+        let fwds = self.forward_decls();
+        if !fwds.is_empty() {
+            for name in &fwds {
+                let _ = writeln!(ns_body, "{}class {name};", tabs(base));
+            }
+            ns_body.push('\n');
+        }
+
         let mut emitted_const = false;
         for decl in &m.file.decls {
             if let Decl::Global(g) = decl {
@@ -190,6 +207,60 @@ impl<'a> HeaderGen<'a> {
             .collect::<Vec<_>>()
             .join(", ");
         Some(format!("{prefix}_EXPORT {ret} {prefix}_CALL {name}({params})"))
+    }
+
+    // ---- forward declarations ------------------------------------------
+
+    /// Class/interface (and ADT value-class) names this module must forward-
+    /// declare: those referenced by an *earlier*-emitted type in the module's
+    /// header, so a pointer/param/return to a not-yet-defined sibling resolves.
+    /// Returned in definition order. Excludes `@:native` types.
+    fn forward_decls(&self) -> Vec<String> {
+        let decls = &self.prog.modules[self.mi].file.decls;
+
+        // The local class-kinded types (the only things both forward-declarable
+        // in C++98 and emitted by Hatchet itself), with their definition order.
+        let mut def_order: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut emitted: Vec<&str> = Vec::new();
+        for d in decls {
+            let name = match d {
+                Decl::Class(c) if !has_meta(&c.meta, "native") => &c.name,
+                Decl::Interface(i) if !has_meta(&i.meta, "native") => &i.name,
+                // An ADT enum lowers to a value *class*, so it too can be a
+                // forward-declared target.
+                Decl::Enum(e) if !has_meta(&e.meta, "native") && e.is_adt() => &e.name,
+                _ => continue,
+            };
+            def_order.insert(name.clone(), emitted.len());
+            emitted.push(name);
+        }
+
+        let mut needed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut pos = 0usize;
+        for d in decls {
+            let is_emitted_type = matches!(d,
+                Decl::Class(c) if !has_meta(&c.meta, "native"))
+                || matches!(d, Decl::Interface(i) if !has_meta(&i.meta, "native"))
+                || matches!(d, Decl::Enum(e) if !has_meta(&e.meta, "native") && e.is_adt());
+            if !is_emitted_type {
+                continue;
+            }
+            let here = pos;
+            pos += 1;
+            for r in header_type_refs(d) {
+                if let Some(&def) = def_order.get(&r) {
+                    // referenced before it is defined → needs a forward decl
+                    if def > here {
+                        needed.insert(r);
+                    }
+                }
+            }
+        }
+
+        // Return in definition order (stable, readable) rather than alphabetical.
+        let mut out: Vec<String> = needed.into_iter().collect();
+        out.sort_by_key(|n| def_order.get(n).copied().unwrap_or(0));
+        out
     }
 
     // ---- enums ---------------------------------------------------------
@@ -457,8 +528,11 @@ impl<'a> HeaderGen<'a> {
         };
 
         let mut public = String::new();
+        // Hatchet never emits C++ `private`: Haxe `private` is accessible from
+        // subclasses (and Haxe has no "private even from subclasses" concept), so
+        // a hidden member maps to C++ `protected` — otherwise a subclass reaching
+        // an inherited member would compile in Haxe but be rejected by C++.
         let mut protected = String::new();
-        let mut private = String::new();
 
         // constructor + (inline, empty) destructor
         if let Some(ctor) = &c.ctor {
@@ -466,11 +540,17 @@ impl<'a> HeaderGen<'a> {
             let _ = writeln!(public, "{t}\t{}({params});", c.name);
         }
         // Destructor: empty by default, or freeing the pointers this class owns.
+        // A `@:stackOnly` value class is non-polymorphic and owns no heap, so its
+        // destructor is **non-virtual** — a vtable pointer would bloat `sizeof`
+        // and break the flat value layout that makes `std::vector<Foo>` and
+        // recursive-by-value composition work.
+        let is_value = has_meta(&c.meta, "stackOnly") || has_meta(&c.meta, "value");
+        let virt_dtor = if is_value { "" } else { "virtual " };
         let deletes = ownership::owned_deletes(self.prog, self.mi, &self.ns, c);
         if deletes.is_empty() {
-            let _ = writeln!(public, "{t}\tvirtual ~{}() {{}}", c.name);
+            let _ = writeln!(public, "{t}\t{virt_dtor}~{}() {{}}", c.name);
         } else {
-            let _ = writeln!(public, "{t}\tvirtual ~{}() {{", c.name);
+            let _ = writeln!(public, "{t}\t{virt_dtor}~{}() {{", c.name);
             for d in &deletes {
                 let _ = writeln!(public, "{t}\t\t{d}");
             }
@@ -516,8 +596,7 @@ impl<'a> HeaderGen<'a> {
                 format!("{t}\t{virt}{stat}{sig};\n")
             };
             match m.access {
-                Access::Protected => protected.push_str(&line),
-                Access::Private => private.push_str(&line),
+                Access::Private => protected.push_str(&line),
                 _ => public.push_str(&line),
             }
         }
@@ -529,11 +608,12 @@ impl<'a> HeaderGen<'a> {
             }
         }
 
-        // fields, grouped by access. A property's backing field is private when
-        // its writes are restricted (`null`/`never`) or routed (`set`) — the C++
-        // compiler then enforces the Haxe access rule — or when a custom getter
-        // backs it. A write-open property (`(null, default)`/`(never, default)`)
-        // stays a directly-writable field in its declared access group.
+        // fields, grouped by access. A property's backing field is hidden
+        // (`protected`) when its writes are restricted (`null`/`never`) or routed
+        // (`set`) — the C++ compiler then enforces the Haxe access rule — or when
+        // a custom getter backs it. A write-open property (`(null, default)`/
+        // `(never, default)`) stays a directly-writable field in its declared
+        // access group.
         for f in &c.fields {
             // Haxe physicality: a `(get, never)` property without `@:isVar` is
             // purely computed — it has no backing field at all (`(get, null)`
@@ -545,15 +625,14 @@ impl<'a> HeaderGen<'a> {
                 continue;
             }
             let line = format!("{t}\t{} {};\n", self.field_type(c, f, &nullable), f.name);
-            let private_backing =
+            let hidden_backing =
                 has_accessor(f) && (f.set != PropAccess::Default || f.get == PropAccess::Get);
-            if private_backing {
-                private.push_str(&line); // backing field
+            if hidden_backing {
+                protected.push_str(&line); // backing field
             } else {
                 match f.access {
                     Access::Public => public.push_str(&line),
-                    Access::Protected => protected.push_str(&line),
-                    _ => private.push_str(&line),
+                    _ => protected.push_str(&line),
                 }
             }
         }
@@ -577,10 +656,6 @@ impl<'a> HeaderGen<'a> {
         if !protected.is_empty() {
             let _ = writeln!(s, "{t}protected:");
             s.push_str(&protected);
-        }
-        if !private.is_empty() {
-            let _ = writeln!(s, "{t}private:");
-            s.push_str(&private);
         }
         let _ = writeln!(s, "{t}}};");
         s
@@ -610,13 +685,10 @@ impl<'a> HeaderGen<'a> {
     // ---- signatures & types --------------------------------------------
 
     fn method_signature(&self, m: &Function, _interface: bool) -> String {
-        let mut ret = match &m.ret {
+        let ret = match &m.ret {
             Some(ty) => self.prog.map_type_use(ty, self.mi, &self.ns),
             None => "void".to_string(),
         };
-        if has_meta(&m.meta, "readOnly") {
-            ret = format!("const {ret}");
-        }
         let name = m.name.clone().unwrap_or_else(|| "new".to_string());
         let params = self.params(&m.params);
         format!("{ret} {name}({params})")
@@ -938,6 +1010,91 @@ fn enum_default(prog: &Program, mi: usize, ns: &[String], ty: &Type) -> Option<S
 
 fn has_accessor(f: &Field) -> bool {
     f.get != PropAccess::Default || f.set != PropAccess::Default
+}
+
+/// The named types a class/interface/ADT-enum mentions in the parts that appear
+/// in its **header** definition — base list, field types, and method signatures
+/// (params + returns), plus enum-variant payloads. Bodies are excluded (they
+/// live in the `.cpp`, which sees every full definition). Used to decide which
+/// sibling types must be forward-declared. Returns the final path segment of
+/// each named type (e.g. `Proxy` for `pack.Proxy`).
+fn header_type_refs(d: &Decl) -> Vec<String> {
+    let mut out = Vec::new();
+    fn ty(t: &Type, out: &mut Vec<String>) {
+        match t {
+            Type::Named { path, params, .. } => {
+                if let Some(n) = path.last() {
+                    out.push(n.clone());
+                }
+                for p in params {
+                    ty(p, out);
+                }
+            }
+            Type::Anon(fields) => {
+                for f in fields {
+                    ty(&f.ty, out);
+                }
+            }
+            Type::Func { params, ret } => {
+                for p in params {
+                    ty(p, out);
+                }
+                ty(ret, out);
+            }
+        }
+    }
+    fn sig(f: &Function, out: &mut Vec<String>) {
+        for p in &f.params {
+            if let Some(t) = &p.ty {
+                ty(t, out);
+            }
+        }
+        if let Some(t) = &f.ret {
+            ty(t, out);
+        }
+    }
+    match d {
+        Decl::Class(c) => {
+            if let Some(b) = &c.extends {
+                ty(b, &mut out);
+            }
+            for i in &c.implements {
+                ty(i, &mut out);
+            }
+            for f in &c.fields {
+                if let Some(t) = &f.ty {
+                    ty(t, &mut out);
+                }
+            }
+            for m in c.methods.iter().chain(c.ctor.iter()) {
+                sig(m, &mut out);
+            }
+        }
+        Decl::Interface(i) => {
+            for b in &i.extends {
+                ty(b, &mut out);
+            }
+            for f in &i.fields {
+                if let Some(t) = &f.ty {
+                    ty(t, &mut out);
+                }
+            }
+            for m in &i.methods {
+                sig(m, &mut out);
+            }
+        }
+        Decl::Enum(e) => {
+            for v in &e.variants {
+                for p in &v.params {
+                    if let Some(t) = &p.ty {
+                        ty(t, &mut out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// Whether codegen synthesizes a trivial `GetX` for this property: reads are

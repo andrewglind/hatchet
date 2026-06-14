@@ -423,6 +423,16 @@ impl<'a> BodyGen<'a> {
         }
     }
 
+    /// Transfer ownership of a local out of the current function: drop it from
+    /// every scope's owned set so it is not freed at scope close. Used when a
+    /// scope-owned local is handed to a `@sink` parameter (the callee now owns
+    /// it) — the call-site counterpart to emitting a `new` argument inline.
+    fn transfer_owned(&mut self, name: &str) {
+        for scope in self.owned.iter_mut() {
+            scope.retain(|n| n != name);
+        }
+    }
+
     /// Emit `delete` statements for the current scope's owned locals, in reverse
     /// order of acquisition. Called just before the scope's closing brace.
     fn emit_owned_deletes(&mut self, out: &mut String, ind: usize) {
@@ -904,14 +914,10 @@ impl<'a> BodyGen<'a> {
     }
 
     fn return_type(&self, m: &Function) -> String {
-        let mut ret = match &m.ret {
+        match &m.ret {
             Some(t) => self.prog.map_type_use(t, self.mi, &self.ns),
             None => "void".to_string(),
-        };
-        if has_meta(&m.meta, "readOnly") {
-            ret = format!("const {ret}");
         }
-        ret
     }
 
     /// Parameters as they appear in the out-of-line definition (same spelling as
@@ -950,6 +956,17 @@ impl<'a> BodyGen<'a> {
                 None => Ty::default(),
             };
             let is_container = !ty.is_ptr && is_container_ty(&ty);
+            // `@sink` only means something for a heap pointer (a class, or a
+            // `Null<T>` value lowered to a pointer) — the caller transfers
+            // ownership of the pointed-to object. On a by-value parameter
+            // (primitive, String, value-struct, container) there is nothing to
+            // consume, so the tag is a no-op; flag it so it can't silently mislead.
+            if has_meta(&p.meta, "sink") && !ty.is_ptr {
+                self.warn(format!(
+                    "`@sink` on parameter `{}` has no effect — it is passed by value, not as an owned pointer",
+                    p.name
+                ));
+            }
             self.define_local(&p.name, ty);
             // after define_local, which clears any earlier shadow bookkeeping
             if is_container {
@@ -1058,7 +1075,10 @@ impl<'a> BodyGen<'a> {
                 // regardless of what the analysis would infer (e.g. a returned
                 // pointer the scope would otherwise leak). Pointer-only — `delete`ing
                 // a value local is meaningless.
-                let owns_heap = is_heap_new_init(init) || nullable_init;
+                let heap_new = init
+                    .as_ref()
+                    .is_some_and(|e| matches!(e, Expr::New(ty, _) if !self.value_new(ty)));
+                let owns_heap = heap_new || nullable_init;
                 let forced = *delete && is_ptr;
                 if forced || (owns_heap && !self.escaping.contains(name)) {
                     self.register_owned(&emit);
@@ -1070,8 +1090,17 @@ impl<'a> BodyGen<'a> {
                 // its destructor) stores it long-term, so it escapes this scope —
                 // emit it inline rather than hoisting it into a scope-owned local
                 // that would be deleted (leaving a dangling pointer in the field).
-                if self.pushes_new_into_owned_container(e) {
-                    self.new_args_escape = true;
+                if let Some(value) = self.push_into_retaining_container(e) {
+                    // a `new` value is emitted inline (the container keeps it)…
+                    if matches!(value, Expr::New(ty, _) if !self.value_new(ty)) {
+                        self.new_args_escape = true;
+                    }
+                    // …and an owned local handed to the container transfers out.
+                    if let Expr::Ident(name) = value {
+                        if self.lookup_local(name).is_some() {
+                            self.transfer_owned(name);
+                        }
+                    }
                 }
                 // Assigning into a field stores the value long-term, so its `new`
                 // arguments are owned by the receiver, not this scope. This holds
@@ -1315,7 +1344,7 @@ impl<'a> BodyGen<'a> {
         if dynamic {
             return ("catch (...)".to_string(), false);
         }
-        let p = Param { name: c.name.clone(), ty: c.ty.clone(), optional: false, default: None, rest: false };
+        let p = Param { name: c.name.clone(), ty: c.ty.clone(), optional: false, default: None, rest: false, meta: Vec::new() };
         (format!("catch ({})", super::param_decl(self.prog, self.mi, &self.ns, &p)), true)
     }
 
@@ -2305,6 +2334,16 @@ impl<'a> BodyGen<'a> {
                     let a = self.gen_args(args);
                     return (format!("std::string({a})"), Ty { base, ..Default::default() });
                 }
+                // `new` of a `@:stackOnly` class → a value temporary (`Foo(args)`),
+                // not a heap `new Foo(args)`: value semantics, no ownership.
+                if matches!(ty, Type::Named { path, .. } if self.prog.is_value_class(path, self.mi)) {
+                    let param_tys = self.ctor_param_types(ty);
+                    let a = self.gen_args_typed(args, &param_tys, false);
+                    return (
+                        format!("{base}({a})"),
+                        Ty { base, info: ty_named_info(self.prog, self.mi, ty), ..Default::default() },
+                    );
+                }
                 let param_tys = self.ctor_param_types(ty);
                 let owned = self.ctor_owned_params(ty);
                 let a = self.gen_args_owned(args, &param_tys, &owned, false);
@@ -2696,7 +2735,7 @@ impl<'a> BodyGen<'a> {
         // mirrors the Haxe (GC) semantics where the wrapper is collected but the
         // referenced value lives on.
         let (rcode, rty) = match recv {
-            Expr::New(ty, args) if !is_value_new(ty) => self.hoist_new_receiver(ty, args),
+            Expr::New(ty, args) if !self.value_new(ty) => self.hoist_new_receiver(ty, args),
             _ => self.gen_expr(recv),
         };
 
@@ -2854,7 +2893,8 @@ impl<'a> BodyGen<'a> {
                     self.err(msg);
                 }
             }
-            let a = self.gen_args_typed(args, &param_tys, overloaded);
+            let sink = self.callee_sink_params(&rty, method);
+            let a = self.gen_args_owned(args, &param_tys, &sink, overloaded);
             let ret = self.method_return_ty(&rty, method, args);
             if !rty.is_ptr {
                 return (format!("{rcode}{op}{method}({a})"), ret);
@@ -2911,7 +2951,8 @@ impl<'a> BodyGen<'a> {
                     self.err(msg);
                 }
             }
-            let a = self.gen_args_typed(args, &param_tys, overloaded);
+            let sink = self.callee_sink_params(&rty, method);
+            let a = self.gen_args_owned(args, &param_tys, &sink, overloaded);
             let ret = self.method_return_ty(&rty, method, args);
             return (format!("{rcode}{op}{method}({a})"), ret);
         }
@@ -2927,7 +2968,8 @@ impl<'a> BodyGen<'a> {
             // An aliased import (`import a.b.Foo as Bar;`) calls the real name.
             let callee = self.resolve_alias(fname);
             let param_tys = self.own_method_param_types(fname);
-            let a = self.gen_args_typed(args, &param_tys, false);
+            let sink = self.bare_sink_params(fname);
+            let a = self.gen_args_owned(args, &param_tys, &sink, false);
             let ret = self
                 .class_method_return(fname)
                 .or_else(|| self.free_fn_return(&callee))
@@ -3030,16 +3072,28 @@ impl<'a> BodyGen<'a> {
                     }
                     // A `new X(...)` argument is hoisted to an owned local (the
                     // caller frees it) unless the receiver escapes — or the callee
-                    // takes ownership of this parameter (an `@owned`/allocated field),
-                    // in which case the constructed object frees it, so it is emitted
-                    // inline to avoid a double-free.
-                    Expr::New(nty, _) if !is_value_new(nty) => {
+                    // takes ownership of this position (a `@sink` parameter, or a
+                    // constructor arg stored into an owned field), in which case
+                    // the receiver frees it, so it is emitted inline to avoid a
+                    // double-free.
+                    Expr::New(nty, _) if !self.value_new(nty) => {
                         let (code, vty) = self.gen_expr(a);
                         if owned.get(i).copied().unwrap_or(false) {
                             code
                         } else {
                             self.place_new_arg(code, vty)
                         }
+                    }
+                    // A scope-owned local handed to a `@sink` parameter: the
+                    // callee takes ownership, so transfer it (drop the scope-close
+                    // delete) rather than freeing here and dangling the callee's copy.
+                    Expr::Ident(name)
+                        if owned.get(i).copied().unwrap_or(false)
+                            && self.lookup_local(name).is_some() =>
+                    {
+                        let code = self.gen_expr(a).0;
+                        self.transfer_owned(name);
+                        code
                     }
                     _ => {
                         let (code, vty) = self.gen_expr(a);
@@ -3090,22 +3144,34 @@ impl<'a> BodyGen<'a> {
     /// Such a `new` escapes the current scope, so it must not be hoisted into a
     /// scope-owned local. Handles `field.push(...)`, `this.field.push(...)`, and
     /// `local.push(...)` (the receiver name is matched against the escape set).
-    fn pushes_new_into_owned_container(&self, e: &Expr) -> bool {
-        let Expr::Call(target, args) = e else { return false };
-        let Expr::Field(recv, method) = &**target else { return false };
+    /// If `e` is `container.push(v)` / `container.insert(k, v)` where the
+    /// container *retains* what is pushed beyond this scope — a class-owned
+    /// container field, or a local container that escapes (returned, or stored
+    /// into a field) — return the value expression `v`. Such a `v` comes to rest
+    /// in the container, so it must not be freed here: a `new` is emitted inline,
+    /// and an owned local has its ownership transferred to the container.
+    /// Like the free [`is_value_new`], but also treats a `new` of a
+    /// `@:stackOnly` class as a value construction (no heap, no ownership) — so
+    /// such a `new` is never hoisted into an owned local or freed.
+    fn value_new(&self, ty: &Type) -> bool {
+        is_value_new(ty)
+            || matches!(ty, Type::Named { path, .. } if self.prog.is_value_class(path, self.mi))
+    }
+
+    fn push_into_retaining_container(&self, e: &'a Expr) -> Option<&'a Expr> {
+        let Expr::Call(target, args) = e else { return None };
+        let Expr::Field(recv, method) = &**target else { return None };
         let value = match (method.as_str(), args.len()) {
             ("push", 1) => &args[0],
             ("insert", 2) => &args[1],
-            _ => return false,
+            _ => return None,
         };
-        if !matches!(value, Expr::New(ty, _) if !is_value_new(ty)) {
-            return false;
-        }
-        match &**recv {
-            Expr::Ident(n) => self.owned_containers.contains(n),
+        let retains = match &**recv {
+            Expr::Ident(n) => self.owned_containers.contains(n) || self.escaping.contains(n),
             Expr::Field(r, f) if matches!(**r, Expr::This) => self.owned_containers.contains(f),
             _ => false,
-        }
+        };
+        retains.then_some(value)
     }
 
     /// Build an anonymous struct into a hoisted temporary; return the temp name.
@@ -3561,6 +3627,39 @@ impl<'a> BodyGen<'a> {
             Some(m) => m.params.iter().map(|p| self.param_ty_in(p, self.mi)).collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Per-position `@sink` flags for a method on `recv`'s type: positions the
+    /// callee consumes, so a `new` passed there is emitted inline (the receiver
+    /// frees it) rather than freed by the caller.
+    fn callee_sink_params(&self, recv: &Ty, method: &str) -> Vec<bool> {
+        let Some(info) = &recv.info else { return Vec::new() };
+        let Some(decl) = self.prog.type_decl(info) else { return Vec::new() };
+        let methods = match decl {
+            Decl::Class(c) => &c.methods,
+            Decl::Interface(i) => &i.methods,
+            _ => return Vec::new(),
+        };
+        match methods.iter().find(|m| m.name.as_deref() == Some(method)) {
+            Some(m) => param_sink_flags(&m.params),
+            None => Vec::new(),
+        }
+    }
+
+    /// `@sink` flags for a bare call: an own-class method, else a module-level
+    /// free function of that name.
+    fn bare_sink_params(&self, name: &str) -> Vec<bool> {
+        if let Some(m) = self.class.methods.iter().find(|m| m.name.as_deref() == Some(name)) {
+            return param_sink_flags(&m.params);
+        }
+        for d in &self.prog.modules[self.mi].file.decls {
+            if let Decl::Function(f) = d {
+                if f.name.as_deref() == Some(name) {
+                    return param_sink_flags(&f.params);
+                }
+            }
+        }
+        Vec::new()
     }
 
     // ---- intrinsics ----------------------------------------------------
@@ -4968,12 +5067,6 @@ fn is_value_new(ty: &Type) -> bool {
     )
 }
 
-/// Is a `var` initialiser a heap allocation the scope owns — a `new X(...)` that
-/// is not a value type?
-fn is_heap_new_init(init: &Option<Expr>) -> bool {
-    matches!(init, Some(Expr::New(ty, _)) if !is_value_new(ty))
-}
-
 /// Is this declared type an explicit `Null<T>`?
 fn is_null_type(ty: &Option<Type>) -> bool {
     matches!(
@@ -5151,6 +5244,12 @@ fn is_container_ty(ty: &Ty) -> bool {
     ty.base.starts_with("std::vector") || ty.base.starts_with("std::map")
 }
 
+/// Per-position `@sink` flags for a parameter list — positions whose callee
+/// consumes (takes ownership of) what is passed, so the caller does not free it.
+fn param_sink_flags(params: &[Param]) -> Vec<bool> {
+    params.iter().map(|p| p.meta.iter().any(|m| m.name == "sink")).collect()
+}
+
 /// Container methods that mutate their receiver (the rest — `indexOf`, `copy`,
 /// `filter`, `get`, `keys`, … — read it). Drives the mutated-parameter lint.
 fn is_mutating_container_method(method: &str) -> bool {
@@ -5236,8 +5335,74 @@ pub(crate) fn float_lit(s: &str) -> String {
     s.to_string()
 }
 
+/// Translate the raw source text of a Haxe string literal into the body of a C++
+/// string literal (the part between the quotes). The lexer keeps escape
+/// sequences *uninterpreted* (Haxe `\n` is stored as backslash + `n`), so this
+/// must re-emit each Haxe escape as the matching C++ escape — not blindly double
+/// the backslash, which would turn `\n` into a literal backslash-n.
+///
+/// Most escapes are byte-identical between the two languages and pass straight
+/// through. Numeric byte escapes (`\0`, `\xHH`) are normalised to 3-digit octal,
+/// which is byte-exact and — unlike C++ `\x` (greedy) or short octal — can never
+/// absorb a following digit. Unicode escapes (`\u…`) have no single-byte C++98
+/// form on Hatchet's byte-oriented strings; they are passed through verbatim
+/// (the backslash preserved) and remain a documented limitation.
 pub(crate) fn escape_str(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\\' && i + 1 < b.len() {
+            let n = b[i + 1];
+            match n {
+                // byte-identical, non-greedy escapes — emit as-is
+                b'n' | b't' | b'r' | b'\\' | b'"' => {
+                    out.push(b'\\');
+                    out.push(n);
+                    i += 2;
+                }
+                // Haxe's escaped single quote needs no escaping inside C++ "..."
+                b'\'' => {
+                    out.push(b'\'');
+                    i += 2;
+                }
+                // numeric byte escapes → 3-digit octal (byte-exact, non-greedy)
+                b'0' => {
+                    out.extend_from_slice(b"\\000");
+                    i += 2;
+                }
+                b'x' if i + 3 < b.len()
+                    && (b[i + 2] as char).is_ascii_hexdigit()
+                    && (b[i + 3] as char).is_ascii_hexdigit() =>
+                {
+                    let v = u8::from_str_radix(&s[i + 2..i + 4], 16).unwrap();
+                    out.extend_from_slice(format!("\\{:03o}", v).as_bytes());
+                    i += 4;
+                }
+                // unknown escape (notably `\u` unicode, unrepresentable as one
+                // byte): keep the bytes verbatim, escaping the backslash so the
+                // emitted C++ is well-formed rather than silently mistranslated.
+                _ => {
+                    out.extend_from_slice(b"\\\\");
+                    i += 1;
+                }
+            }
+        } else {
+            // A bare character. Escape the C++-significant ones, and normalise any
+            // raw control bytes (from a multi-line literal) to their escapes.
+            match c {
+                b'"' => out.extend_from_slice(b"\\\""),
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                b'\n' => out.extend_from_slice(b"\\n"),
+                b'\t' => out.extend_from_slice(b"\\t"),
+                b'\r' => out.extend_from_slice(b"\\r"),
+                other => out.push(other),
+            }
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A segment of an interpolated string: a literal run or a `${...}` expression.

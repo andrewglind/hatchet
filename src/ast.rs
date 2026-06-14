@@ -79,8 +79,6 @@ pub struct StructField {
 pub enum Access {
     Public,
     Private,
-    /// `@:protected` (or `@:protected private`).
-    Protected,
     /// No explicit modifier — Haxe instance default is private.
     Default,
 }
@@ -307,6 +305,13 @@ pub struct Param {
     /// can flag it as `Unsupported` (varargs have no C++98 lowering here) instead
     /// of dying with a parse error.
     pub rest: bool,
+    /// Parameter metadata. Currently only `@sink` is meaningful: it marks a
+    /// parameter the callee *consumes* (takes ownership of), so a `new` passed at
+    /// this position is emitted inline (the receiver frees it) rather than freed
+    /// by the caller. The consuming-parameter counterpart to an owning `@owned`
+    /// field: `@owned` says "this object frees this member when it dies"; `@sink`
+    /// says "ownership transfers to the callee at this call".
+    pub meta: Vec<Meta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

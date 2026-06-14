@@ -264,15 +264,23 @@ fn run(args: Args) -> Result<(), String> {
         OutputMode::Stdout => "Emitted",
         OutputMode::DryRun => "Would generate",
     };
+    // In Files mode, report the resolved output directory so it is unambiguous
+    // where files landed — e.g. `--out .` mirrors the package layout under the
+    // current directory, which can surprise (`./json/…` for `package json`).
+    let location = if cfg.mode == OutputMode::Files {
+        format!(" in {}", cfg.out_dir.display())
+    } else {
+        String::new()
+    };
     if !errors.is_empty() {
         eprintln!();
         let n = diag::report(&errors);
         let skipped = errors_module_count(&errors);
-        cfg.info(&format!("\n{verb} {emitted} file(s); {skipped} module(s) skipped due to errors."));
+        cfg.info(&format!("\n{verb} {emitted} file(s){location}; {skipped} module(s) skipped due to errors."));
         return Err(format!("{n} error(s); {skipped} module(s) were not generated"));
     }
 
-    cfg.info(&format!("\n{verb} {emitted} file(s)."));
+    cfg.info(&format!("\n{verb} {emitted} file(s){location}."));
     Ok(())
 }
 

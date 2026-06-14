@@ -36,10 +36,33 @@ Supported today, end to end:
   namespace of typed `static const` constants, `namespace X_ { static const std::string A = "…"; }`,
   with the type mapping straight to its underlying C++ type), typedef structs and aliases, the
   fixed-width `UInt8/16/32` shims, and `@:native` interop wiring (which emits no code of its own,
-  only the includes it contributes).
-- **Members & access** — property accessors: every pair of `default`/`null`/`never` (pure access
-  control — lowered to direct field access, with C++ `private` approximating the Haxe rule, e.g.
-  `(default,null)`'s backing field is private behind a generated `GetX`); **custom accessors with
+  only the includes it contributes). **Mutually-recursive classes** in one module need no manual
+  ordering: Hatchet emits a **targeted forward declaration** (`class B;`) for any class/interface/ADT
+  it defines that is referenced before its own definition — and only those, never `@:native` types.
+  Since Hatchet classes are reference types (every cross-class member/param/return is a pointer), a
+  forward declaration is always sufficient, so cyclic type graphs "just work".
+- **Value classes (`@value`)** — a class tagged **`@value`** is emitted as a C++ **value type**
+  rather than a reference type: it keeps its methods, constructor and fields, but `new Foo(a)`
+  becomes a stack value `Foo(a)` (no heap), a field/`Array<Foo>` is held by value
+  (`Foo`/`std::vector<Foo>`), member access is `.`, the destructor is non-virtual (no vtable — a flat
+  value layout), and the ownership analysis never touches it (nothing to free). This gives a **value
+  object with methods** — the hand-written-C++ idiom of a small struct-with-behaviour — letting
+  value-heavy code (vectors, JSON-style trees) transliterate by value instead of being reimplemented
+  on the heap. A value type can't do C++ polymorphism, so `@value` + inheritance is rejected
+  (slicing), as is a field holding the class itself by value (an incomplete type — use an
+  `Array<Self>`); `Null<Foo>` still boxes to `Foo*`, as for any value type. `@value` types may be
+  nested freely (fields, array elements). The stricter **`@:stackOnly`** (real hxcpp metadata) also
+  makes a value class but adds hxcpp's stack-residence rule — it may *not* be nested as a field or
+  element (Hatchet flags that, steering to `@value`) — so it suits genuine stack-only locals while
+  staying portable to hxcpp. See the **Metadata** section for the full `@:` vs `@` split and the
+  dual-target notes.
+- **Members & access** — a Haxe `private` member maps to C++ **`protected`**, not `private`: Haxe
+  `private` is accessible from subclasses (and Haxe has no "private even from subclasses" concept),
+  so emitting C++ `private` would reject an inherited-member access that Haxe accepts. Hatchet
+  therefore never emits C++ `private` — hidden members are `protected` (still closed to outside code,
+  open to subclasses, matching Haxe). Property accessors: every pair of `default`/`null`/`never`
+  (pure access control — lowered to direct field access, the backing field hidden as `protected`
+  behind a generated `GetX` for `(default,null)`); **custom accessors with
   real Haxe routing** — a user-written `get_x`/`set_x` is emitted as a real method and **every
   access routes through it**, external and internal alike, except inside the property's own
   accessors (Haxe's recursion rule): reads become `get_x()`, writes become `set_x(v)` —
@@ -55,7 +78,7 @@ Supported today, end to end:
   callers never also free), and a setter that `return`s the field reads to the escape analysis as
   the value being handed out — the field then leans borrowed (leak over double-free, the standard
   bias; `@owned` opts the destructor in). `(get, default)` and `dynamic` access remain flagged as
-  unsupported. Also `@:protected`, `@:readOnly` (const-return), `@:decl` (DLL-export
+  unsupported. Also `@:decl` (DLL-export
   class), `@:overload(...)` (a call is resolved to the matching C++ overload by argument type, else a
   hard error), `extern inline` (`extern "C"` export via a portable macro), `abstract class` and
   `abstract function` (an abstract method becomes a pure virtual `virtual T f() = 0;`, declared and
@@ -149,7 +172,16 @@ Supported today, end to end:
   warns when a tag looks unsound (e.g. an `@owned` field that is also handed out); auto-inferring an
   injected pointer's ownership would need interprocedural call-site analysis and is a future improvement.
   A `new` passed to a constructor parameter the class owns is emitted **inline** — the constructed object
-  frees it — rather than hoisted into a scope-owned local that would double-free it. **On exception
+  frees it — rather than hoisted into a scope-owned local that would double-free it. A **method/function
+  parameter** can be marked **`@sink`** — **`function setKey(key, @sink val:JValue)`** — a *consuming*
+  parameter that takes ownership across the call (distinct from `@owned`, which says a *field* frees its
+  member when the object dies; `@sink` says ownership *transfers in* at this call): a `new` handed to a
+  `@sink` position is emitted inline, and an owned local handed there has its scope-close free dropped,
+  so the value is freed once (by the receiver) rather than dangled by the caller. This is the explicit
+  answer to a retaining method (`store(x)` that keeps `x`), which an intraprocedural analysis cannot
+  otherwise see; `@sink` on a by-value parameter (where there is nothing to consume) is flagged as a
+  no-op. A `new` pushed into a container that **escapes** the scope — a class-owned field container, or
+  a local container that is returned/stored — likewise comes to rest there and is not freed locally. **On exception
   unwind** (a `throw` inside a `try`), the scope-close frees do not run, so owned objects created in
   the `try` before the throw **leak** — a deliberate extension of the conservative bias (never a
   double-free/use-after-free); free them in the `catch` if it matters. (Exceptions must be enabled on
@@ -209,8 +241,54 @@ The idiomatic Hatchet patterns, in preference order:
 - **Return the result** instead of mutating an argument: `function doubled(xs:Array<Int>):Array<Int>`.
 - **Mutate a local copy** when a working copy is genuinely what you want.
 
+Conversely, when value semantics are what you *want* — small objects copied freely, composed by
+value, no heap — a `@value` **value class** (see *Declarations* above) is the deliberate tool:
+it carries methods like any class but behaves like a `struct`, matching the value-object idiom of
+hand-written C++.
+
 A future evolution may pass mutated container parameters by non-const reference (restoring Haxe
 semantics at the parameter boundary); until then, the lint is the contract.
+
+## Metadata
+
+Hatchet reacts to two kinds of metadata, kept deliberately separate. (Internally Hatchet matches
+metadata by **name** and ignores the `@:`/`@` prefix, but the prefix matters to *other* Haxe
+targets, so write each tag in the form shown.)
+
+**Haxe / hxcpp compiler metadata Hatchet honours (`@:…`)** — real metadata whose meaning Hatchet
+matches, so the same source behaves consistently under hxcpp:
+
+| Tag | Effect in Hatchet |
+|-----|-------------------|
+| `@:native("a::b::Name")` | Bind to a hand-written C++ type/function; emit its native name/namespace, no code of its own |
+| `@:include("p.h")` / `@:include("<h>")` | Emit an `#include` (quoted for a project header, angle-bracketed verbatim for a system one) |
+| `@:cppFileCode('…')` | Inject verbatim C++ at that point in a body (also real hxcpp) |
+| `@:overload(function(...){})` | Resolve a call to the matching C++ overload by argument type, else a hard error |
+| `@:isVar` | Force a physical backing field for a property (so `(get,never)` keeps storage) |
+| `@:decl` | Export a class from a DLL via the portable export macro |
+| `@:stackOnly` | A **value class** that also obeys hxcpp's stack-residence rule — may **not** be nested as a field/element (flagged, steering to `@value`). Portable; use for genuine stack-only value types |
+
+**Hatchet directives (user metadata, `@…`)** — Hatchet's own. The guiding rule: a user-metadata tag
+exists **only for a C++ reality Haxe genuinely cannot express** (manual memory ownership; value
+semantics where Haxe offers no construct). Anything Haxe *can* say — operators, casts,
+value-types-with-methods via `abstract`, access levels — is expressed in real Haxe, not invented
+here. Because these are plain user metadata, every other Haxe target ignores them, so the source
+stays portable.
+
+| Tag | Effect |
+|-----|--------|
+| `@value` | A **value class** (value type with methods) that may nest freely. Hatchet-specific: under hxcpp these are ordinary reference types, so only use where value-vs-reference behaviour doesn't matter (see below) |
+| `@owned` | A field the owning object frees in its destructor (a scalar via `delete`, a container element-by-element) |
+| `@sink` | A *consuming* parameter — the callee takes ownership of what is passed (caller does not free); the call-site counterpart to an owning field |
+| `@delete` | Free a marked local (`@delete var x = …`) at scope close |
+
+**Portability note.** The reference-semantic path — plain `class` plus `@owned`/`@sink`/`@delete` —
+is the one that compiles *and behaves the same* under both hxcpp (GC ignores the ownership tags) and
+Hatchet (the ownership analysis uses them). The value-semantic path (`@value`) has no portable hxcpp
+equivalent — hxcpp has no metadata that turns a plain Haxe class into a value type with methods — so
+a `@value` type is a value type under Hatchet and a reference type under hxcpp. For types that don't
+depend on the difference (small immutable values, build-once/read trees) that divergence is benign;
+for anything that relies on copy-vs-share semantics across both targets, stay on the reference path.
 
 ## Requirements
 

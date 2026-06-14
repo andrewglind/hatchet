@@ -137,6 +137,15 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
     for d in &m.file.decls {
         flag_properties(d, &file, &mut out);
     }
+    // `@:stackOnly` value classes: a value type cannot do C++ polymorphism
+    // (slicing through a base) or contain itself by value, so flag those shapes
+    // ahead of a confusing C++ error.
+    for d in &m.file.decls {
+        flag_stack_only(d, &file, &mut out);
+    }
+    // `@:stackOnly` types may not be nested (hxcpp's stack-residence rule) — flag
+    // them used as field/element types, steering to `@value`.
+    flag_stack_restricted_nesting(prog, mi, &file, &mut out);
     // `using` static extensions rewrite `a.f(b)` into `Module.f(a, b)` at the call
     // site, chosen by `a`'s type. Hatchet has no such call-site rewriting, so a
     // `using` would be silently ignored — flag it rather than drop it.
@@ -311,6 +320,108 @@ fn flag_macro_functions(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
 
 /// Flag every generic (type-parameterized) class, interface, method, or function
 /// declared in `d` as unsupported — Hatchet has no C++98 template lowering.
+/// Flag `@:stackOnly` (value-class) shapes C++ value semantics can't express:
+/// inheritance/`extends` (slicing — a value can't dispatch through a base), and
+/// a field that contains the class itself **by value** (an incomplete type; only
+/// a container of it, `Array<Self>`, is laid out as `std::vector<Self>`).
+fn flag_stack_only(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
+    let Decl::Class(c) = d else { return };
+    // Both Hatchet value tags: `@value` (nestable) and `@:stackOnly` (no nesting).
+    if !(has_meta(&c.meta, "stackOnly") || has_meta(&c.meta, "value")) {
+        return;
+    }
+    // These two constraints are plain C++ facts about value types, so they apply
+    // to *both* value tags regardless of the stack-residence rule.
+    if c.extends.is_some() || !c.implements.is_empty() {
+        out.push(Diagnostic::unsupported(
+            file.to_string(),
+            c.line,
+            format!(
+                "inheritance on the value class `{}` (a value type cannot dispatch polymorphically — C++ object slicing)",
+                c.name
+            ),
+        ));
+    }
+    for f in &c.fields {
+        // a *direct* field of the class's own type is an incomplete-type member;
+        // through a container it is fine (`std::vector<Self>`).
+        if matches!(&f.ty, Some(Type::Named { path, params, .. })
+            if params.is_empty() && path.last().map(|s| s.as_str()) == Some(c.name.as_str()))
+        {
+            out.push(Diagnostic::unsupported(
+                file.to_string(),
+                type_line(f.ty.as_ref().unwrap()),
+                format!(
+                    "the by-value self-field `{}` on value class `{}` (a value type cannot contain itself; hold it in an `Array<{}>` or make the class a reference type)",
+                    f.name, c.name, c.name
+                ),
+            ));
+        }
+    }
+}
+
+/// Flag a `@:stackOnly` type used where it cannot live on the stack — as a field
+/// type, or as a container element type — because hxcpp forbids exactly this
+/// (stack-residence). The fix is `@value`, the nestable Hatchet value class.
+/// (`@value` itself is exempt; its whole point is to be nestable.) Runs per
+/// module over its own declarations; the referenced type resolves cross-module.
+fn flag_stack_restricted_nesting(prog: &Program, mi: usize, file: &str, out: &mut Vec<Diagnostic>) {
+    // Does `ty` (directly, or as a container element) name a `@:stackOnly` type?
+    fn restricted_use<'a>(prog: &Program, mi: usize, ty: &'a Type) -> Option<&'a Type> {
+        let Type::Named { path, params, .. } = ty else { return None };
+        let name = path.last().map(|s| s.as_str()).unwrap_or("");
+        // `Array<T>`/`Map<K,V>` — recurse into the element/value types.
+        if container_template(name).is_some() {
+            return params.iter().find_map(|p| restricted_use(prog, mi, p));
+        }
+        if params.is_empty() && prog.is_stack_restricted(path, mi) {
+            return Some(ty);
+        }
+        None
+    }
+    let mut report = |ty: &Type, ctx: &str, name: &str| {
+        out.push(Diagnostic::unsupported(
+            file.to_string(),
+            type_line(ty),
+            format!(
+                "the `@:stackOnly` type `{name}` used {ctx} — hxcpp forbids a stack-only type from living off the stack; use `@value` for a nestable value class",
+                name = name,
+            ),
+        ));
+    };
+    let m = &prog.modules[mi];
+    for d in &m.file.decls {
+        let fields: Vec<&Field> = match d {
+            Decl::Class(c) => c.fields.iter().collect(),
+            Decl::Interface(i) => i.fields.iter().collect(),
+            _ => Vec::new(),
+        };
+        for f in fields {
+            if let Some(t) = &f.ty {
+                if let Some(bad) = restricted_use(prog, mi, t) {
+                    let n = match bad {
+                        Type::Named { path, .. } => path.last().cloned().unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    report(bad, &format!("as the type of field `{}`", f.name), &n);
+                }
+            }
+        }
+        // typedef struct fields too
+        if let Decl::Typedef(Typedef { target: TypedefTarget::Struct(sfields), name: tn, .. }) = d {
+            for sf in sfields {
+                if let Some(bad) = restricted_use(prog, mi, &sf.ty) {
+                    let n = match bad {
+                        Type::Named { path, .. } => path.last().cloned().unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    report(bad, &format!("as the type of field `{}` in typedef `{tn}`", sf.name), &n);
+                }
+            }
+        }
+    }
+}
+
 fn flag_generics(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
     fn flag_fn(f: &Function, label: &str, file: &str, fallback: usize, out: &mut Vec<Diagnostic>) {
         if f.type_params.is_empty() {

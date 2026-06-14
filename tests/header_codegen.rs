@@ -198,3 +198,26 @@ fn deeply_nested_generic_type_splits_the_unsigned_shift_token() {
         "triple-nested array field must parse and map:\n{out}"
     );
 }
+
+#[test]
+fn mutually_recursive_classes_get_targeted_forward_declarations() {
+    // `A` references `B` before `B` is defined, so `B` is forward-declared; `A`
+    // is defined first and is not forward-declared (targeted, not blanket).
+    let dir = std::env::temp_dir().join(format!("hatchet_fwd_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Pair.hx"),
+        "class A {\n  public var b:B;\n  public function new() {}\n  public function make():B { return b; }\n}\nclass B {\n  public var a:A;\n  public function new() {}\n}\n",
+    )
+    .unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let out = header(&prog, "Pair");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(out.contains("class B;"), "B is referenced before its definition → forward-declared:\n{out}");
+    assert!(!out.contains("class A;"), "A is defined first → no forward declaration (targeted):\n{out}");
+    // the forward declaration precedes the class definition that needs it
+    let fwd = out.find("class B;").unwrap();
+    let def = out.find("class A {").unwrap();
+    assert!(fwd < def, "forward declaration must precede the referring class:\n{out}");
+}

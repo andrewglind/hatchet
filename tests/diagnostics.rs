@@ -626,3 +626,85 @@ fn get_access_without_get_method_is_an_error() {
         errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Value classes (`@value` / `@:stackOnly`) — shapes value semantics can't
+// express, and the `@:stackOnly` stack-residence (no-nesting) rule.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn value_class_inheritance_is_unsupported() {
+    // Slicing — applies to both value tags; here via `@value`.
+    let (prog, idx) = program_from(
+        "Sh",
+        "@value class Base { public function new() {} }\n@value class Sh extends Base { public function new() { super(); } }\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("inheritance on the value class `Sh`")),
+        "expected a value-class inheritance diagnostic, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn value_class_self_by_value_field_is_unsupported_but_container_is_ok() {
+    // A `@value` type may nest, so `Array<Self>` is fine; a *direct* `self:Self`
+    // is still an incomplete-type member and is flagged.
+    let (prog, idx) = program_from(
+        "Node",
+        "@value class Node {\n  public var self:Node;\n  public var kids:Array<Node>;\n  public function new() {}\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.iter().any(|d| d.severity == Severity::Unsupported
+            && d.message.contains("by-value self-field `self`")),
+        "expected a by-value self-field diagnostic, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+    // a `@value` container of self is allowed — not flagged
+    assert!(
+        !errs.iter().any(|d| d.message.contains("`kids`") || d.message.contains("stackOnly")),
+        "a `@value` container of self must be allowed, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn stack_only_nesting_is_unsupported_steering_to_value() {
+    // `@:stackOnly` carries hxcpp's stack-residence rule: it may not be a field
+    // (or container element) of anything — only `@value` may nest. Both the
+    // direct field and the `Array<>` element are flagged.
+    let (prog, idx) = program_from(
+        "Use",
+        "@:stackOnly class Vec2 { public var x:Float; public function new() { x = 0.0; } }\nclass Entity {\n  public var pos:Vec2;\n  public var trail:Array<Vec2>;\n  public function new() {}\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    let msgs: Vec<&String> = errs.iter().map(|d| &d.message).collect();
+    assert!(
+        msgs.iter().any(|m| m.contains("`@:stackOnly` type `Vec2`") && m.contains("field `pos`")
+            && m.contains("use `@value`")),
+        "expected a stack-only-as-field diagnostic steering to @value, got: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("field `trail`")),
+        "the Array<Vec2> element should be flagged too, got: {msgs:?}"
+    );
+}
+
+#[test]
+fn value_class_may_be_nested() {
+    // The whole point of `@value` (vs `@:stackOnly`): it may be a field and a
+    // container element with no diagnostic.
+    let (prog, idx) = program_from(
+        "World",
+        "@value class Vec2 { public var x:Float; public function new() { x = 0.0; } }\nclass Entity {\n  public var pos:Vec2;\n  public var trail:Array<Vec2>;\n  public function new() {}\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        errs.is_empty(),
+        "a `@value` type must nest freely, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}

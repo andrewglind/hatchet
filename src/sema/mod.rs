@@ -53,6 +53,16 @@ pub struct TypeInfo {
     pub native_ns: Option<Vec<String>>,
     /// Explicit C++ name from `@:native("...::Name")`, else the Haxe name.
     pub native_name: Option<String>,
+    /// A **value class** — emitted as a C++ value type (stack, no
+    /// `new`/pointer/heap) rather than a reference type, so a class can carry
+    /// methods while having value semantics. Set by Hatchet's `@value` user
+    /// metadata or by `@:stackOnly`. Always `false` for non-classes.
+    pub is_value: bool,
+    /// A `@:stackOnly` value class specifically: hxcpp forbids such a type from
+    /// living anywhere but the stack, so Hatchet flags it being used as a field
+    /// or container element (steering to `@value`, which has no such rule). A
+    /// plain `@value` class is *not* stack-restricted.
+    pub stack_restricted: bool,
     pub module_index: usize,
 }
 
@@ -189,6 +199,13 @@ impl Program {
                 };
                 let is_native = has_meta(meta, "native");
                 let (native_ns, native_name) = native_target(meta);
+                // Value classes: Hatchet's `@value` (user metadata) or the
+                // `@:stackOnly` compiler metadata make a *class* a value type.
+                // `@:stackOnly` additionally carries hxcpp's stack-residence rule
+                // (no nesting). Only meaningful for classes.
+                let is_class = matches!(decl, Decl::Class(_));
+                let stack_restricted = is_class && has_meta(meta, "stackOnly");
+                let is_value = is_class && (stack_restricted || has_meta(meta, "value"));
                 self.types.push(TypeInfo {
                     name: name.clone(),
                     package: m.package.clone(),
@@ -196,6 +213,8 @@ impl Program {
                     is_native,
                     native_ns,
                     native_name,
+                    is_value,
+                    stack_restricted,
                     module_index: mi,
                 });
             }
@@ -330,11 +349,24 @@ impl Program {
         None
     }
 
-    /// Is `path`, as seen from `ctx_module`, a reference (pointer) type?
+    /// Is `path`, as seen from `ctx_module`, a reference (pointer) type? A value
+    /// class (`@value`/`@:stackOnly`) is class-kinded but value-represented, so
+    /// it is **not** a reference.
     pub fn is_reference(&self, path: &[String], ctx_module: usize) -> bool {
         self.resolve_type(path, ctx_module)
-            .map(|t| t.kind.is_reference())
+            .map(|t| t.kind.is_reference() && !t.is_value)
             .unwrap_or(false)
+    }
+
+    /// Whether `path` resolves to a value class (`@value` or `@:stackOnly`).
+    pub fn is_value_class(&self, path: &[String], ctx_module: usize) -> bool {
+        self.resolve_type(path, ctx_module).map(|t| t.is_value).unwrap_or(false)
+    }
+
+    /// Whether `path` resolves to a `@:stackOnly` (stack-restricted) value class
+    /// — one hxcpp forbids from being nested as a field/element.
+    pub fn is_stack_restricted(&self, path: &[String], ctx_module: usize) -> bool {
+        self.resolve_type(path, ctx_module).map(|t| t.stack_restricted).unwrap_or(false)
     }
 
     /// The kind of a referenced type, if known.

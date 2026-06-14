@@ -1991,3 +1991,147 @@ class MutWarn {
         "reads/copies/fields/locals/shadowing must not warn: {warnings:?}"
     );
 }
+
+#[test]
+fn string_escapes_translate_to_cpp_not_double_escaped() {
+    // The lexer keeps escape sequences uninterpreted (Haxe `\n` is stored as
+    // backslash + 'n'); codegen must re-emit them as the matching C++ escape,
+    // not double the backslash (which made `\n` a literal backslash-n and
+    // `"\"".code` the backslash's code instead of the quote's). Octal-normalises
+    // numeric byte escapes so they can never absorb a following digit.
+    let src = "\
+class Esc {
+  public function new() {}
+  public function nl():String { return \"a\\nb\"; }
+  public function quote():Int { return \"\\\"\".code; }
+  public function tab():Int { return \"\\t\".code; }
+  public function backslash():Int { return \"\\\\\".code; }
+  public function hex():String { return \"\\x41\\x42\"; }
+}
+";
+    let out = gen_one(src, "Esc");
+    assert!(out.contains("return \"a\\nb\";"), "`\\n` stays a single C++ escape:\n{out}");
+    assert!(
+        out.contains("((int)(unsigned char)(\"\\\"\")[0])"),
+        "`\"\\\"\".code` compares against the quote (34), not the backslash:\n{out}"
+    );
+    assert!(
+        out.contains("((int)(unsigned char)(\"\\t\")[0])"),
+        "`\\t.code` is the tab escape:\n{out}"
+    );
+    assert!(
+        out.contains("((int)(unsigned char)(\"\\\\\")[0])"),
+        "`\\\\.code` is a single backslash:\n{out}"
+    );
+    // \x41\x42 → octal \101\102 ("AB"), byte-exact and non-greedy.
+    assert!(out.contains("\\101\\102"), "hex byte escapes normalise to octal:\n{out}");
+}
+
+#[test]
+fn sink_parameter_transfers_ownership_no_double_free() {
+    // `@sink` on a parameter: a `new` passed there is emitted inline (the
+    // callee consumes it), and an owned local handed there transfers out — so
+    // the caller never frees what the callee retained (the use-after-free that
+    // an un-annotated retaining method would otherwise cause).
+    let src = "\
+class Node {
+  public var kids:Array<Node>;
+  public function new() { kids = []; }
+  public function adopt(@sink child:Node):Void {
+    kids.push(child);
+  }
+}
+class Tree {
+  public var root:Node;
+  public function new() { root = new Node(); }
+  public function grow():Void {
+    root.adopt(new Node());          // new at @sink position -> inline, no free
+    var extra = new Node();
+    root.adopt(extra);               // owned local -> ownership transferred
+  }
+}
+";
+    let out = gen_one(src, "Tree");
+    assert!(
+        out.contains("root->adopt(new Node())"),
+        "a `new` at a `@sink` position is emitted inline (no hoist/free):\n{out}"
+    );
+    assert!(
+        !out.contains("delete _v") && !out.contains("delete extra"),
+        "neither the inline new nor the transferred local is freed by the caller:\n{out}"
+    );
+}
+
+#[test]
+fn sink_on_value_parameter_is_warned() {
+    // `@sink` is meaningless on a by-value parameter — flag it as a no-op.
+    let src = "\
+class W {
+  public function new() {}
+  public function take(@sink n:Int):Void {}
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_sinkwarn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("W.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("W"))
+        .unwrap();
+    let (_, warnings, _) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        warnings.iter().any(|(_, w)| w.contains("`@sink` on parameter `n` has no effect")),
+        "expected a no-op `@sink` warning, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn value_class_is_a_value_type() {
+    // `@value` makes a class a value type: `new` is value construction (no heap),
+    // fields and `Array<T>` are by value, member access is `.`, and nothing is
+    // ever freed (no ownership). Unlike `@:stackOnly`, a `@value` type may nest
+    // (be a field / array element).
+    let src = "\
+@value
+class Vec2 {
+  public var x:Float;
+  public var y:Float;
+  public function new(x:Float, y:Float) { this.x = x; this.y = y; }
+  public function lenSq():Float { return x * x + y * y; }
+}
+class Use {
+  public var here:Vec2;
+  public function new() { here = new Vec2(0.0, 0.0); }
+  public function run():Float {
+    var v = new Vec2(3.0, 4.0);
+    var pts:Array<Vec2> = [];
+    pts.push(new Vec2(1.0, 2.0));
+    return v.lenSq() + pts[0].lenSq();
+  }
+}
+";
+    let head = {
+        let dir = std::env::temp_dir().join(format!("hatchet_so_h_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Use.hx"), src).unwrap();
+        let prog = Program::from_src_dir(&dir).expect("build program");
+        let idx = prog.modules.iter().position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Use")).unwrap();
+        let h = hatchet::codegen::generate_header(&prog, idx).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        h
+    };
+    // value field, and a non-virtual destructor (no vtable → flat value layout)
+    assert!(head.contains("Vec2 here;"), "value field is by value, not a pointer:\n{head}");
+    assert!(head.contains("\t~Vec2() {}"), "value class destructor is non-virtual:\n{head}");
+    assert!(!head.contains("virtual ~Vec2"), "no virtual destructor on a value class:\n{head}");
+
+    let out = gen_one(src, "Use");
+    assert!(out.contains("Vec2 v = Vec2(3.0, 4.0)"), "`new` is value construction, not heap:\n{out}");
+    assert!(out.contains("std::vector<Vec2>"), "Array<Vec2> is a value vector:\n{out}");
+    assert!(out.contains("pts.push_back(Vec2(1.0, 2.0))"), "pushed value, no heap:\n{out}");
+    assert!(out.contains("this->here = Vec2(0.0, 0.0)"), "value field init, no `new`:\n{out}");
+    assert!(!out.contains("new Vec2") && !out.contains("delete"), "no heap or frees for a value class:\n{out}");
+}

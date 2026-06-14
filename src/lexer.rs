@@ -541,8 +541,8 @@ mod tests {
     fn metadata() {
         assert_eq!(kinds("@:native"), vec![TokKind::Meta("native".into())]);
         assert_eq!(
-            kinds("@:readOnly public"),
-            vec![TokKind::Meta("readOnly".into()), TokKind::Kw(Kw::Public)]
+            kinds("@:keep public"),
+            vec![TokKind::Meta("keep".into()), TokKind::Kw(Kw::Public)]
         );
     }
 

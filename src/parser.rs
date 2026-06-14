@@ -829,9 +829,6 @@ impl<'a> Parser<'a> {
         let mut access = Access::Default;
         let mut is_static = false;
         let mut modifiers = FnModifiers::default();
-        if has_meta(&meta, "protected") {
-            access = Access::Protected;
-        }
         loop {
             match self.peek() {
                 TokKind::Kw(Kw::Public) => access = set_access(access, Access::Public),
@@ -988,6 +985,8 @@ impl<'a> Parser<'a> {
             return Ok(params);
         }
         loop {
+            // Leading parameter metadata (`@sink val:T`).
+            let meta = self.parse_meta_list()?;
             // Haxe 4.2 rest parameter (`...vals:Int`): parsed and marked so the
             // validation pass reports it cleanly instead of a parse error.
             let rest = self.eat_sym(Sym::DotDotDot);
@@ -1009,6 +1008,7 @@ impl<'a> Parser<'a> {
                 optional: optional || default.is_some(),
                 default,
                 rest,
+                meta,
             });
             if self.eat_sym(Sym::Comma) {
                 continue;
@@ -1803,6 +1803,7 @@ impl<'a> Parser<'a> {
                             optional: false,
                             default: None,
                             rest: false,
+                            meta: Vec::new(),
                         }],
                         ret: None,
                         body: Box::new(body),
@@ -2043,7 +2044,7 @@ impl<'a> Parser<'a> {
 }
 
 fn set_access(current: Access, new: Access) -> Access {
-    // explicit public/private win over default/protected metadata
+    // explicit public/private win over the default
     match current {
         Access::Default => new,
         other => other,
