@@ -8,7 +8,13 @@ use hatchet::sema::Program;
 
 /// Transpile a single synthetic `.hx` source and return class `stem`'s generated `.cpp`.
 fn gen_one(src: &str, stem: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("hatchet_t_{stem}_{}", std::process::id()));
+    // Unique per call: two tests may share a `stem`, and tests run in parallel, so
+    // keying the scratch dir on the stem alone lets them race in one directory.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir =
+        std::env::temp_dir().join(format!("hatchet_t_{stem}_{}_{uniq}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(format!("{stem}.hx")), src).unwrap();
     let prog = Program::from_src_dir(&dir).expect("build program");
@@ -2134,4 +2140,88 @@ class Use {
     assert!(out.contains("pts.push_back(Vec2(1.0, 2.0))"), "pushed value, no heap:\n{out}");
     assert!(out.contains("this->here = Vec2(0.0, 0.0)"), "value field init, no `new`:\n{out}");
     assert!(!out.contains("new Vec2") && !out.contains("delete"), "no heap or frees for a value class:\n{out}");
+}
+
+#[test]
+fn switch_case_on_final_constants_is_supported() {
+    // A `case` whose pattern is a `final` constant (not a literal or enum member)
+    // is a constant pattern — it lowers to the constant as a C++ case label, not
+    // a Haxe capture variable. Regression guard for the switch-pattern validator.
+    let src = "\
+final ALIENBEACH_SCENE_ID:Int = 0;
+final POINTS_SCENE_ID:Int = 1;
+class Factory {
+  public function new() {}
+  public function make(sceneId:Int):Int {
+    switch sceneId {
+      case ALIENBEACH_SCENE_ID: return 10;
+      case POINTS_SCENE_ID: return 20;
+      default: return -1;
+    }
+  }
+}
+";
+    let out = gen_one(src, "Factory");
+    assert!(out.contains("case ALIENBEACH_SCENE_ID:"), "final constant is a valid case label:\n{out}");
+    assert!(out.contains("case POINTS_SCENE_ID:"), "final constant is a valid case label:\n{out}");
+}
+
+#[test]
+fn value_position_switch_uses_the_expected_type_not_the_first_arm() {
+    // `return switch …` whose arms are different subclasses (+ null) must hoist
+    // the temporary as the *return type* (the common base), not the first arm's
+    // subclass — otherwise assigning a sibling subclass to it is nonsense C++.
+    let src = "\
+class Scene { public function new() {} }
+class AlienBeach extends Scene { public function new() { super(); } }
+class Points extends Scene { public function new() { super(); } }
+class Factory {
+  public function new() {}
+  public function make(id:Int):Scene {
+    return switch id {
+      case 0: new AlienBeach();
+      case 1: new Points();
+      default: null;
+    }
+  }
+}
+";
+    let out = gen_one(src, "Factory");
+    assert!(out.contains("Scene* _swx"), "temp is the base/return type, not the first arm:\n{out}");
+    assert!(!out.contains("AlienBeach* _swx"), "temp must not be typed as the first arm's subclass:\n{out}");
+    assert!(out.contains("_swx1 = new Points()"), "a sibling subclass assigns to the base temp:\n{out}");
+}
+
+#[test]
+fn abstract_newtype_lowers_to_a_value_class() {
+    // `abstract Name(U)` → a value class wrapping U in a synthetic `__this`
+    // field; `this` inside methods is the underlying value (`this->__this`);
+    // `new` is value construction (no heap); non-virtual destructor.
+    let src = "\
+abstract Meters(Float) {
+  public function new(v:Float) { this = v; }
+  public function doubled():Float { return this * 2.0; }
+}
+class Use {
+  public function new() {}
+  public function go():Float { var m = new Meters(3.5); return m.doubled(); }
+}
+";
+    let head = {
+        let dir = std::env::temp_dir().join(format!("hatchet_abs_h_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Use.hx"), src).unwrap();
+        let prog = Program::from_src_dir(&dir).expect("build program");
+        let idx = prog.modules.iter().position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Use")).unwrap();
+        let h = hatchet::codegen::generate_header(&prog, idx).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        h
+    };
+    assert!(head.contains("double __this;"), "underlying wrapped in __this:\n{head}");
+    assert!(head.contains("\t~Meters() {}"), "value class: non-virtual destructor:\n{head}");
+
+    let out = gen_one(src, "Use");
+    assert!(out.contains("this->__this = v;"), "`this = v` writes the underlying:\n{out}");
+    assert!(out.contains("return this->__this * 2.0;"), "`this` reads the underlying:\n{out}");
+    assert!(out.contains("Meters m = Meters(3.5)"), "`new` is value construction:\n{out}");
 }

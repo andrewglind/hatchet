@@ -184,6 +184,15 @@ fn run(args: Args) -> Result<(), String> {
     // guard); a StdAfx.h is emitted into each one afterwards.
     let mut header_dirs: std::collections::BTreeMap<Vec<String>, Vec<String>> =
         std::collections::BTreeMap::new();
+    // Modules actually run through codegen (everything but the never-emitted
+    // `Main.hx` / `StdAfx.hx`), for a `[i/N] file` progress line per module so a
+    // large run visibly makes progress rather than appearing to hang.
+    let total = prog
+        .modules
+        .iter()
+        .filter(|m| !discover::is_main(&m.path) && !m.is_stdafx)
+        .count();
+    let mut processed = 0usize;
     for (i, m) in prog.modules.iter().enumerate() {
         // `Main.hx` is the hxcpp entry point and is never transpiled; `StdAfx.hx`
         // is never emitted directly (the StdAfx pass produces the prelude header
@@ -191,6 +200,10 @@ fn run(args: Args) -> Result<(), String> {
         if discover::is_main(&m.path) || m.is_stdafx {
             continue;
         }
+        // Announce the module before generating it, so a crash or a slow file is
+        // attributable to the one named here.
+        processed += 1;
+        cfg.info(&format!("[{processed}/{total}] {}", module_rel(m, "hx")));
 
         // Fail loudly rather than guess: a module that references a type Hatchet
         // cannot resolve — or uses a construct Hatchet does not yet support — is not

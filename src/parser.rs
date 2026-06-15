@@ -222,17 +222,6 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
-    /// The next token if it is an identifier (consuming it), else `None`. Used to
-    /// pick up the optional name of a skipped declaration for its diagnostic.
-    fn opt_ident(&mut self) -> Option<String> {
-        if let TokKind::Ident(n) = self.peek() {
-            let n = n.clone();
-            self.bump();
-            Some(n)
-        } else {
-            None
-        }
-    }
 
     /// Skip a declaration body: advance to the next `{`, then consume the balanced
     /// `{ … }` group. Used for declarations Hatchet recognises but does not yet
@@ -543,13 +532,11 @@ impl<'a> Parser<'a> {
                 Ok(Decl::Enum(self.parse_enum_abstract(meta)?))
             }
             TokKind::Kw(Kw::Enum) => self.parse_enum(meta),
-            // A bare `abstract X(Int) { … }` type (the `abstract class` form is
-            // handled by the modifier loop above). Skip the body and flag it.
+            // A bare `abstract X(T) { … }` newtype (the `abstract class` form is
+            // handled by the modifier loop above). Lowered to a value class.
             TokKind::Kw(Kw::Abstract) => {
                 self.bump(); // abstract
-                let name = self.opt_ident();
-                self.skip_braced_body()?;
-                Ok(Decl::Unsupported { feature: labelled("an `abstract` type", name), line })
+                self.parse_abstract(meta, line)
             }
             TokKind::Kw(Kw::Typedef) => self.parse_typedef(meta),
             TokKind::Kw(Kw::Function) => {
@@ -614,6 +601,7 @@ impl<'a> Parser<'a> {
             is_extern,
             is_final,
             is_abstract,
+            abstract_underlying: None,
             meta,
             fields: Vec::new(),
             methods: Vec::new(),
@@ -627,6 +615,64 @@ impl<'a> Parser<'a> {
         }
         self.expect_sym(Sym::RBrace)?;
         Ok(class)
+    }
+
+    /// Parse `abstract Name(Underlying) [from/to …] { members }` — a Haxe
+    /// newtype. Lowered to a value `Class` that wraps the underlying in a
+    /// synthetic `__this` field; the abstract's methods become the class's
+    /// methods, and `this` inside them denotes the underlying value. The leading
+    /// `abstract` keyword is already consumed.
+    fn parse_abstract(&mut self, meta: Vec<Meta>, line: usize) -> PResult<Decl> {
+        let name = self.expect_ident()?;
+        self.parse_type_params()?; // generic abstracts not supported; discard
+        // The underlying type `(T)`.
+        self.expect_sym(Sym::LParen)?;
+        let underlying = self.parse_type()?;
+        self.expect_sym(Sym::RParen)?;
+        // Skip any `from`/`to`/`to`-cast header clauses up to the body — the
+        // implicit-cast-to-underlying forms are not modelled; `@:to`/`@:from`
+        // methods inside the body are.
+        while !self.at_sym(Sym::LBrace) && !self.at_eof() {
+            self.bump();
+        }
+        self.expect_sym(Sym::LBrace)?;
+
+        // The synthetic field that holds the underlying value. The abstract's
+        // `this` rewrites to it during codegen.
+        let this_field = Field {
+            name: "__this".to_string(),
+            ty: Some(underlying.clone()),
+            init: None,
+            access: Access::Private,
+            is_static: false,
+            is_final: false,
+            get: PropAccess::Default,
+            set: PropAccess::Default,
+            meta: Vec::new(),
+        };
+        let mut class = Class {
+            name,
+            line,
+            type_params: vec![],
+            extends: None,
+            implements: vec![],
+            is_extern: false,
+            is_final: false,
+            is_abstract: false,
+            abstract_underlying: Some(underlying),
+            meta,
+            fields: vec![this_field],
+            methods: Vec::new(),
+            ctor: None,
+        };
+        while !self.at_sym(Sym::RBrace) && !self.at_eof() {
+            if self.eat_sym(Sym::Semi) {
+                continue;
+            }
+            self.parse_member_into(&mut class)?;
+        }
+        self.expect_sym(Sym::RBrace)?;
+        Ok(Decl::Class(Box::new(class)))
     }
 
     fn parse_interface(&mut self, meta: Vec<Meta>) -> PResult<Interface> {
@@ -662,6 +708,7 @@ impl<'a> Parser<'a> {
                 is_extern: false,
                 is_final: false,
                 is_abstract: false,
+                abstract_underlying: None,
                 meta: vec![],
                 fields: vec![],
                 methods: vec![],
@@ -2067,15 +2114,6 @@ fn flatten_or_pattern(e: Expr) -> Vec<Expr> {
 /// Is this pattern Haxe's `_` wildcard?
 fn is_wildcard_pattern(e: &Expr) -> bool {
     matches!(e, Expr::Ident(n) if n == "_")
-}
-
-/// Append a parsed name to an unsupported-feature label, e.g.
-/// `labelled("an `abstract` type", Some("Color"))` → "an `abstract` type (`Color`)".
-fn labelled(base: &str, name: Option<String>) -> String {
-    match name {
-        Some(n) => format!("{base} (`{n}`)"),
-        None => base.to_string(),
-    }
 }
 
 #[cfg(test)]

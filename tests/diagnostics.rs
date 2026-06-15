@@ -291,19 +291,17 @@ fn is_is_a_contextual_keyword_not_reserved() {
 }
 
 #[test]
-fn abstract_type_is_unsupported() {
-    // A bare `abstract` type is parsed-and-skipped and flagged on its line (2).
+fn abstract_newtype_is_supported() {
+    // An `abstract Name(U)` newtype now lowers to a value class — no longer
+    // flagged as unsupported.
     let (prog, idx) = program_from(
         "Meters",
-        "package p;\nabstract Meters(Float) {\n  public inline function new(v:Float) { this = v; }\n}\n",
+        "package p;\nabstract Meters(Float) {\n  public inline function new(v:Float) { this = v; }\n  public function doubled():Float { return this * 2.0; }\n}\n",
     );
     let errs = unsupported_construct_errors(&prog, idx);
     assert!(
-        errs.iter().any(|d| d.severity == Severity::Unsupported
-            && d.message.contains("`abstract` type")
-            && d.message.contains("Meters")
-            && d.line == 2),
-        "expected an Unsupported `abstract` diagnostic on line 2, got: {:?}",
+        !errs.iter().any(|d| d.message.contains("`abstract`")),
+        "an abstract newtype must not be flagged unsupported, got: {:?}",
         errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
     );
 }
@@ -705,6 +703,22 @@ fn value_class_may_be_nested() {
     assert!(
         errs.is_empty(),
         "a `@value` type must nest freely, got: {:?}",
+        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn switch_case_final_constant_is_not_a_capture() {
+    // A `final` constant used as a bare `case` pattern must NOT be flagged as a
+    // capture variable (the regression where finals tripped the pattern check).
+    let (prog, idx) = program_from(
+        "Disp",
+        "final A_ID:Int = 0;\nfinal B_ID:Int = 1;\nclass Disp {\n  public function new() {}\n  public function pick(id:Int):Int {\n    switch id { case A_ID: return 1; case B_ID: return 2; default: return 0; }\n  }\n}\n",
+    );
+    let errs = unsupported_construct_errors(&prog, idx);
+    assert!(
+        !errs.iter().any(|d| d.message.contains("capture pattern")),
+        "final constants must not be treated as capture patterns, got: {:?}",
         errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
     );
 }

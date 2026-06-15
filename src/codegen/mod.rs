@@ -544,7 +544,9 @@ impl<'a> HeaderGen<'a> {
         // destructor is **non-virtual** — a vtable pointer would bloat `sizeof`
         // and break the flat value layout that makes `std::vector<Foo>` and
         // recursive-by-value composition work.
-        let is_value = has_meta(&c.meta, "stackOnly") || has_meta(&c.meta, "value");
+        let is_value = has_meta(&c.meta, "stackOnly")
+            || has_meta(&c.meta, "value")
+            || c.abstract_underlying.is_some();
         let virt_dtor = if is_value { "" } else { "virtual " };
         let deletes = ownership::owned_deletes(self.prog, self.mi, &self.ns, c);
         if deletes.is_empty() {
@@ -598,6 +600,20 @@ impl<'a> HeaderGen<'a> {
             match m.access {
                 Access::Private => protected.push_str(&line),
                 _ => public.push_str(&line),
+            }
+            // `@:op(...)` on an abstract method → an additive C++ operator that
+            // forwards to the named method (so the value reads as `a[k]` / `a + b`
+            // *and* `a.method(...)`). The named method above is still emitted.
+            if let Some(fwd) = self.op_forwarder(m) {
+                public.push_str(&format!("{t}\t{fwd}\n"));
+            }
+            // `@:to` → an implicit conversion operator; `@:from` → a converting
+            // constructor. Both forward to the named (instance/static) method.
+            if let Some(fwd) = self.to_forwarder(m) {
+                public.push_str(&format!("{t}\t{fwd}\n"));
+            }
+            if let Some(ctor) = self.converting_ctor(c, m) {
+                public.push_str(&format!("{t}\t{ctor}\n"));
             }
         }
 
@@ -680,6 +696,56 @@ impl<'a> HeaderGen<'a> {
             );
         }
         s
+    }
+
+    /// If `m` carries `@:op(...)`, the inline C++ operator that forwards to it
+    /// (e.g. `Proxy operator[](int k) { return get(k); }`), else `None`. The
+    /// operator's return/parameter types mirror the method's; unsupported op
+    /// forms (the 2-arg `[]` write, `a.b`, `a()`, postfix) yield `None` here and
+    /// are flagged by the validation pass.
+    fn op_forwarder(&self, m: &Function) -> Option<String> {
+        let name = m.name.as_ref()?;
+        let arg = m.meta.iter().find(|me| me.name == "op").and_then(|me| me.first_arg())?;
+        let token = cpp_operator(arg, m.params.len())?;
+        let ret = match &m.ret {
+            Some(ty) => self.prog.map_type_use(ty, self.mi, &self.ns),
+            None => "void".to_string(),
+        };
+        let params = self.params(&m.params);
+        let arg_names = m
+            .params
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!("{ret} operator{token}({params}) {{ return {name}({arg_names}); }}"))
+    }
+
+    /// If `m` carries `@:to`, an implicit C++ conversion operator forwarding to
+    /// it: `operator T() { return toX(); }` (non-`const`, so it may call the
+    /// non-const named method). Expects a 0-parameter instance method.
+    fn to_forwarder(&self, m: &Function) -> Option<String> {
+        let name = m.name.as_ref()?;
+        if !has_meta(&m.meta, "to") || m.modifiers.is_static || !m.params.is_empty() {
+            return None;
+        }
+        let target = self.prog.map_type_use(m.ret.as_ref()?, self.mi, &self.ns);
+        Some(format!("operator {target}() {{ return {name}(); }}"))
+    }
+
+    /// If `m` carries `@:from` (a static, single-parameter factory returning the
+    /// abstract), a *converting constructor* forwarding to it, so the source type
+    /// implicitly converts to the abstract: `Foo(Src s) { *this = fromX(s); }`.
+    fn converting_ctor(&self, c: &Class, m: &Function) -> Option<String> {
+        let name = m.name.as_ref()?;
+        if !has_meta(&m.meta, "from") || !m.modifiers.is_static || m.params.len() != 1 {
+            return None;
+        }
+        let p = &m.params[0];
+        let decl = param_decl(self.prog, self.mi, &self.ns, p);
+        // strip any ` = default` (a converting ctor parameter has none)
+        let decl = decl.split(" = ").next().unwrap_or(&decl);
+        Some(format!("{}({decl}) {{ *this = {name}({}); }}", c.name, p.name))
     }
 
     // ---- signatures & types --------------------------------------------
@@ -1104,6 +1170,35 @@ fn header_type_refs(d: &Decl) -> Vec<String> {
 /// (`(null, …)`/`(never, …)`) has no external reads to serve.
 fn generated_getter(f: &Field) -> bool {
     f.get == PropAccess::Default && f.set != PropAccess::Default
+}
+
+/// Map a `@:op(...)` argument to the C++ operator token to emit (so the caller
+/// writes `operator<token>`), given the method's parameter count. Supports:
+/// `[]` read (1 param) → subscript; binary `A op B` (1 param); prefix unary
+/// `op A` (0 params). Returns `None` for forms with no C++98 operator mapping —
+/// the 2-arg `[]` write, postfix, `a.b` field access, `a()` call — which the
+/// validation pass flags instead.
+pub(crate) fn cpp_operator(arg: &str, n_params: usize) -> Option<String> {
+    let a = arg.trim();
+    // Array read: `@:op([])` with one parameter (the index). The two-parameter
+    // write form has no C++ `operator[]` equivalent (it must return a reference).
+    if a == "[]" {
+        return (n_params == 1).then(|| "[]".to_string());
+    }
+    // The operator symbol is whatever remains after dropping the `A`/`B` operand
+    // placeholders and whitespace (`A << B` → `<<`, `-A` → `-`).
+    let sym: String = a
+        .chars()
+        .filter(|c| !c.is_alphanumeric() && *c != '_' && !c.is_whitespace())
+        .collect();
+    const BINARY: &[&str] = &[
+        "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=", "&", "|", "^", "<<", ">>",
+        "&&", "||",
+    ];
+    const UNARY: &[&str] = &["-", "!", "~"];
+    let ok = (n_params == 1 && BINARY.contains(&sym.as_str()))
+        || (n_params == 0 && UNARY.contains(&sym.as_str()));
+    ok.then_some(sym)
 }
 
 /// Whether a `set`-access property has a user-written `set_x` (real Haxe

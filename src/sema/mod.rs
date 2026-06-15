@@ -205,7 +205,13 @@ impl Program {
                 // (no nesting). Only meaningful for classes.
                 let is_class = matches!(decl, Decl::Class(_));
                 let stack_restricted = is_class && has_meta(meta, "stackOnly");
-                let is_value = is_class && (stack_restricted || has_meta(meta, "value"));
+                // An `abstract Name(U)` newtype is always a value type (a value
+                // class wrapping `U`), in addition to the explicit `@value` /
+                // `@:stackOnly` tags.
+                let is_abstract_newtype =
+                    matches!(decl, Decl::Class(c) if c.abstract_underlying.is_some());
+                let is_value =
+                    is_class && (stack_restricted || is_abstract_newtype || has_meta(meta, "value"));
                 self.types.push(TypeInfo {
                     name: name.clone(),
                     package: m.package.clone(),

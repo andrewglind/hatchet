@@ -56,6 +56,23 @@ Supported today, end to end:
   element (Hatchet flags that, steering to `@value`) — so it suits genuine stack-only locals while
   staying portable to hxcpp. See the **Metadata** section for the full `@:` vs `@` split and the
   dual-target notes.
+- **Abstract types (`abstract Name(U)`)** — Haxe's newtype: a **value type with methods** over an
+  underlying type `U`, lowered to a value class that wraps `U` in a synthetic `__this` field. Inside
+  its methods Haxe `this` *is* the underlying value (so `this = v` and `this.field` operate on `U`),
+  and `new Name(...)` is value construction. This is the portable, idiomatic way to get a value
+  object with operators and conversions (the previous `@value` is the Hatchet-specific shortcut for
+  the no-operator case). Supported member metadata:
+  - **`@:op(...)`** operator overloading, emitted as a C++ operator that forwards to the named
+    method (so the value reads as `v[k]` / `a + b` *and* `v.method(...)`, with C++ doing the
+    operator resolution): `@:op([])` (one-arg read) → `operator[]`, `@:op(A op B)` → the binary
+    `operator op`, and prefix unary `@:op(-A)` / `!A` / `~A`. Forms with no C++98 mapping — the
+    two-arg `@:op([])` write, `@:op(a.b)`, `@:op(a())`, postfix — are flagged as unsupported.
+  - **`@:to`** → an implicit C++ conversion operator (`@:to function toStr():String` →
+    `operator std::string()`), and **`@:from`** (a static factory) → a converting constructor, so the
+    source type implicitly converts to the abstract.
+
+  Generic abstracts and `@:multiType` are not supported; an `abstract`'s value-class nature means the
+  same caveats as `@value` (no polymorphism; nests freely; `Null<Name>` boxes to `Name*`).
 - **Members & access** — a Haxe `private` member maps to C++ **`protected`**, not `private`: Haxe
   `private` is accessible from subclasses (and Haxe has no "private even from subclasses" concept),
   so emitting C++ `private` would reject an inherited-member access that Haxe accepts. Hatchet
@@ -266,6 +283,8 @@ matches, so the same source behaves consistently under hxcpp:
 | `@:overload(function(...){})` | Resolve a call to the matching C++ overload by argument type, else a hard error |
 | `@:isVar` | Force a physical backing field for a property (so `(get,never)` keeps storage) |
 | `@:decl` | Export a class from a DLL via the portable export macro |
+| `@:op(...)` | (on an `abstract` method) operator overloading → a C++ operator forwarding to the method: `@:op([])` read → `operator[]`, `@:op(A op B)` → binary `operator op`, prefix unary `@:op(-A)` |
+| `@:to` / `@:from` | (on an `abstract` method) `@:to` → an implicit conversion operator; `@:from` (static) → a converting constructor |
 | `@:stackOnly` | A **value class** that also obeys hxcpp's stack-residence rule — may **not** be nested as a field/element (flagged, steering to `@value`). Portable; use for genuine stack-only value types |
 
 **Hatchet directives (user metadata, `@…`)** — Hatchet's own. The guiding rule: a user-metadata tag
@@ -405,10 +424,11 @@ template lowering, so each is flagged rather than emitted with `T` as a bare unk
 **`(get, default)` properties and `dynamic`
 access** (every other accessor pair is lowered — see *Members & access* above — and a stray
 `get_x`/`set_x` whose field does not declare the matching access kind is flagged rather than
-silently dropped); and ordinary **`abstract` types** (the
-`abstract X(T)` newtype form — distinct
-from `enum abstract`, which *is* supported, and from an `abstract class`, also supported). These are
-parsed but not transpiled, so they are reported with a clean diagnostic rather than a parse error.
+silently dropped); **generic / `@:multiType` abstracts** (a plain `abstract X(T)` newtype *is*
+supported — see *Declarations* — but a type-parameterized or multitype one is not); and **`@:op`
+forms with no C++98 operator** (the two-arg `@:op([])` write, `@:op(a.b)`, `@:op(a())`, postfix).
+These are parsed but not transpiled, so they are reported with a clean diagnostic rather than a
+parse error.
 Relatedly, a `for` loop over anything other than a range,
 an `Array`, or a `Map` (a custom `Iterator`/`Iterable`) is a hard error rather than a guess.
 

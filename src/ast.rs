@@ -369,6 +369,11 @@ pub struct Class {
     pub is_extern: bool,
     pub is_final: bool,
     pub is_abstract: bool,
+    /// When `Some(U)`, this class was synthesized from a Haxe `abstract Name(U)`
+    /// newtype: it is a **value type** wrapping `U` in a synthetic `__this` field,
+    /// and inside its methods `this` refers to that underlying value (`U`), not
+    /// the C++ `this` pointer. `None` for an ordinary class.
+    pub abstract_underlying: Option<Type>,
     pub meta: Vec<Meta>,
     pub fields: Vec<Field>,
     pub methods: Vec<Function>,

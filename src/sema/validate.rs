@@ -107,15 +107,39 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
     // other bare identifier in a pattern is a Haxe capture variable, which has no
     // lowering (it would be emitted as a bare C++ `case` label).
     let mut enums: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // `final` constants (module-level finals and static final fields), program-
+    // wide. A bare identifier in a `case` that names one is a *constant* pattern
+    // (it lowers to the namespaced const, a valid C++ case label), not a Haxe
+    // capture variable.
+    let mut finals: BTreeSet<String> = BTreeSet::new();
     for module in &prog.modules {
         for d in &module.file.decls {
-            if let Decl::Enum(e) = d {
-                enums.insert(e.name.clone(), e.variants.iter().map(|v| v.name.clone()).collect());
+            match d {
+                Decl::Enum(e) => {
+                    enums.insert(e.name.clone(), e.variants.iter().map(|v| v.name.clone()).collect());
+                }
+                Decl::Global(g) if g.is_final => {
+                    finals.insert(g.name.clone());
+                }
+                Decl::Class(c) => {
+                    for f in &c.fields {
+                        if f.is_static && f.is_final {
+                            finals.insert(f.name.clone());
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
     {
-        let mut w = UnsupportedWalker { file: file.clone(), line: 0, enums: &enums, out: &mut out };
+        let mut w = UnsupportedWalker {
+            file: file.clone(),
+            line: 0,
+            enums: &enums,
+            finals: &finals,
+            out: &mut out,
+        };
         for d in &m.file.decls {
             w.decl(d);
         }
@@ -142,6 +166,12 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
     // ahead of a confusing C++ error.
     for d in &m.file.decls {
         flag_stack_only(d, &file, &mut out);
+    }
+    // `@:op(...)` forms with no C++98 operator mapping (the 2-arg `[]` write,
+    // `a.b` field access, `a()` call, postfix `A++`) — flag rather than silently
+    // emit only the named method without the requested operator.
+    for d in &m.file.decls {
+        flag_unsupported_ops(d, &file, &mut out);
     }
     // `@:stackOnly` types may not be nested (hxcpp's stack-residence rule) — flag
     // them used as field/element types, steering to `@value`.
@@ -324,6 +354,28 @@ fn flag_macro_functions(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
 /// inheritance/`extends` (slicing — a value can't dispatch through a base), and
 /// a field that contains the class itself **by value** (an incomplete type; only
 /// a container of it, `Array<Self>`, is laid out as `std::vector<Self>`).
+/// Flag `@:op(...)` methods whose operator form has no C++98 mapping (so codegen
+/// would emit the named method but not the requested operator).
+fn flag_unsupported_ops(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
+    let Decl::Class(c) = d else { return };
+    for m in &c.methods {
+        let Some(arg) = m.meta.iter().find(|me| me.name == "op").and_then(|me| me.first_arg())
+        else {
+            continue;
+        };
+        if crate::codegen::cpp_operator(arg, m.params.len()).is_none() {
+            let who = m.name.clone().unwrap_or_else(|| "new".to_string());
+            out.push(Diagnostic::unsupported(
+                file.to_string(),
+                signature_line(m),
+                format!(
+                    "the `@:op({arg})` form on `{who}` (no C++98 operator mapping — supported: `[]` read, binary `A op B`, and prefix unary)"
+                ),
+            ));
+        }
+    }
+}
+
 fn flag_stack_only(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
     let Decl::Class(c) = d else { return };
     // Both Hatchet value tags: `@value` (nestable) and `@:stackOnly` (no nesting).
@@ -598,6 +650,9 @@ struct UnsupportedWalker<'a> {
     line: usize,
     /// Enum name → member names, program-wide (see `unsupported_construct_errors`).
     enums: &'a BTreeMap<String, BTreeSet<String>>,
+    /// `final` constant names, program-wide — valid bare-identifier `case`
+    /// patterns (they lower to a namespaced const, a real C++ case label).
+    finals: &'a BTreeSet<String>,
     out: &'a mut Vec<Diagnostic>,
 }
 
@@ -638,17 +693,22 @@ impl<'a> UnsupportedWalker<'a> {
                 matches!(&**expr, Expr::Int(_) | Expr::Float(_))
             }
             Expr::Paren(inner) => self.pattern_supported(inner),
-            // A bare identifier is a constant pattern only when it names a known
-            // enum member; in Haxe anything else is a capture variable.
-            Expr::Ident(name) => self.enums.values().any(|vs| vs.contains(name)),
-            // `EnumType.Member` (possibly package-qualified: `pack.EnumType.Member`).
+            // A bare identifier is a constant pattern when it names a known enum
+            // member or a `final` constant (both lower to a valid C++ case
+            // label); anything else is a Haxe capture variable.
+            Expr::Ident(name) => {
+                self.finals.contains(name) || self.enums.values().any(|vs| vs.contains(name))
+            }
+            // `EnumType.Member` (possibly package-qualified: `pack.EnumType.Member`),
+            // or a qualified `final` constant (`pack.CONST` / `Class.CONST`).
             Expr::Field(recv, member) => {
                 let ty = match &**recv {
                     Expr::Ident(t) => Some(t.as_str()),
                     Expr::Field(_, t) => Some(t.as_str()),
                     _ => None,
                 };
-                ty.and_then(|t| self.enums.get(t)).is_some_and(|vs| vs.contains(member))
+                self.finals.contains(member)
+                    || ty.and_then(|t| self.enums.get(t)).is_some_and(|vs| vs.contains(member))
             }
             _ => false,
         }
