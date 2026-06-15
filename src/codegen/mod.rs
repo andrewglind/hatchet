@@ -103,7 +103,7 @@ impl<'a> HeaderGen<'a> {
         let mut emitted_const = false;
         for decl in &m.file.decls {
             if let Decl::Global(g) = decl {
-                if g.is_final && g.access != Access::Private && !has_meta(&g.meta, "native") {
+                if g.is_final && g.access != Access::Private {
                     if let Some(text) = crate::codegen::source::render_final_const(self.prog, self.mi, g) {
                         ns_body.push_str(&text);
                         emitted_const = true;
@@ -121,10 +121,10 @@ impl<'a> HeaderGen<'a> {
         let mut deferred_defs = String::new();
         for decl in &m.file.decls {
             let chunk = match decl {
-                Decl::Enum(e) if !has_meta(&e.meta, "native") => Some(self.emit_enum(e, base)),
+                Decl::Enum(e) if !e.is_extern => Some(self.emit_enum(e, base)),
                 Decl::Typedef(t) if self.emit_typedef_wanted(t) => self.emit_typedef(t, base),
-                Decl::Interface(i) if !has_meta(&i.meta, "native") => Some(self.emit_interface(i, base)),
-                Decl::Class(c) if !has_meta(&c.meta, "native") => {
+                Decl::Interface(i) if !i.is_extern => Some(self.emit_interface(i, base)),
+                Decl::Class(c) if !c.is_extern => {
                     let (text, deferred) = self.emit_class(c, base);
                     deferred_defs.push_str(&deferred);
                     Some(text)
@@ -150,7 +150,7 @@ impl<'a> HeaderGen<'a> {
         let mut emitted_fn = false;
         for decl in &m.file.decls {
             if let Decl::Global(g) = decl {
-                if g.access != Access::Private && !has_meta(&g.meta, "native") {
+                if g.access != Access::Private {
                     if let Some(sig) = self.free_fn_decl(g) {
                         if !emitted_fn && !first {
                             ns_body.push('\n');
@@ -175,16 +175,14 @@ impl<'a> HeaderGen<'a> {
             }
         }
 
-        // `extern inline` functions become `extern "C"` exports at **global scope**
+        // `@:abi` functions become `extern "C"` exports at **global scope**
         // (an `extern "C"` symbol cannot be namespaced), declared with the portable
         // export/calling-convention macros.
         let mut extern_decls = String::new();
         for decl in &m.file.decls {
             if let Decl::Function(f) = decl {
-                if !has_meta(&f.meta, "native") {
-                    if let Some(sig) = self.extern_fn_decl(f) {
-                        let _ = writeln!(extern_decls, "{sig};");
-                    }
+                if let Some(sig) = self.extern_fn_decl(f) {
+                    let _ = writeln!(extern_decls, "{sig};");
                 }
             }
         }
@@ -211,12 +209,12 @@ impl<'a> HeaderGen<'a> {
         out
     }
 
-    /// Global-scope declaration for an `extern inline` function:
+    /// Global-scope declaration for a `@:abi` function:
     /// `<P>_EXPORT <ret> <P>_CALL name(params)` (no trailing `;`). Emitted outside
     /// any namespace, so every referenced type is fully qualified (empty namespace
-    /// context). Returns `None` for non-`extern` functions.
+    /// context). Returns `None` for non-`@:abi` functions.
     fn extern_fn_decl(&self, f: &Function) -> Option<String> {
-        if !f.modifiers.is_extern {
+        if !has_meta(&f.meta, "abi") {
             return None;
         }
         let name = f.name.as_ref()?;
@@ -250,10 +248,10 @@ impl<'a> HeaderGen<'a> {
             .decls
             .iter()
             .filter(|d| match d {
-                Decl::Enum(e) => !has_meta(&e.meta, "native"),
+                Decl::Enum(e) => !e.is_extern,
                 Decl::Typedef(t) => self.emit_typedef_wanted(t),
-                Decl::Interface(i) => !has_meta(&i.meta, "native"),
-                Decl::Class(c) => !has_meta(&c.meta, "native"),
+                Decl::Interface(i) => !i.is_extern,
+                Decl::Class(c) => !c.is_extern,
                 _ => false,
             })
             .collect()
@@ -279,6 +277,16 @@ impl<'a> HeaderGen<'a> {
         def_order
     }
 
+    /// The C++ name a locally-declared type is **emitted** under: its `@:native`
+    /// rename if present, else its Haxe name. (`@:native` now only renames; it no
+    /// longer suppresses emission — that is `extern`.)
+    fn cpp_def_name(&self, haxe_name: &str) -> String {
+        self.prog
+            .resolve_type(std::slice::from_ref(&haxe_name.to_string()), self.mi)
+            .map(|t| t.cpp_name().to_string())
+            .unwrap_or_else(|| haxe_name.to_string())
+    }
+
     fn forward_decls(&self) -> Vec<String> {
         let emitted = self.emitted_type_decls();
         let def_order = self.type_def_order();
@@ -298,10 +306,12 @@ impl<'a> HeaderGen<'a> {
             }
         }
 
-        // Return in definition order (stable, readable) rather than alphabetical.
+        // Return in definition order (stable, readable) rather than alphabetical,
+        // mapped to the C++ name each type is emitted under (its `@:native` rename,
+        // if any), since that is what the forward declaration must name.
         let mut out: Vec<String> = needed.into_iter().collect();
         out.sort_by_key(|n| def_order.get(n).copied().unwrap_or(0));
-        out
+        out.into_iter().map(|n| self.cpp_def_name(&n)).collect()
     }
 
     // ---- enums ---------------------------------------------------------
@@ -467,6 +477,8 @@ impl<'a> HeaderGen<'a> {
     // ---- typedefs ------------------------------------------------------
 
     fn emit_typedef_wanted(&self, t: &Typedef) -> bool {
+        // A `@:native` typedef names an existing engine struct (external) — not
+        // emitted; nor are the `UInt*` shims.
         !has_meta(&t.meta, "native") && !crate::sema::types::is_uint_shim(&t.name)
     }
 
@@ -528,6 +540,8 @@ impl<'a> HeaderGen<'a> {
     fn emit_class(&self, c: &Class, ind: usize) -> (String, String) {
         let t = tabs(ind);
         let mut deferred = String::new();
+        // The C++ name this class is emitted under (its `@:native` rename, if any).
+        let cpp = self.cpp_def_name(&c.name);
 
         // Fields whose value can be null (matched by an optional constructor
         // parameter of the same name) are stored as pointers when struct-typed.
@@ -583,7 +597,7 @@ impl<'a> HeaderGen<'a> {
         // constructor + (inline, empty) destructor
         if let Some(ctor) = &c.ctor {
             let params = self.params(&ctor.params);
-            let _ = writeln!(public, "{t}\t{}({params});", c.name);
+            let _ = writeln!(public, "{t}\t{}({params});", cpp);
         }
         // Destructor: empty by default, or freeing the pointers this class owns.
         // A `@:stackOnly` value class is non-polymorphic and owns no heap, so its
@@ -594,9 +608,9 @@ impl<'a> HeaderGen<'a> {
         let virt_dtor = if is_value { "" } else { "virtual " };
         let deletes = ownership::owned_deletes(self.prog, self.mi, &self.ns, c);
         if deletes.is_empty() {
-            let _ = writeln!(public, "{t}\t{virt_dtor}~{}() {{}}", c.name);
+            let _ = writeln!(public, "{t}\t{virt_dtor}~{}() {{}}", cpp);
         } else {
-            let _ = writeln!(public, "{t}\t{virt_dtor}~{}() {{", c.name);
+            let _ = writeln!(public, "{t}\t{virt_dtor}~{}() {{", cpp);
             for d in &deletes {
                 let _ = writeln!(public, "{t}\t\t{d}");
             }
@@ -728,7 +742,7 @@ impl<'a> HeaderGen<'a> {
                 s.push('\n');
             }
         }
-        let _ = writeln!(s, "{t}class {decl_mod}{}{base} {{", c.name);
+        let _ = writeln!(s, "{t}class {decl_mod}{}{base} {{", cpp);
         let _ = writeln!(s, "{t}public:");
         s.push_str(&public);
         if !protected.is_empty() {
@@ -795,10 +809,11 @@ impl<'a> HeaderGen<'a> {
             .collect::<Vec<_>>()
             .join(", ");
         let body = format!("return {name}({arg_names});");
+        let cpp = self.cpp_def_name(&c.name);
         Some(Forwarder {
             inline: format!("{ret} operator{token}({params}) {{ {body} }}"),
             decl: format!("{ret} operator{token}({params});"),
-            def: format!("inline {ret} {}::operator{token}({params}) {{ {body} }}", c.name),
+            def: format!("inline {ret} {cpp}::operator{token}({params}) {{ {body} }}"),
         })
     }
 
@@ -811,10 +826,11 @@ impl<'a> HeaderGen<'a> {
             return None;
         }
         let target = self.prog.map_type_use(m.ret.as_ref()?, self.mi, &self.ns);
+        let cpp = self.cpp_def_name(&c.name);
         Some(Forwarder {
             inline: format!("operator {target}() {{ return {name}(); }}"),
             decl: format!("operator {target}();"),
-            def: format!("inline {}::operator {target}() {{ return {name}(); }}", c.name),
+            def: format!("inline {cpp}::operator {target}() {{ return {name}(); }}"),
         })
     }
 
@@ -830,7 +846,7 @@ impl<'a> HeaderGen<'a> {
         let decl = param_decl(self.prog, self.mi, &self.ns, p);
         // strip any ` = default` (a converting ctor parameter has none)
         let decl = decl.split(" = ").next().unwrap_or(&decl);
-        let cn = &c.name;
+        let cn = self.cpp_def_name(&c.name);
         let body = format!("*this = {name}({});", p.name);
         Some(Forwarder {
             inline: format!("{cn}({decl}) {{ {body} }}"),
@@ -853,10 +869,11 @@ impl<'a> HeaderGen<'a> {
 
     /// Declaration (`ret name(params)`) for a public top-level free function.
     /// Header declaration for a plain module-level `function name(...) {...}`:
-    /// `ret name(params)`. Skips `extern`/`@:native` (handled elsewhere) and the
-    /// bodyless / `macro` forms. Defaults are kept on the declaration.
+    /// `ret name(params)`. Skips a `@:abi` function (declared as a global
+    /// `extern "C"` export instead) and the bodyless / `macro` forms. Defaults are
+    /// kept on the declaration.
     fn plain_fn_decl(&self, f: &Function) -> Option<String> {
-        if f.modifiers.is_extern || f.modifiers.is_macro || has_meta(&f.meta, "native") {
+        if f.modifiers.is_macro || has_meta(&f.meta, "abi") {
             return None;
         }
         f.body.as_ref()?;

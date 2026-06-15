@@ -28,6 +28,25 @@ fn gen_one(src: &str, stem: &str) -> String {
     out
 }
 
+/// Transpile a single synthetic `.hx` source and return module `stem`'s `.h`.
+fn gen_header(src: &str, stem: &str) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("hatchet_h_{stem}_{}_{uniq}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{stem}.hx")), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some(stem))
+        .unwrap();
+    let head = hatchet::codegen::generate_header(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    head
+}
+
 #[test]
 fn nullable_misuse_is_warned() {
     // A nullable (`Null<T>`) result assigned to a non-`Null<T>` local must warn.
@@ -313,15 +332,13 @@ fn bare_enum_constant_is_qualified_in_expression_position() {
 
 #[test]
 fn final_constant_references_are_namespace_qualified() {
-    // A `@:native final` (provided by the C++ engine, not emitted) is referenced
-    // with its native namespace (`native::MAX_CHARS`). A public `final` is a
-    // `static const` inside its namespace, so a reference from a *different*
-    // namespace — here a global-scope `extern "C"` export — is qualified too
+    // A public `final` is a `static const` inside its module's namespace, so a
+    // reference from another namespace is qualified (`native::MAX_CHARS`), and a
+    // global-scope `@:abi` export qualifies a same-module ref too
     // (`game::SCENE_ID`), while a reference from within the same namespace stays
     // bare.
     let native = "\
 package native;
-@:native @:include(\"engine.h\")
 final MAX_CHARS:Int = 100;
 ";
     let scenes = "\
@@ -331,11 +348,11 @@ final SCENE_ID:Int = 7;
 
 class Scene {
   public function new() {}
-  public function cap():Int { return MAX_CHARS; }        // native const → native::
+  public function cap():Int { return MAX_CHARS; }        // other ns → native::
   public function id():Int { return SCENE_ID; }          // same ns → bare
 }
 
-extern inline function Pick(n:Int):Int {
+@:abi function Pick(n:Int):Int {
   switch (n) {
     case SCENE_ID: return 1;                              // global scope → game::
     default: return 0;
@@ -2289,4 +2306,70 @@ abstract View(ViewData) {
         head.contains("operator int() { return toInt(); }"),
         "a non-deferred conversion stays inline:\n{head}"
     );
+}
+
+#[test]
+fn native_meta_renames_an_emitted_class() {
+    // `@:native("name")` only renames the emitted C++ symbol — the type is still
+    // emitted (definition, ctor/dtor, method qualifiers, and uses all use `name`).
+    let src = "\
+typedef PtData = { var x:Int; }
+@:native(\"pt\") abstract Point(PtData) {
+  public function new(x:Int) { this = { x: x }; }
+  public function gx():Int { return this.x; }
+}
+class Use {
+  public var p:Point;
+  public function new() { p = new Point(1); }
+}
+";
+    let head = gen_header(src, "Use");
+    assert!(head.contains("class pt {"), "renamed class definition:\n{head}");
+    assert!(head.contains("pt(int x);"), "renamed constructor:\n{head}");
+    assert!(head.contains("pt p;"), "uses of the type are renamed:\n{head}");
+    assert!(!head.contains("Point"), "the Haxe name must not leak:\n{head}");
+
+    let out = gen_one(src, "Use");
+    assert!(out.contains("pt::pt(int x)"), "ctor definition qualifier renamed:\n{out}");
+    assert!(out.contains("int pt::gx()"), "method definition qualifier renamed:\n{out}");
+}
+
+#[test]
+fn extern_type_is_not_emitted_but_its_include_is_pulled() {
+    // `extern class` — implementation in hand-written C++; Hatchet emits no
+    // definition, but a module using it still pulls the `@:include`.
+    let src = "\
+@:include(\"engine.h\")
+extern class Engine {
+  public function ping():Int;
+}
+class User {
+  public var e:Engine;
+  public function new() {}
+  public function go():Int { return e.ping(); }
+}
+";
+    let head = gen_header(src, "User");
+    assert!(!head.contains("class Engine"), "extern class must not be emitted:\n{head}");
+    assert!(head.contains("#include \"engine.h\""), "its @:include is pulled:\n{head}");
+    assert!(head.contains("class User"), "the non-extern class is emitted:\n{head}");
+    assert!(head.contains("Engine* e;"), "the extern type is referenced (by pointer):\n{head}");
+}
+
+#[test]
+fn abi_meta_exports_a_c_abi_function_and_plain_does_not() {
+    // `@:abi` is the C-ABI export (the export/calling-convention macros at
+    // global scope); a plain `function` stays a namespace free function.
+    let src = "\
+@:abi function pick(n:Int):Int { return n; }
+function helper(n:Int):Int { return n + 1; }
+";
+    let head = gen_header(src, "Api");
+    assert!(
+        head.contains("HATCHET_EXPORT int HATCHET_CALL pick(int n)"),
+        "@:abi → a macro-wrapped global export:\n{head}"
+    );
+    assert!(head.contains("int helper(int n)"), "a plain function stays a free function:\n{head}");
+    // The export lives at global scope, the free function inside the namespace.
+    assert!(!head.contains("HATCHET_EXPORT int HATCHET_CALL helper"), "plain fn is not exported:\n{head}");
 }

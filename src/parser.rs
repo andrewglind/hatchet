@@ -522,16 +522,18 @@ impl<'a> Parser<'a> {
                 is_final_class,
                 is_abstract_class,
             )?))),
-            TokKind::Kw(Kw::Interface) => Ok(Decl::Interface(self.parse_interface(meta)?)),
+            TokKind::Kw(Kw::Interface) => {
+                Ok(Decl::Interface(self.parse_interface(meta, modifiers.is_extern)?))
+            }
             // `enum abstract X(T) { … }` — Haxe's typed-constant idiom. An integral
             // backing lowers to a plain C++ `enum` (with explicit member values); a
             // `String`/`Float` backing lowers to a namespace of `static const`s.
             TokKind::Kw(Kw::Enum) if matches!(self.peek2(), TokKind::Kw(Kw::Abstract)) => {
                 self.bump(); // enum
                 self.bump(); // abstract
-                Ok(Decl::Enum(self.parse_enum_abstract(meta)?))
+                Ok(Decl::Enum(self.parse_enum_abstract(meta, modifiers.is_extern)?))
             }
-            TokKind::Kw(Kw::Enum) => self.parse_enum(meta),
+            TokKind::Kw(Kw::Enum) => self.parse_enum(meta, modifiers.is_extern),
             // A bare `abstract X(T) { … }` newtype (the `abstract class` form is
             // handled by the modifier loop above). Lowered to a value class.
             TokKind::Kw(Kw::Abstract) => {
@@ -675,7 +677,7 @@ impl<'a> Parser<'a> {
         Ok(Decl::Class(Box::new(class)))
     }
 
-    fn parse_interface(&mut self, meta: Vec<Meta>) -> PResult<Interface> {
+    fn parse_interface(&mut self, meta: Vec<Meta>, is_extern: bool) -> PResult<Interface> {
         let line = self.line();
         self.expect_sym_kw(Kw::Interface)?;
         let name = self.expect_ident()?;
@@ -691,6 +693,7 @@ impl<'a> Parser<'a> {
         let mut iface = Interface {
             name,
             line,
+            is_extern,
             type_params,
             extends,
             meta,
@@ -725,7 +728,7 @@ impl<'a> Parser<'a> {
         Ok(iface)
     }
 
-    fn parse_enum(&mut self, meta: Vec<Meta>) -> PResult<Decl> {
+    fn parse_enum(&mut self, meta: Vec<Meta>, is_extern: bool) -> PResult<Decl> {
         let line = self.line();
         self.expect_sym_kw(Kw::Enum)?;
         let name = self.expect_ident()?;
@@ -752,7 +755,7 @@ impl<'a> Parser<'a> {
                 line,
             });
         }
-        Ok(Decl::Enum(Enum { name, meta, variants, underlying: None }))
+        Ok(Decl::Enum(Enum { name, is_extern, meta, variants, underlying: None }))
     }
 
     /// Parse `enum abstract X(T) { var A [= expr]; ... }`. The leading
@@ -760,7 +763,7 @@ impl<'a> Parser<'a> {
     /// the underlying type `T` and each member's explicit value; codegen lowers an
     /// integral backing to a C++ `enum` and a `String`/`Float` backing to a
     /// namespace of typed `static const` constants.
-    fn parse_enum_abstract(&mut self, meta: Vec<Meta>) -> PResult<Enum> {
+    fn parse_enum_abstract(&mut self, meta: Vec<Meta>, is_extern: bool) -> PResult<Enum> {
         let name = self.expect_ident()?;
         // The underlying type `(T)`.
         self.expect_sym(Sym::LParen)?;
@@ -813,7 +816,7 @@ impl<'a> Parser<'a> {
             variants.push(EnumVariant { name: vname, params: Vec::new(), value });
         }
         self.expect_sym(Sym::RBrace)?;
-        Ok(Enum { name, meta, variants, underlying: Some(underlying) })
+        Ok(Enum { name, is_extern, meta, variants, underlying: Some(underlying) })
     }
 
     fn parse_typedef(&mut self, meta: Vec<Meta>) -> PResult<Decl> {

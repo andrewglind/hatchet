@@ -386,6 +386,9 @@ pub struct Interface {
     /// Source line (1-based) of the `interface` keyword, for diagnostics. `0`
     /// when synthesized rather than parsed.
     pub line: usize,
+    /// `extern interface` — implementation provided by hand-written C++; Hatchet
+    /// emits no definition for it (only type-checks and references it).
+    pub is_extern: bool,
     /// Generic parameters (`interface I<T>`). Hatchet has no template lowering, so
     /// a non-empty list is flagged as `Unsupported` by the validation pass.
     pub type_params: Vec<String>,
@@ -409,6 +412,9 @@ pub struct EnumVariant {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Enum {
     pub name: String,
+    /// `extern enum` — implementation provided by hand-written C++; Hatchet emits
+    /// no definition for it (only type-checks and references it).
+    pub is_extern: bool,
     pub meta: Vec<Meta>,
     pub variants: Vec<EnumVariant>,
     /// The underlying type of an `enum abstract X(T)` (`None` for a plain `enum`).

@@ -52,7 +52,7 @@ pub fn generate_source_diagnostics(
         .file
         .decls
         .iter()
-        .any(|d| matches!(d, Decl::Class(c) if !has_meta(&c.meta, "native")));
+        .any(|d| matches!(d, Decl::Class(c) if !c.is_extern));
     let free_fns: Vec<&GlobalVar> = m
         .file
         .decls
@@ -62,27 +62,27 @@ pub fn generate_source_diagnostics(
             _ => None,
         })
         .collect();
-    // `extern inline` functions → `extern "C"` exports defined at global scope.
+    // `@:abi` functions → `extern "C"` exports defined at global scope.
     let extern_fns: Vec<&Function> = m
         .file
         .decls
         .iter()
         .filter_map(|d| match d {
-            Decl::Function(f) if f.modifiers.is_extern && !has_meta(&f.meta, "native") => Some(f),
+            Decl::Function(f) if has_meta(&f.meta, "abi") => Some(f),
             _ => None,
         })
         .collect();
     // Plain module-level `function name(...) {...}` → namespace free functions
-    // (unlike the lambda form, these have a real signature and body).
+    // (unlike the lambda form, these have a real signature and body). A `@:abi`
+    // function is *not* one of these — it is a global `extern "C"` export.
     let plain_fns: Vec<&Function> = m
         .file
         .decls
         .iter()
         .filter_map(|d| match d {
             Decl::Function(f)
-                if !f.modifiers.is_extern
-                    && !f.modifiers.is_macro
-                    && !has_meta(&f.meta, "native")
+                if !f.modifiers.is_macro
+                    && !has_meta(&f.meta, "abi")
                     && f.body.is_some() =>
             {
                 Some(f)
@@ -130,7 +130,6 @@ pub fn generate_source_diagnostics(
                 Decl::Global(g)
                     if g.is_final
                         && g.access == Access::Private
-                        && !has_meta(&g.meta, "native")
                         && lambda_parts(g).is_none() =>
                 {
                     Some(g)
@@ -208,7 +207,7 @@ pub fn generate_source_diagnostics(
 
     for decl in &m.file.decls {
         if let Decl::Class(c) = decl {
-            if has_meta(&c.meta, "native") {
+            if c.is_extern {
                 continue;
             }
             let mut g = BodyGen::new(prog, module_index, c, extract_depth, no_trace);

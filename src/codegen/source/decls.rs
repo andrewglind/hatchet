@@ -5,7 +5,13 @@ use super::*;
 impl<'a> BodyGen<'a> {
     pub(super) fn class_impl(&mut self) -> String {
         let mut s = String::new();
-        let name = self.class.name.clone();
+        // The C++ name this class is emitted under — its `@:native` rename, if
+        // any — used to qualify ctor/dtor/method definitions (`name::method`).
+        let name = self
+            .prog
+            .resolve_type(std::slice::from_ref(&self.class.name), self.mi)
+            .map(|t| t.cpp_name().to_string())
+            .unwrap_or_else(|| self.class.name.clone());
 
         if let Some(ctor) = self.class.ctor.clone() {
             s.push_str(&self.ctor_impl(&name, &ctor));

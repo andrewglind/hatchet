@@ -49,6 +49,9 @@ pub struct TypeInfo {
     pub package: Vec<String>,
     pub kind: TypeKind,
     pub is_native: bool,
+    /// `extern` — the type's implementation lives in hand-written C++; Hatchet
+    /// emits no definition for it. Independent of `@:native` (which only renames).
+    pub is_extern: bool,
     /// Explicit C++ namespace parts from `@:native("a::b::Name")`, if any.
     pub native_ns: Option<Vec<String>>,
     /// Explicit C++ name from `@:native("...::Name")`, else the Haxe name.
@@ -69,15 +72,21 @@ pub struct TypeInfo {
 impl TypeInfo {
     /// The C++ namespace this type lives in (component list).
     ///
-    /// * regular types → their Haxe package (the rule "namespaces match packages");
+    /// * emitted types → their Haxe package (the rule "namespaces match packages"),
+    ///   including a `@:native`-renamed one (only the leaf name changes);
     /// * `@:native("a::b::N")` → the explicit namespace `a::b`;
-    /// * bare `@:native` → the first package component (the engine's root
-    ///   namespace, e.g. package `native.api` → namespace `native`).
+    /// * other external (`extern`) types → the first package component (the
+    ///   engine's root namespace, e.g. package `native.api` → namespace `native`).
     pub fn cpp_namespace(&self) -> Vec<String> {
-        if self.is_native {
-            if let Some(ns) = &self.native_ns {
-                return ns.clone();
-            }
+        // An explicit `@:native("a::b::Name")` namespace always wins.
+        if let Some(ns) = &self.native_ns {
+            return ns.clone();
+        }
+        // An *external* (engine) type lives in the engine's root namespace — the
+        // first package component, e.g. package `native.api` → namespace `native`.
+        // An emitted type (including a `@:native`-renamed one) is defined in this
+        // module's own package namespace.
+        if self.is_extern {
             return self.package.iter().take(1).cloned().collect();
         }
         self.package.clone()
@@ -108,7 +117,7 @@ pub struct Program {
     /// project can name it e.g. `MyGame`, producing `MyGame.h`).
     pub stdafx_stem: String,
     /// Prefix for the platform export/calling-convention macros emitted around
-    /// `extern inline` functions (default `HATCHET` → `HATCHET_EXPORT`/`HATCHET_CALL`;
+    /// `@:abi` functions (default `HATCHET` → `HATCHET_EXPORT`/`HATCHET_CALL`;
     /// configurable via `--export-macro`).
     pub export_macro: String,
     /// When generated files are written somewhere other than in-place, the
@@ -198,6 +207,19 @@ impl Program {
                     Decl::Global(_) | Decl::Function(_) | Decl::Unsupported { .. } => continue,
                 };
                 let is_native = has_meta(meta, "native");
+                // External — implementation provided by hand-written C++; Hatchet
+                // emits no definition for the type, only references it. The
+                // `extern` keyword carries this on class/interface/enum (valid
+                // Haxe). A typedef cannot be `extern` in Haxe, so a `@:native`
+                // typedef (an alias naming an existing engine struct) is the way to
+                // declare an external *value* type — it is treated as external too.
+                let is_extern = match decl {
+                    Decl::Class(c) => c.is_extern,
+                    Decl::Interface(i) => i.is_extern,
+                    Decl::Enum(e) => e.is_extern,
+                    Decl::Typedef(_) => is_native,
+                    _ => false,
+                };
                 let (native_ns, native_name) = native_target(meta);
                 // Value classes: the `@:stackOnly` compiler metadata makes a
                 // *class* a value type, additionally carrying hxcpp's
@@ -214,6 +236,7 @@ impl Program {
                     package: m.package.clone(),
                     kind,
                     is_native,
+                    is_extern,
                     native_ns,
                     native_name,
                     is_value,
@@ -315,10 +338,11 @@ impl Program {
 
     /// If `name` refers to a global `final` **constant** in scope, return its
     /// namespace-qualified C++ reference. `final`s lower to `static const` inside
-    /// the namespace (or, for `@:native`, come from the C++ engine in its native
-    /// namespace), so a reference from a different namespace — notably a global-
-    /// scope `extern "C"` export, e.g. `case game::ALIENBEACH_SCENE_ID:` — must be
-    /// qualified, exactly like a type reference is. A `final` whose value is a
+    /// their module's namespace, so a reference from a different namespace —
+    /// notably a global-scope `extern "C"` export, e.g.
+    /// `case game::ALIENBEACH_SCENE_ID:` — must be qualified, exactly like a type
+    /// reference is. `@:native` renames the symbol but the constant is still
+    /// emitted in this module's namespace. A `final` whose value is a
     /// function/lambda is a free function, not a constant, and is left alone.
     /// Searches the current module first, then its imports.
     pub fn global_final_ref(&self, name: &str, ctx_module: usize, current_ns: &[String]) -> Option<String> {
@@ -329,17 +353,9 @@ impl Program {
                 if let Decl::Global(g) = decl {
                     let is_lambda = matches!(g.init, Some(Expr::Lambda { .. }));
                     if g.name == name && g.is_final && !is_lambda {
-                        let (ns, cpp_name) = if has_meta(&g.meta, "native") {
-                            let (nns, nname) = native_target(&g.meta);
-                            (
-                                nns.unwrap_or_else(|| {
-                                    self.modules[mi].package.iter().take(1).cloned().collect()
-                                }),
-                                nname.unwrap_or_else(|| g.name.clone()),
-                            )
-                        } else {
-                            (self.modules[mi].package.clone(), g.name.clone())
-                        };
+                        let (_, nname) = native_target(&g.meta);
+                        let cpp_name = nname.unwrap_or_else(|| g.name.clone());
+                        let ns = self.modules[mi].package.clone();
                         return Some(if ns == current_ns || ns.is_empty() {
                             cpp_name
                         } else {
@@ -545,8 +561,8 @@ impl Program {
 
     // ---- includes ------------------------------------------------------
 
-    /// Does this module emit a header of its own? Pure native-interop modules
-    /// (only `@:native` decls, plus `UInt8/16/32` shims) do not — importers
+    /// Does this module emit a header of its own? Pure interop modules (only
+    /// `extern` type declarations, plus `UInt8/16/32` shims) do not — importers
     /// inherit their `@:include`s instead.
     pub fn generates_header(&self, m: &Module) -> bool {
         if m.is_stdafx {
@@ -557,12 +573,20 @@ impl Program {
 
     fn is_emittable(&self, decl: &Decl) -> bool {
         match decl {
-            Decl::Class(c) => !has_meta(&c.meta, "native"),
-            Decl::Interface(i) => !has_meta(&i.meta, "native"),
-            Decl::Enum(e) => !has_meta(&e.meta, "native"),
+            // `extern` types are implemented in hand-written C++ — not emitted.
+            Decl::Class(c) => !c.is_extern,
+            Decl::Interface(i) => !i.is_extern,
+            Decl::Enum(e) => !e.is_extern,
+            // A `@:native` typedef names an existing engine struct (external value
+            // type — typedefs can't be `extern`), so it is not emitted; the `UInt*`
+            // shims aren't either. A plain typedef is emitted.
             Decl::Typedef(t) => !has_meta(&t.meta, "native") && !is_uint_shim(&t.name),
-            Decl::Global(g) => !has_meta(&g.meta, "native"),
-            Decl::Function(f) => !has_meta(&f.meta, "native"),
+            // A module-level `final`/lambda is emitted (external consts live as
+            // statics of an `extern class`).
+            Decl::Global(_) => true,
+            // A function is emitted if it has a body (a free function or a
+            // `@:abi` C-ABI export); a bodyless declaration is not.
+            Decl::Function(f) => f.body.is_some() && !f.modifiers.is_macro,
             // Parsed-and-skipped; nothing to emit (it is flagged unsupported).
             Decl::Unsupported { .. } => false,
         }
@@ -788,7 +812,7 @@ mod tests {
             "/src/native/api/Native.hx",
             "package native.api;\n\
              @:include(\"../../src/Native.h\")\n\
-             @:native interface IEngine {}\n\
+             extern interface IEngine {}\n\
              @:native typedef Effects = { values:Array<Float> };\n\
              @:native typedef Vertex = { x:Float };",
         );
@@ -825,7 +849,7 @@ mod tests {
             "package native.api;\n\
              @:include(\"../../src/Native.h\")\n\
              typedef UInt8 = UInt;\n\
-             @:native interface IEngine {}",
+             extern interface IEngine {}",
         );
         let stdafx = ("/src/modules/StdAfx.hx", "package modules;");
         let module = ("/src/modules/Module.hx", "package modules; class Module {}");
@@ -880,7 +904,7 @@ mod tests {
     fn native_only_module_emits_no_header() {
         let native = (
             "/src/native/api/Native.hx",
-            "package native.api;\n@:include(\"../../src/Native.h\")\ntypedef UInt8 = UInt;\n@:native interface IEngine {}",
+            "package native.api;\n@:include(\"../../src/Native.h\")\ntypedef UInt8 = UInt;\nextern interface IEngine {}",
         );
         let p = prog(&[native]);
         assert!(!p.generates_header(&p.modules[0]));
