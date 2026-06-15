@@ -174,7 +174,7 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
         flag_unsupported_ops(d, &file, &mut out);
     }
     // `@:stackOnly` types may not be nested (hxcpp's stack-residence rule) — flag
-    // them used as field/element types, steering to `@value`.
+    // them used as field/element types, steering to an `abstract`.
     flag_stack_restricted_nesting(prog, mi, &file, &mut out);
     // `using` static extensions rewrite `a.f(b)` into `Module.f(a, b)` at the call
     // site, chosen by `a`'s type. Hatchet has no such call-site rewriting, so a
@@ -378,12 +378,10 @@ fn flag_unsupported_ops(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
 
 fn flag_stack_only(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
     let Decl::Class(c) = d else { return };
-    // Both Hatchet value tags: `@value` (nestable) and `@:stackOnly` (no nesting).
-    if !(has_meta(&c.meta, "stackOnly") || has_meta(&c.meta, "value")) {
+    if !has_meta(&c.meta, "stackOnly") {
         return;
     }
-    // These two constraints are plain C++ facts about value types, so they apply
-    // to *both* value tags regardless of the stack-residence rule.
+    // These two constraints are plain C++ facts about value types.
     if c.extends.is_some() || !c.implements.is_empty() {
         out.push(Diagnostic::unsupported(
             file.to_string(),
@@ -414,9 +412,9 @@ fn flag_stack_only(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
 
 /// Flag a `@:stackOnly` type used where it cannot live on the stack — as a field
 /// type, or as a container element type — because hxcpp forbids exactly this
-/// (stack-residence). The fix is `@value`, the nestable Hatchet value class.
-/// (`@value` itself is exempt; its whole point is to be nestable.) Runs per
-/// module over its own declarations; the referenced type resolves cross-module.
+/// (stack-residence). The fix is an `abstract Name(U)` newtype, which is a value
+/// type that nests freely. Runs per module over its own declarations; the
+/// referenced type resolves cross-module.
 fn flag_stack_restricted_nesting(prog: &Program, mi: usize, file: &str, out: &mut Vec<Diagnostic>) {
     // Does `ty` (directly, or as a container element) name a `@:stackOnly` type?
     fn restricted_use<'a>(prog: &Program, mi: usize, ty: &'a Type) -> Option<&'a Type> {
@@ -436,7 +434,7 @@ fn flag_stack_restricted_nesting(prog: &Program, mi: usize, file: &str, out: &mu
             file.to_string(),
             type_line(ty),
             format!(
-                "the `@:stackOnly` type `{name}` used {ctx} — hxcpp forbids a stack-only type from living off the stack; use `@value` for a nestable value class",
+                "the `@:stackOnly` type `{name}` used {ctx} — hxcpp forbids a stack-only type from living off the stack; use an `abstract` newtype for a nestable value type",
                 name = name,
             ),
         ));

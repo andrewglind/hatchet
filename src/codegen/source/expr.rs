@@ -911,6 +911,39 @@ impl<'a> BodyGen<'a> {
                 let a = self.gen_args(args);
                 return (format!("{base}::{method}({a})"), Ty::default());
             }
+            // Static method call on a user class/abstract: `Type.method(args)` →
+            // `NS::Type::method(args)` (scope resolution, not member access). The
+            // receiver is a bare type name (not a local, field, or enum — those are
+            // handled above).
+            if let Expr::Ident(tname) = &**recv {
+                if self.lookup_local(tname).is_none() && self.class_field(tname).is_none() {
+                    if let Some(info) =
+                        self.prog.resolve_type(std::slice::from_ref(tname), self.mi).cloned()
+                    {
+                        if info.kind == TypeKind::Class {
+                            let recv_ty =
+                                Ty { base: info.name.clone(), info: Some(info.clone()), ..Default::default() };
+                            let param_tys = self.callee_param_types(&recv_ty, method);
+                            let overloaded = self.method_is_overloaded(&recv_ty, method);
+                            if overloaded {
+                                if let Some(msg) = self.overload_mismatch(&recv_ty, method, args) {
+                                    self.err(msg);
+                                }
+                            }
+                            let sink = self.callee_sink_params(&recv_ty, method);
+                            let a = self.gen_args_owned(args, &param_tys, &sink, overloaded);
+                            let ret = self.method_return_ty(&recv_ty, method, args);
+                            let ns = info.cpp_namespace();
+                            let prefix = if ns == self.ns || ns.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{}::", ns.join("::"))
+                            };
+                            return (format!("{prefix}{}::{method}({a})", info.cpp_name()), ret);
+                        }
+                    }
+                }
+            }
             let (rcode, rty) = self.gen_expr(recv);
             // Haxe container methods → std::vector / std::map equivalents.
             if is_container_ty(&rty) {

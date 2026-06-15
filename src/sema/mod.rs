@@ -55,13 +55,13 @@ pub struct TypeInfo {
     pub native_name: Option<String>,
     /// A **value class** — emitted as a C++ value type (stack, no
     /// `new`/pointer/heap) rather than a reference type, so a class can carry
-    /// methods while having value semantics. Set by Hatchet's `@value` user
-    /// metadata or by `@:stackOnly`. Always `false` for non-classes.
+    /// methods while having value semantics. Set by `@:stackOnly` or by being an
+    /// `abstract Name(U)` newtype. Always `false` for non-classes.
     pub is_value: bool,
     /// A `@:stackOnly` value class specifically: hxcpp forbids such a type from
     /// living anywhere but the stack, so Hatchet flags it being used as a field
-    /// or container element (steering to `@value`, which has no such rule). A
-    /// plain `@value` class is *not* stack-restricted.
+    /// or container element. An `abstract` newtype value class is *not*
+    /// stack-restricted (it nests freely).
     pub stack_restricted: bool,
     pub module_index: usize,
 }
@@ -199,19 +199,16 @@ impl Program {
                 };
                 let is_native = has_meta(meta, "native");
                 let (native_ns, native_name) = native_target(meta);
-                // Value classes: Hatchet's `@value` (user metadata) or the
-                // `@:stackOnly` compiler metadata make a *class* a value type.
-                // `@:stackOnly` additionally carries hxcpp's stack-residence rule
-                // (no nesting). Only meaningful for classes.
+                // Value classes: the `@:stackOnly` compiler metadata makes a
+                // *class* a value type, additionally carrying hxcpp's
+                // stack-residence rule (no nesting). Only meaningful for classes.
                 let is_class = matches!(decl, Decl::Class(_));
                 let stack_restricted = is_class && has_meta(meta, "stackOnly");
                 // An `abstract Name(U)` newtype is always a value type (a value
-                // class wrapping `U`), in addition to the explicit `@value` /
-                // `@:stackOnly` tags.
+                // class wrapping `U`), and — unlike `@:stackOnly` — nests freely.
                 let is_abstract_newtype =
                     matches!(decl, Decl::Class(c) if c.abstract_underlying.is_some());
-                let is_value =
-                    is_class && (stack_restricted || is_abstract_newtype || has_meta(meta, "value"));
+                let is_value = is_class && (stack_restricted || is_abstract_newtype);
                 self.types.push(TypeInfo {
                     name: name.clone(),
                     package: m.package.clone(),
@@ -356,15 +353,15 @@ impl Program {
     }
 
     /// Is `path`, as seen from `ctx_module`, a reference (pointer) type? A value
-    /// class (`@value`/`@:stackOnly`) is class-kinded but value-represented, so
-    /// it is **not** a reference.
+    /// class (`@:stackOnly` or an `abstract` newtype) is class-kinded but
+    /// value-represented, so it is **not** a reference.
     pub fn is_reference(&self, path: &[String], ctx_module: usize) -> bool {
         self.resolve_type(path, ctx_module)
             .map(|t| t.kind.is_reference() && !t.is_value)
             .unwrap_or(false)
     }
 
-    /// Whether `path` resolves to a value class (`@value` or `@:stackOnly`).
+    /// Whether `path` resolves to a value class (`@:stackOnly` or an `abstract`).
     pub fn is_value_class(&self, path: &[String], ctx_module: usize) -> bool {
         self.resolve_type(path, ctx_module).map(|t| t.is_value).unwrap_or(false)
     }

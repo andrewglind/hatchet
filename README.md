@@ -6,6 +6,14 @@ older Unix toolchains. It is a *transpiler*, not a compiler: it emits C++ source
 target, and it never produces a custom C++ runtime. Supported Haxe constructs map to an equivalent,
 hand-writable C++ idiom. Hatchet implements a focused subset of Haxe 4.x; it is **not** a drop-in for hxcpp.
 
+> **hxcpp compatibility is compile-time only.** A guiding principle of Hatchet is that the Haxe you
+> write always *compiles* under hxcpp (Haxe's official C++ backend), so the source stays valid,
+> portable Haxe you can keep editing and type-checking with normal Haxe tooling. Hatchet makes **no
+> guarantee that the hxcpp build runs** or behaves identically — the supported, authoritative runtime
+> is the **C++98 that Hatchet emits**. The two targets can diverge at runtime (most notably value vs.
+> reference semantics: a Hatchet value class / `abstract` is a flat value, while under hxcpp the same
+> type may be a heap object). Validate behaviour on the transpiled C++98, never on an hxcpp build.
+
 ## Motivation
 
 hxcpp (Haxe's official C++ backend) cannot target C++ revisions older than C++11, which has
@@ -41,27 +49,26 @@ Supported today, end to end:
   it defines that is referenced before its own definition — and only those, never `@:native` types.
   Since Hatchet classes are reference types (every cross-class member/param/return is a pointer), a
   forward declaration is always sufficient, so cyclic type graphs "just work".
-- **Value classes (`@value`)** — a class tagged **`@value`** is emitted as a C++ **value type**
-  rather than a reference type: it keeps its methods, constructor and fields, but `new Foo(a)`
-  becomes a stack value `Foo(a)` (no heap), a field/`Array<Foo>` is held by value
+- **Value classes** — a class can be emitted as a C++ **value type** rather than a reference type:
+  `new Foo(a)` becomes a stack value `Foo(a)` (no heap), a field/`Array<Foo>` is held by value
   (`Foo`/`std::vector<Foo>`), member access is `.`, the destructor is non-virtual (no vtable — a flat
   value layout), and the ownership analysis never touches it (nothing to free). This gives a **value
   object with methods** — the hand-written-C++ idiom of a small struct-with-behaviour — letting
   value-heavy code (vectors, JSON-style trees) transliterate by value instead of being reimplemented
-  on the heap. A value type can't do C++ polymorphism, so `@value` + inheritance is rejected
-  (slicing), as is a field holding the class itself by value (an incomplete type — use an
-  `Array<Self>`); `Null<Foo>` still boxes to `Foo*`, as for any value type. `@value` types may be
-  nested freely (fields, array elements). The stricter **`@:stackOnly`** (real hxcpp metadata) also
-  makes a value class but adds hxcpp's stack-residence rule — it may *not* be nested as a field or
-  element (Hatchet flags that, steering to `@value`) — so it suits genuine stack-only locals while
-  staying portable to hxcpp. See the **Metadata** section for the full `@:` vs `@` split and the
-  dual-target notes.
+  on the heap. A value type can't do C++ polymorphism, so inheritance is rejected (slicing), as is a
+  field holding the class itself by value (an incomplete type — use an `Array<Self>`); `Null<Foo>`
+  still boxes to `Foo*`, as for any value type. Two tags select a value class: the real hxcpp
+  **`@:stackOnly`** metadata makes one that also obeys hxcpp's stack-residence rule — it may *not* be
+  nested as a field or element (Hatchet flags that, steering to an `abstract`) — suiting genuine
+  stack-only locals while staying portable to hxcpp; and an **`abstract Name(U)`** newtype (next
+  bullet) is a value type that **nests freely**, the portable way to get a value object with methods,
+  operators, and conversions. See the **Metadata** section for the full `@:` vs `@` split.
 - **Abstract types (`abstract Name(U)`)** — Haxe's newtype: a **value type with methods** over an
   underlying type `U`, lowered to a value class that wraps `U` in a synthetic `__this` field. Inside
   its methods Haxe `this` *is* the underlying value (so `this = v` and `this.field` operate on `U`),
   and `new Name(...)` is value construction. This is the portable, idiomatic way to get a value
-  object with operators and conversions (the previous `@value` is the Hatchet-specific shortcut for
-  the no-operator case). Supported member metadata:
+  object with operators and conversions, and the nestable value type (a field, an `Array<Name>`, or a
+  recursive-by-value tree through a container). Supported member metadata:
   - **`@:op(...)`** operator overloading, emitted as a C++ operator that forwards to the named
     method (so the value reads as `v[k]` / `a + b` *and* `v.method(...)`, with C++ doing the
     operator resolution): `@:op([])` (one-arg read) → `operator[]`, `@:op(A op B)` → the binary
@@ -72,7 +79,7 @@ Supported today, end to end:
     source type implicitly converts to the abstract.
 
   Generic abstracts and `@:multiType` are not supported; an `abstract`'s value-class nature means the
-  same caveats as `@value` (no polymorphism; nests freely; `Null<Name>` boxes to `Name*`).
+  usual value-class caveats (no polymorphism; nests freely; `Null<Name>` boxes to `Name*`).
 - **Members & access** — a Haxe `private` member maps to C++ **`protected`**, not `private`: Haxe
   `private` is accessible from subclasses (and Haxe has no "private even from subclasses" concept),
   so emitting C++ `private` would reject an inherited-member access that Haxe accepts. Hatchet
@@ -259,7 +266,7 @@ The idiomatic Hatchet patterns, in preference order:
 - **Mutate a local copy** when a working copy is genuinely what you want.
 
 Conversely, when value semantics are what you *want* — small objects copied freely, composed by
-value, no heap — a `@value` **value class** (see *Declarations* above) is the deliberate tool:
+value, no heap — an **`abstract Name(U)`** (see *Declarations* above) is the deliberate tool:
 it carries methods like any class but behaves like a `struct`, matching the value-object idiom of
 hand-written C++.
 
@@ -273,7 +280,7 @@ metadata by **name** and ignores the `@:`/`@` prefix, but the prefix matters to 
 targets, so write each tag in the form shown.)
 
 **Haxe / hxcpp compiler metadata Hatchet honours (`@:…`)** — real metadata whose meaning Hatchet
-matches, so the same source behaves consistently under hxcpp:
+matches, so the same source stays valid and keeps compiling under hxcpp:
 
 | Tag | Effect in Hatchet |
 |-----|-------------------|
@@ -285,29 +292,29 @@ matches, so the same source behaves consistently under hxcpp:
 | `@:decl` | Export a class from a DLL via the portable export macro |
 | `@:op(...)` | (on an `abstract` method) operator overloading → a C++ operator forwarding to the method: `@:op([])` read → `operator[]`, `@:op(A op B)` → binary `operator op`, prefix unary `@:op(-A)` |
 | `@:to` / `@:from` | (on an `abstract` method) `@:to` → an implicit conversion operator; `@:from` (static) → a converting constructor |
-| `@:stackOnly` | A **value class** that also obeys hxcpp's stack-residence rule — may **not** be nested as a field/element (flagged, steering to `@value`). Portable; use for genuine stack-only value types |
+| `@:stackOnly` | A **value class** that also obeys hxcpp's stack-residence rule — may **not** be nested as a field/element (flagged, steering to an `abstract`). Portable; use for genuine stack-only value types |
 
 **Hatchet directives (user metadata, `@…`)** — Hatchet's own. The guiding rule: a user-metadata tag
-exists **only for a C++ reality Haxe genuinely cannot express** (manual memory ownership; value
-semantics where Haxe offers no construct). Anything Haxe *can* say — operators, casts,
-value-types-with-methods via `abstract`, access levels — is expressed in real Haxe, not invented
+exists **only for a C++ reality Haxe genuinely cannot express** — and now that value-types-with-methods
+are `abstract` newtypes, that reality is just **manual memory ownership**. Anything Haxe *can* say —
+operators, casts, value types via `abstract`, access levels — is expressed in real Haxe, not invented
 here. Because these are plain user metadata, every other Haxe target ignores them, so the source
 stays portable.
 
 | Tag | Effect |
 |-----|--------|
-| `@value` | A **value class** (value type with methods) that may nest freely. Hatchet-specific: under hxcpp these are ordinary reference types, so only use where value-vs-reference behaviour doesn't matter (see below) |
 | `@owned` | A field the owning object frees in its destructor (a scalar via `delete`, a container element-by-element) |
 | `@sink` | A *consuming* parameter — the callee takes ownership of what is passed (caller does not free); the call-site counterpart to an owning field |
 | `@delete` | Free a marked local (`@delete var x = …`) at scope close |
 
-**Portability note.** The reference-semantic path — plain `class` plus `@owned`/`@sink`/`@delete` —
-is the one that compiles *and behaves the same* under both hxcpp (GC ignores the ownership tags) and
-Hatchet (the ownership analysis uses them). The value-semantic path (`@value`) has no portable hxcpp
-equivalent — hxcpp has no metadata that turns a plain Haxe class into a value type with methods — so
-a `@value` type is a value type under Hatchet and a reference type under hxcpp. For types that don't
-depend on the difference (small immutable values, build-once/read trees) that divergence is benign;
-for anything that relies on copy-vs-share semantics across both targets, stay on the reference path.
+**Portability note.** Both paths *compile* under hxcpp and Hatchet (the compile-time guarantee); only
+their **runtime** representation can differ, and Hatchet's emitted C++98 is the authoritative runtime
+(see the note at the top of this README). The reference-semantic path — plain `class` plus
+`@owned`/`@sink`/`@delete` — even behaves the same under both (hxcpp's GC ignores the ownership tags;
+Hatchet's analysis uses them). The value-semantic path — `abstract Name(U)` and `@:stackOnly` — is a
+flat value type under Hatchet, but under hxcpp its representation depends on the underlying (an
+anonymous-structure underlying is a heap object there), so copy-vs-share behaviour can diverge.
+Validate such behaviour on the transpiled C++98.
 
 ## Requirements
 

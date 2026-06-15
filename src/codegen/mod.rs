@@ -39,6 +39,19 @@ struct HeaderGen<'a> {
     ns: Vec<String>,
 }
 
+/// A C++ operator / conversion / converting-constructor forwarder built for an
+/// `abstract` method, in three forms: the `inline` body (`Foo operator[](int k) {
+/// return get(k); }`) used in-class when the forwarder's value types are all
+/// complete there; and the `decl` + out-of-line `def` pair used when a by-value
+/// return/parameter names a *later*-defined sibling class (incomplete in the
+/// class body), so the definition must follow both class definitions — exactly
+/// what a hand-written header does to break a `jobject`/`proxy` cycle.
+struct Forwarder {
+    inline: String,
+    decl: String,
+    def: String,
+}
+
 impl<'a> HeaderGen<'a> {
     fn build(&self) -> String {
         let m = &self.prog.modules[self.mi];
@@ -102,12 +115,20 @@ impl<'a> HeaderGen<'a> {
             ns_body.push('\n');
         }
         let mut first = true;
+        // Out-of-line `inline` forwarder definitions (a class returning a sibling
+        // defined later) accumulate here and are emitted after every class, so
+        // both ends of a cyclic value-type pair are complete by then.
+        let mut deferred_defs = String::new();
         for decl in &m.file.decls {
             let chunk = match decl {
                 Decl::Enum(e) if !has_meta(&e.meta, "native") => Some(self.emit_enum(e, base)),
                 Decl::Typedef(t) if self.emit_typedef_wanted(t) => self.emit_typedef(t, base),
                 Decl::Interface(i) if !has_meta(&i.meta, "native") => Some(self.emit_interface(i, base)),
-                Decl::Class(c) if !has_meta(&c.meta, "native") => Some(self.emit_class(c, base)),
+                Decl::Class(c) if !has_meta(&c.meta, "native") => {
+                    let (text, deferred) = self.emit_class(c, base);
+                    deferred_defs.push_str(&deferred);
+                    Some(text)
+                }
                 _ => None,
             };
             if let Some(text) = chunk {
@@ -117,6 +138,10 @@ impl<'a> HeaderGen<'a> {
                 first = false;
                 ns_body.push_str(&text);
             }
+        }
+        if !deferred_defs.is_empty() {
+            ns_body.push('\n');
+            ns_body.push_str(&deferred_defs);
         }
 
         // Free-function declarations come **after** the type definitions above, since
@@ -215,41 +240,57 @@ impl<'a> HeaderGen<'a> {
     /// declare: those referenced by an *earlier*-emitted type in the module's
     /// header, so a pointer/param/return to a not-yet-defined sibling resolves.
     /// Returned in definition order. Excludes `@:native` types.
-    fn forward_decls(&self) -> Vec<String> {
-        let decls = &self.prog.modules[self.mi].file.decls;
+    /// The type declarations this header actually emits, in emission order — the
+    /// same set and order as the body emit loop (enums, struct/alias typedefs,
+    /// interfaces, classes). Typedefs are included so a struct typedef referencing
+    /// a later class is recognised as a referrer.
+    fn emitted_type_decls(&self) -> Vec<&'a Decl> {
+        self.prog.modules[self.mi]
+            .file
+            .decls
+            .iter()
+            .filter(|d| match d {
+                Decl::Enum(e) => !has_meta(&e.meta, "native"),
+                Decl::Typedef(t) => self.emit_typedef_wanted(t),
+                Decl::Interface(i) => !has_meta(&i.meta, "native"),
+                Decl::Class(c) => !has_meta(&c.meta, "native"),
+                _ => false,
+            })
+            .collect()
+    }
 
-        // The local class-kinded types (the only things both forward-declarable
-        // in C++98 and emitted by Hatchet itself), with their definition order.
-        let mut def_order: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut emitted: Vec<&str> = Vec::new();
-        for d in decls {
+    /// Forward-declarable / definition-order targets: class/interface/ADT-enum
+    /// (the only things both forward-declarable in C++98 and emitted by Hatchet
+    /// itself), keyed to their emission index.
+    fn type_def_order(&self) -> std::collections::HashMap<String, usize> {
+        let mut def_order = std::collections::HashMap::new();
+        for (i, d) in self.emitted_type_decls().iter().enumerate() {
             let name = match d {
-                Decl::Class(c) if !has_meta(&c.meta, "native") => &c.name,
-                Decl::Interface(i) if !has_meta(&i.meta, "native") => &i.name,
-                // An ADT enum lowers to a value *class*, so it too can be a
-                // forward-declared target.
-                Decl::Enum(e) if !has_meta(&e.meta, "native") && e.is_adt() => &e.name,
-                _ => continue,
+                Decl::Class(c) => Some(&c.name),
+                Decl::Interface(it) => Some(&it.name),
+                // An ADT enum lowers to a value *class*, so it too can be a target.
+                Decl::Enum(e) if e.is_adt() => Some(&e.name),
+                _ => None,
             };
-            def_order.insert(name.clone(), emitted.len());
-            emitted.push(name);
-        }
-
-        let mut needed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut pos = 0usize;
-        for d in decls {
-            let is_emitted_type = matches!(d,
-                Decl::Class(c) if !has_meta(&c.meta, "native"))
-                || matches!(d, Decl::Interface(i) if !has_meta(&i.meta, "native"))
-                || matches!(d, Decl::Enum(e) if !has_meta(&e.meta, "native") && e.is_adt());
-            if !is_emitted_type {
-                continue;
+            if let Some(n) = name {
+                def_order.insert(n.clone(), i);
             }
-            let here = pos;
-            pos += 1;
+        }
+        def_order
+    }
+
+    fn forward_decls(&self) -> Vec<String> {
+        let emitted = self.emitted_type_decls();
+        let def_order = self.type_def_order();
+
+        // A target referenced by an earlier-emitted declaration needs a forward
+        // decl. Hatchet classes are reference types (cross-class members are
+        // pointers) and a recursive value tree reaches itself through a container
+        // (`std::vector<Foo>`), so a forward declaration always suffices.
+        let mut needed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (here, d) in emitted.iter().enumerate() {
             for r in header_type_refs(d) {
                 if let Some(&def) = def_order.get(&r) {
-                    // referenced before it is defined → needs a forward decl
                     if def > here {
                         needed.insert(r);
                     }
@@ -480,8 +521,13 @@ impl<'a> HeaderGen<'a> {
 
     // ---- classes -------------------------------------------------------
 
-    fn emit_class(&self, c: &Class, ind: usize) -> String {
+    /// Returns `(class_text, deferred_defs)` — the second holds any out-of-line
+    /// `inline` forwarder definitions whose by-value types are incomplete in the
+    /// class body (a sibling defined later); the caller emits them after all
+    /// classes.
+    fn emit_class(&self, c: &Class, ind: usize) -> (String, String) {
         let t = tabs(ind);
+        let mut deferred = String::new();
 
         // Fields whose value can be null (matched by an optional constructor
         // parameter of the same name) are stored as pointers when struct-typed.
@@ -544,9 +590,7 @@ impl<'a> HeaderGen<'a> {
         // destructor is **non-virtual** — a vtable pointer would bloat `sizeof`
         // and break the flat value layout that makes `std::vector<Foo>` and
         // recursive-by-value composition work.
-        let is_value = has_meta(&c.meta, "stackOnly")
-            || has_meta(&c.meta, "value")
-            || c.abstract_underlying.is_some();
+        let is_value = has_meta(&c.meta, "stackOnly") || c.abstract_underlying.is_some();
         let virt_dtor = if is_value { "" } else { "virtual " };
         let deletes = ownership::owned_deletes(self.prog, self.mi, &self.ns, c);
         if deletes.is_empty() {
@@ -604,16 +648,34 @@ impl<'a> HeaderGen<'a> {
             // `@:op(...)` on an abstract method → an additive C++ operator that
             // forwards to the named method (so the value reads as `a[k]` / `a + b`
             // *and* `a.method(...)`). The named method above is still emitted.
-            if let Some(fwd) = self.op_forwarder(m) {
-                public.push_str(&format!("{t}\t{fwd}\n"));
+            // A forwarder whose by-value type is a later sibling is declared here
+            // and defined out-of-line (see `forwarder_deferred`).
+            if let Some(fwd) = self.op_forwarder(c, m) {
+                if self.forwarder_deferred(c, m.ret.as_ref()) {
+                    public.push_str(&format!("{t}\t{}\n", fwd.decl));
+                    let _ = writeln!(deferred, "{t}{}", fwd.def);
+                } else {
+                    public.push_str(&format!("{t}\t{}\n", fwd.inline));
+                }
             }
             // `@:to` → an implicit conversion operator; `@:from` → a converting
             // constructor. Both forward to the named (instance/static) method.
-            if let Some(fwd) = self.to_forwarder(m) {
-                public.push_str(&format!("{t}\t{fwd}\n"));
+            if let Some(fwd) = self.to_forwarder(c, m) {
+                if self.forwarder_deferred(c, m.ret.as_ref()) {
+                    public.push_str(&format!("{t}\t{}\n", fwd.decl));
+                    let _ = writeln!(deferred, "{t}{}", fwd.def);
+                } else {
+                    public.push_str(&format!("{t}\t{}\n", fwd.inline));
+                }
             }
-            if let Some(ctor) = self.converting_ctor(c, m) {
-                public.push_str(&format!("{t}\t{ctor}\n"));
+            if let Some(fwd) = self.converting_ctor(c, m) {
+                let src = m.params.first().and_then(|p| p.ty.as_ref());
+                if self.forwarder_deferred(c, src) {
+                    public.push_str(&format!("{t}\t{}\n", fwd.decl));
+                    let _ = writeln!(deferred, "{t}{}", fwd.def);
+                } else {
+                    public.push_str(&format!("{t}\t{}\n", fwd.inline));
+                }
             }
         }
 
@@ -674,7 +736,7 @@ impl<'a> HeaderGen<'a> {
             s.push_str(&protected);
         }
         let _ = writeln!(s, "{t}}};");
-        s
+        (s, deferred)
     }
 
     fn emit_accessors(&self, _c: &Class, f: &Field, nullable: &BTreeSet<String>, ind: usize) -> String {
@@ -698,12 +760,26 @@ impl<'a> HeaderGen<'a> {
         s
     }
 
-    /// If `m` carries `@:op(...)`, the inline C++ operator that forwards to it
-    /// (e.g. `Proxy operator[](int k) { return get(k); }`), else `None`. The
-    /// operator's return/parameter types mirror the method's; unsupported op
-    /// forms (the 2-arg `[]` write, `a.b`, `a()`, postfix) yield `None` here and
-    /// are flagged by the validation pass.
-    fn op_forwarder(&self, m: &Function) -> Option<String> {
+    /// Whether a forwarder whose by-value return / parameter type is `ty` must be
+    /// defined out-of-line: `ty` names a sibling class defined *later* in this
+    /// module, which is incomplete inside `c`'s body (a by-value return/param then
+    /// needs the full definition, which a forward decl can't supply). The class's
+    /// own type is fine — a member body is a complete-class context.
+    fn forwarder_deferred(&self, c: &Class, ty: Option<&Type>) -> bool {
+        let order = self.type_def_order();
+        let Some(&here) = order.get(&c.name) else { return false };
+        let Some(t) = ty else { return false };
+        let mut names = Vec::new();
+        type_names_in(t, &mut names);
+        names.iter().any(|n| order.get(n).is_some_and(|&def| def > here))
+    }
+
+    /// If `m` carries `@:op(...)`, the C++ operator that forwards to it (e.g.
+    /// `Proxy operator[](int k) { return get(k); }`), else `None`. The operator's
+    /// return/parameter types mirror the method's; unsupported op forms (the 2-arg
+    /// `[]` write, `a.b`, `a()`, postfix) yield `None` here and are flagged by the
+    /// validation pass.
+    fn op_forwarder(&self, c: &Class, m: &Function) -> Option<Forwarder> {
         let name = m.name.as_ref()?;
         let arg = m.meta.iter().find(|me| me.name == "op").and_then(|me| me.first_arg())?;
         let token = cpp_operator(arg, m.params.len())?;
@@ -718,25 +794,34 @@ impl<'a> HeaderGen<'a> {
             .map(|p| p.name.clone())
             .collect::<Vec<_>>()
             .join(", ");
-        Some(format!("{ret} operator{token}({params}) {{ return {name}({arg_names}); }}"))
+        let body = format!("return {name}({arg_names});");
+        Some(Forwarder {
+            inline: format!("{ret} operator{token}({params}) {{ {body} }}"),
+            decl: format!("{ret} operator{token}({params});"),
+            def: format!("inline {ret} {}::operator{token}({params}) {{ {body} }}", c.name),
+        })
     }
 
     /// If `m` carries `@:to`, an implicit C++ conversion operator forwarding to
     /// it: `operator T() { return toX(); }` (non-`const`, so it may call the
     /// non-const named method). Expects a 0-parameter instance method.
-    fn to_forwarder(&self, m: &Function) -> Option<String> {
+    fn to_forwarder(&self, c: &Class, m: &Function) -> Option<Forwarder> {
         let name = m.name.as_ref()?;
         if !has_meta(&m.meta, "to") || m.modifiers.is_static || !m.params.is_empty() {
             return None;
         }
         let target = self.prog.map_type_use(m.ret.as_ref()?, self.mi, &self.ns);
-        Some(format!("operator {target}() {{ return {name}(); }}"))
+        Some(Forwarder {
+            inline: format!("operator {target}() {{ return {name}(); }}"),
+            decl: format!("operator {target}();"),
+            def: format!("inline {}::operator {target}() {{ return {name}(); }}", c.name),
+        })
     }
 
     /// If `m` carries `@:from` (a static, single-parameter factory returning the
     /// abstract), a *converting constructor* forwarding to it, so the source type
     /// implicitly converts to the abstract: `Foo(Src s) { *this = fromX(s); }`.
-    fn converting_ctor(&self, c: &Class, m: &Function) -> Option<String> {
+    fn converting_ctor(&self, c: &Class, m: &Function) -> Option<Forwarder> {
         let name = m.name.as_ref()?;
         if !has_meta(&m.meta, "from") || !m.modifiers.is_static || m.params.len() != 1 {
             return None;
@@ -745,7 +830,13 @@ impl<'a> HeaderGen<'a> {
         let decl = param_decl(self.prog, self.mi, &self.ns, p);
         // strip any ` = default` (a converting ctor parameter has none)
         let decl = decl.split(" = ").next().unwrap_or(&decl);
-        Some(format!("{}({decl}) {{ *this = {name}({}); }}", c.name, p.name))
+        let cn = &c.name;
+        let body = format!("*this = {name}({});", p.name);
+        Some(Forwarder {
+            inline: format!("{cn}({decl}) {{ {body} }}"),
+            decl: format!("{cn}({decl});"),
+            def: format!("inline {cn}::{cn}({decl}) {{ {body} }}"),
+        })
     }
 
     // ---- signatures & types --------------------------------------------
@@ -1084,6 +1175,33 @@ fn has_accessor(f: &Field) -> bool {
 /// live in the `.cpp`, which sees every full definition). Used to decide which
 /// sibling types must be forward-declared. Returns the final path segment of
 /// each named type (e.g. `Proxy` for `pack.Proxy`).
+/// The final path segment of every named type mentioned by `t` (recursing into
+/// type parameters, anonymous-struct fields, and function types). E.g. for
+/// `Array<pack.Proxy>` → `["Array", "Proxy"]`.
+fn type_names_in(t: &Type, out: &mut Vec<String>) {
+    match t {
+        Type::Named { path, params, .. } => {
+            if let Some(n) = path.last() {
+                out.push(n.clone());
+            }
+            for p in params {
+                type_names_in(p, out);
+            }
+        }
+        Type::Anon(fields) => {
+            for f in fields {
+                type_names_in(&f.ty, out);
+            }
+        }
+        Type::Func { params, ret } => {
+            for p in params {
+                type_names_in(p, out);
+            }
+            type_names_in(ret, out);
+        }
+    }
+}
+
 fn header_type_refs(d: &Decl) -> Vec<String> {
     let mut out = Vec::new();
     fn ty(t: &Type, out: &mut Vec<String>) {
@@ -1158,6 +1276,17 @@ fn header_type_refs(d: &Decl) -> Vec<String> {
                 }
             }
         }
+        // A struct/alias typedef references types too — e.g. an `abstract`'s
+        // underlying record (`typedef FooData = { … Array<Foo> … }`) names the
+        // very class it backs, which is emitted *after* it.
+        Decl::Typedef(td) => match &td.target {
+            TypedefTarget::Alias(t) => ty(t, &mut out),
+            TypedefTarget::Struct(fields) => {
+                for f in fields {
+                    ty(&f.ty, &mut out);
+                }
+            }
+        },
         _ => {}
     }
     out

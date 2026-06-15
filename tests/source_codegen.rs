@@ -2095,18 +2095,15 @@ class W {
 }
 
 #[test]
-fn value_class_is_a_value_type() {
-    // `@value` makes a class a value type: `new` is value construction (no heap),
-    // fields and `Array<T>` are by value, member access is `.`, and nothing is
-    // ever freed (no ownership). Unlike `@:stackOnly`, a `@value` type may nest
-    // (be a field / array element).
+fn abstract_value_type_nests_as_field_and_vector() {
+    // An `abstract Name(U)` is a value type that — unlike `@:stackOnly` — nests
+    // freely: `new` is value construction (no heap), a field and an `Array<T>` are
+    // by value, member access is `.`, and nothing is ever freed (no ownership).
     let src = "\
-@value
-class Vec2 {
-  public var x:Float;
-  public var y:Float;
-  public function new(x:Float, y:Float) { this.x = x; this.y = y; }
-  public function lenSq():Float { return x * x + y * y; }
+typedef Vec2Data = { var x:Float; var y:Float; }
+abstract Vec2(Vec2Data) {
+  public function new(x:Float, y:Float) { this = { x: x, y: y }; }
+  public function lenSq():Float { return this.x * this.x + this.y * this.y; }
 }
 class Use {
   public var here:Vec2;
@@ -2224,4 +2221,72 @@ class Use {
     assert!(out.contains("this->__this = v;"), "`this = v` writes the underlying:\n{out}");
     assert!(out.contains("return this->__this * 2.0;"), "`this` reads the underlying:\n{out}");
     assert!(out.contains("Meters m = Meters(3.5)"), "`new` is value construction:\n{out}");
+}
+
+#[test]
+fn static_abstract_method_call_uses_scope_resolution() {
+    // `Type.staticMethod(args)` on a user value class → `Type::staticMethod(args)`
+    // (scope resolution), not member access (`.`).
+    let src = "\
+typedef Cents = { var n:Int; }
+abstract Money(Cents) {
+  public function new(n:Int) { this = { n: n }; }
+  public static function zero():Money { return new Money(0); }
+}
+class Use {
+  public function new() {}
+  public function go():Money { return Money.zero(); }
+}
+";
+    let out = gen_one(src, "Use");
+    assert!(out.contains("Money::zero()"), "static call uses scope resolution:\n{out}");
+    assert!(!out.contains("Money.zero()"), "no member-access dot for a static call:\n{out}");
+}
+
+#[test]
+fn cyclic_value_types_define_forwarders_out_of_line() {
+    // A `@:op([])` forwarder that returns a *later*-defined sibling value class
+    // (the sibling is incomplete in the class body) must be declared in-class and
+    // defined out-of-line (`inline`) after both classes — how a hand-written
+    // header breaks a `jobject`/`proxy` cycle. The self-returning operator stays
+    // inline (a member body is a complete-class context).
+    let src = "\
+typedef ViewData = { var n:Int; }
+typedef BagData = { var v:View; }
+abstract Bag(BagData) {
+  public function new(v:View) { this = { v: v }; }
+  @:op([]) public function at(i:Int):View { return this.v; }
+}
+abstract View(ViewData) {
+  public function new(n:Int) { this = { n: n }; }
+  @:to public function toInt():Int { return this.n; }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_cycle_h_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Cyc.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Cyc"))
+        .unwrap();
+    let head = hatchet::codegen::generate_header(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(head.contains("class View;"), "later sibling is forward-declared:\n{head}");
+    assert!(
+        head.contains("View operator[](int i);"),
+        "the cyclic forwarder is declared in-class:\n{head}"
+    );
+    assert!(
+        head.contains("inline View Bag::operator[](int i) { return at(i); }"),
+        "...and defined out-of-line after both classes:\n{head}"
+    );
+    // `View`'s own `@:to` (return type Int) is complete in-class → stays inline.
+    assert!(
+        head.contains("operator int() { return toInt(); }"),
+        "a non-deferred conversion stays inline:\n{head}"
+    );
 }
