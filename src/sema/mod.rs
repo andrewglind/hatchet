@@ -66,6 +66,21 @@ pub struct TypeInfo {
     /// or container element. An `abstract` newtype value class is *not*
     /// stack-restricted (it nests freely).
     pub stack_restricted: bool,
+    /// `@proxy("native::Name")` — the fully-qualified C++ native class this glue
+    /// type stands for. A proxy is never emitted. Two forms, keyed on `is_value`:
+    ///
+    /// * **consume** — an `abstract Name(T)` newtype (`is_value == true`): pure
+    ///   extern↔Haxe glue. `resolve_type` redirects it straight to the matched
+    ///   native extern, so spelling, reference-ness, and method dispatch all
+    ///   behave as that engine type (calls pass through, e.g. `engine->GetRenderer()`).
+    /// * **produce** — an `abstract class Name` (`is_value == false`): a Haxe base
+    ///   the modules subclass. It is *not* redirected (its own fields/abstract
+    ///   methods must resolve); it is only spelled as `native::Name` at use sites
+    ///   (`map_type_base`), so `extends Name` → `: public native::Name` and a
+    ///   `super(...)` routes to the native constructor.
+    ///
+    /// `None` for a normal type.
+    pub proxy_native: Option<String>,
     pub module_index: usize,
 }
 
@@ -231,6 +246,19 @@ impl Program {
                 let is_abstract_newtype =
                     matches!(decl, Decl::Class(c) if c.abstract_underlying.is_some());
                 let is_value = is_class && (stack_restricted || is_abstract_newtype);
+                // `@proxy("native::Name")`: the fully-qualified native class this
+                // glue type stands for. The native name now comes solely from the
+                // argument (no inference from the `abstract(T)` underlying). Misuse
+                // (missing argument / wrong declaration kind / no matching extern)
+                // is reported by `validate::flag_proxy`.
+                let proxy_native = if is_class {
+                    meta.iter()
+                        .find(|m| m.name == "proxy")
+                        .and_then(|m| m.first_arg())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
                 self.types.push(TypeInfo {
                     name: name.clone(),
                     package: m.package.clone(),
@@ -241,6 +269,7 @@ impl Program {
                     native_name,
                     is_value,
                     stack_restricted,
+                    proxy_native,
                     module_index: mi,
                 });
             }
@@ -333,7 +362,31 @@ impl Program {
                 best = Some((t, key));
             }
         }
-        best.map(|(t, _)| t)
+        let found = best.map(|(t, _)| t)?;
+        // A *consume* `@proxy` (an `abstract Name(T)` newtype, `is_value`) is
+        // transparent — resolve straight through to the matched native extern, so
+        // type spelling, reference-ness, and method dispatch all behave as that
+        // engine type. A *produce* `@proxy` (an `abstract class`) is NOT redirected:
+        // its own fields/abstract methods must resolve here, and it is spelled as
+        // its native base only at use sites (see `map_type_base`).
+        if found.is_value {
+            if let Some(native) = &found.proxy_native {
+                if let Some(target) = self.resolve_proxy_target(native) {
+                    return Some(target);
+                }
+            }
+        }
+        Some(found)
+    }
+
+    /// The `extern` type a `@proxy("native::Name")` stands for: the (non-proxy)
+    /// type whose fully-qualified `@:native` name equals `native`. This is both the
+    /// redirect target for a consume proxy and the spelling source for a produce
+    /// proxy; `validate::flag_proxy` errors when it is absent.
+    pub(crate) fn resolve_proxy_target(&self, native: &str) -> Option<&TypeInfo> {
+        self.types
+            .iter()
+            .find(|t| t.proxy_native.is_none() && qualified_native(t).as_deref() == Some(native))
     }
 
     /// If `name` refers to a global `final` **constant** in scope, return its
@@ -499,6 +552,11 @@ impl Program {
                 if name == "Null" && params.len() == 1 {
                     return self.map_type_base(&params[0], ctx_module, current_ns);
                 }
+                // `cpp.Pointer<T>` is hxcpp's raw pointer interop type — emit `T*`.
+                if name == "Pointer" && params.len() == 1 {
+                    let inner = self.map_type_base(&params[0], ctx_module, current_ns);
+                    return format!("{inner}*");
+                }
                 if params.is_empty() {
                     if let Some(prim) = map_primitive(name) {
                         return prim.to_string();
@@ -523,6 +581,14 @@ impl Program {
                         .enum_abstract_underlying(ti)
                         .map(|u| self.map_type_base(&u, ti.module_index, current_ns))
                         .unwrap_or_else(|| qualify(ti, current_ns)),
+                    // A *produce* `@proxy` (an `abstract class`) is spelled as the
+                    // native base it stands for — `Scene` → `mucus::IScene` — at
+                    // `extends`/`super`/variable sites. A *consume* proxy was already
+                    // redirected to its extern by `resolve_type`, so `ti` there is the
+                    // extern itself and falls through to `qualify`.
+                    Some(ti) if ti.proxy_native.is_some() => {
+                        ti.proxy_native.clone().unwrap_or_else(|| qualify(ti, current_ns))
+                    }
                     Some(ti) => qualify(ti, current_ns),
                     // Unknown (e.g. a generic parameter) — emit the name verbatim.
                     None => name.to_string(),
@@ -573,17 +639,20 @@ impl Program {
 
     fn is_emittable(&self, decl: &Decl) -> bool {
         match decl {
-            // `extern` types are implemented in hand-written C++ — not emitted.
-            Decl::Class(c) => !c.is_extern,
+            // `extern` types live in hand-written C++; `@proxy` types are pure
+            // extern↔Haxe glue (a consume proxy is transpiled *as* its native
+            // extern; a produce proxy is a base the modules subclass). None emitted.
+            Decl::Class(c) => !c.is_extern && !has_meta(&c.meta, "proxy"),
             Decl::Interface(i) => !i.is_extern,
             Decl::Enum(e) => !e.is_extern,
             // A `@:native` typedef names an existing engine struct (external value
             // type — typedefs can't be `extern`), so it is not emitted; the `UInt*`
             // shims aren't either. A plain typedef is emitted.
             Decl::Typedef(t) => !has_meta(&t.meta, "native") && !is_uint_shim(&t.name),
-            // A module-level `final`/lambda is emitted (external consts live as
-            // statics of an `extern class`).
-            Decl::Global(_) => true,
+            // A module-level `final`/lambda is emitted — unless `extern` (the
+            // constant is provided by hand-written C++; references still resolve
+            // to its `@:native`/namespace-qualified name).
+            Decl::Global(g) => !g.is_extern,
             // A function is emitted if it has a body (a free function or a
             // `@:abi` C-ABI export); a bodyless declaration is not.
             Decl::Function(f) => f.body.is_some() && !f.modifiers.is_macro,
@@ -696,6 +765,17 @@ fn native_target(meta: &[Meta]) -> (Option<Vec<String>>, Option<String>) {
     let name = parts.pop();
     let ns = if parts.is_empty() { None } else { Some(parts) };
     (ns, name)
+}
+
+/// A type's fully-qualified C++ native name from its `@:native` (`mucus::IScene`),
+/// or `None` if it has no explicit `@:native`. Used to match a `@proxy` argument to
+/// the extern it names.
+fn qualified_native(t: &TypeInfo) -> Option<String> {
+    let name = t.native_name.as_ref()?;
+    match &t.native_ns {
+        Some(ns) if !ns.is_empty() => Some(format!("{}::{name}", ns.join("::"))),
+        _ => Some(name.clone()),
+    }
 }
 
 /// Every `@:include` argument declared anywhere in a file.

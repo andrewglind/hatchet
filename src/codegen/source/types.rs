@@ -197,6 +197,13 @@ impl<'a> BodyGen<'a> {
                 inner.nullable = was_value;
                 return inner;
             }
+            // `cpp.Pointer<T>` → `T*`, carrying `T`'s info so member access on the
+            // result resolves (method lookup, parameter types) and dispatches `->`.
+            if path.last().map(|s| s.as_str()) == Some("Pointer") && params.len() == 1 {
+                let mut inner = self.ty_of_in(&params[0], ctx);
+                inner.is_ptr = true;
+                return inner;
+            }
         }
         let base_use = self.prog.map_type_use(ht, ctx, &self.ns);
         let is_ptr = base_use.ends_with('*');
@@ -566,6 +573,10 @@ impl<'a> BodyGen<'a> {
             Expr::Bool(_) => bool_ty(),
             Expr::Str { .. } => Ty { base: "std::string".into(), ..Default::default() },
             Expr::Ident(n) => self.lookup_local(n).unwrap_or_default(),
+            // A *typed* cast (`cast(x, cpp.Float32)`) carries exactly the type the
+            // call means to select an overload on (e.g. C++ `float` vs `double`) —
+            // honour it. An untyped `cast(x)` stays a wildcard.
+            Expr::Cast { ty: Some(t), .. } => self.ty_of(t),
             _ => Ty::default(),
         }
     }

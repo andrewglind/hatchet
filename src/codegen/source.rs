@@ -52,7 +52,7 @@ pub fn generate_source_diagnostics(
         .file
         .decls
         .iter()
-        .any(|d| matches!(d, Decl::Class(c) if !c.is_extern));
+        .any(|d| matches!(d, Decl::Class(c) if !c.is_extern && !has_meta(&c.meta, "proxy")));
     let free_fns: Vec<&GlobalVar> = m
         .file
         .decls
@@ -129,6 +129,7 @@ pub fn generate_source_diagnostics(
             .filter_map(|d| match d {
                 Decl::Global(g)
                     if g.is_final
+                        && !g.is_extern
                         && g.access == Access::Private
                         && lambda_parts(g).is_none() =>
                 {
@@ -207,7 +208,10 @@ pub fn generate_source_diagnostics(
 
     for decl in &m.file.decls {
         if let Decl::Class(c) = decl {
-            if c.is_extern {
+            // `extern` classes live in hand-written C++; `@proxy` glue classes are
+            // never emitted (a consume proxy transpiles *as* its native extern; a
+            // produce proxy is a base the modules subclass). Neither has a `.cpp`.
+            if c.is_extern || has_meta(&c.meta, "proxy") {
                 continue;
             }
             let mut g = BodyGen::new(prog, module_index, c, extract_depth, no_trace);
@@ -443,6 +447,18 @@ impl<'a> BodyGen<'a> {
     fn transfer_owned(&mut self, name: &str) {
         for scope in self.owned.iter_mut() {
             scope.retain(|n| n != name);
+        }
+    }
+
+    /// Emit a function body's scope-closing `delete`s — UNLESS the body ends in a
+    /// tail `return`. A tail return already freed the owned locals (the `return`
+    /// emitter does so before exiting) and nothing falls through past it, so the
+    /// closing-brace deletes would be unreachable dead code AND a spurious second
+    /// free of each owned local. Every function-body emitter funnels through here
+    /// so the guard cannot drift between them.
+    fn emit_body_close_deletes(&mut self, stmts: &[Stmt], out: &mut String, ind: usize) {
+        if !matches!(stmts.last(), Some(Stmt::Return(..))) {
+            self.emit_owned_deletes(out, ind);
         }
     }
 
@@ -839,10 +855,17 @@ fn str_ty() -> Ty {
     Ty { base: "std::string".into(), ..Default::default() }
 }
 
-/// A bare `Type::Named` from a single type name (used to map a parsed overload
-/// signature's Haxe type names back through the normal type machinery).
+/// A bare `Type::Named` from a type name (used to map a parsed overload
+/// signature's Haxe type names back through the normal type machinery). A dotted
+/// name (`cpp.StdString`, `cpp.Float32`) is split into path segments so the leaf
+/// is matched by the primitive/`cpp.*` mapper, exactly as a normally-parsed type.
 fn type_from_name(name: &str) -> Type {
-    Type::Named { path: vec![name.to_string()], params: Vec::new(), optional: false, line: 0 }
+    Type::Named {
+        path: name.split('.').map(|s| s.to_string()).collect(),
+        params: Vec::new(),
+        optional: false,
+        line: 0,
+    }
 }
 
 /// Parse one `@:overload(function(p:T, …):R {})` signature into its parameter Haxe

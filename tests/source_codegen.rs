@@ -168,6 +168,51 @@ class C {
 }
 
 #[test]
+fn overload_matching_accepts_dotted_cpp_param_types() {
+    // Regression: an `@:overload` parameter typed `cpp.StdString` / `cpp.Float32`
+    // (a dotted name) must match a `std::string` / `float` argument — the dotted
+    // name has to be split into path segments so the leaf maps through the
+    // primitive/`cpp.*` mapper (otherwise the whole `"cpp.StdString"` is the base
+    // and never equals `"std::string"`, so no overload matches).
+    let src = "\
+@:native(\"Props\") @:include(\"props.h\") @:structAccess
+extern class IProps {
+  @:overload(function(k:cpp.StdString, d:Int):Int {})
+  @:overload(function(k:cpp.StdString, d:cpp.Float32):cpp.Float32 {})
+  public function GetOr(k:cpp.StdString, d:Dynamic):Dynamic;
+}
+class C {
+  var props:cpp.Pointer<IProps>;
+  public function new() {}
+  public function run():Void {
+    var n = this.props.GetOr(\"a\", 5);
+    var f = this.props.GetOr(\"b\", cast(1.5, cpp.Float32));
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_overload_dotted_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("P.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("P"))
+        .unwrap();
+    let (out, _warnings, errors) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !errors.iter().any(|(_, msg)| msg.contains("overload")),
+        "cpp.StdString param must match a std::string arg (no overload mismatch): {:?}",
+        errors
+    );
+    assert!(out.contains("int n = this->props->GetOr("), "Int overload return type resolves:\n{out}");
+    // A typed `cast(_, cpp.Float32)` arg selects the float overload (not the first).
+    assert!(out.contains("float f = this->props->GetOr("), "typed cast selects the cpp.Float32 overload:\n{out}");
+}
+
+#[test]
 fn file_finals_become_static_const_definitions() {
     // Every `final` becomes a `static const` inside the namespace (no `#define`):
     // a scalar is written directly, a struct is aggregate-initialised, and an
@@ -2354,6 +2399,256 @@ class User {
     assert!(head.contains("#include \"engine.h\""), "its @:include is pulled:\n{head}");
     assert!(head.contains("class User"), "the non-extern class is emitted:\n{head}");
     assert!(head.contains("Engine* e;"), "the extern type is referenced (by pointer):\n{head}");
+}
+
+#[test]
+fn cpp_pointer_and_stdstring_lower_to_pointer_and_std_string() {
+    // hxcpp interop shims used to bind external engine handles: `cpp.Pointer<T>`
+    // lowers to `T*` (the inner type's spelling, incl. any `@:native` rename),
+    // and `cpp.StdString` to `std::string`.
+    let src = "\
+@:include(\"engine.h\") @:native(\"eng::IEngine\") @:structAccess
+extern class IEngine {
+  public function go():Int;
+}
+class User {
+  public var engine:cpp.Pointer<IEngine>;
+  public var name:cpp.StdString;
+  public function new() {}
+  public function rename(n:cpp.StdString):Void { this.name = n; }
+}
+";
+    let head = gen_header(src, "User");
+    assert!(
+        head.contains("eng::IEngine* engine;"),
+        "cpp.Pointer<IEngine> → eng::IEngine* (inner @:native rename applied):\n{head}"
+    );
+    assert!(head.contains("std::string name;"), "cpp.StdString → std::string:\n{head}");
+
+    let out = gen_one(src, "User");
+    assert!(
+        out.contains("std::string& n") || out.contains("std::string n"),
+        "cpp.StdString parameter lowers to std::string:\n{out}"
+    );
+}
+
+#[test]
+fn cpp_pointer_return_carries_inner_info_for_chained_calls() {
+    // Regression: a `cpp.Pointer<T>` result must carry `T`'s `TypeInfo` so a
+    // *chained* call resolves (`GetRenderer()->Push(...)`), and an anon literal
+    // argument lowers to the callee's struct parameter type — not `void`.
+    let src = "\
+@:include(\"e.h\") @:native(\"e::Effect\") @:structAccess
+typedef Effect = { kind:Int };
+@:include(\"e.h\") @:native(\"e::IRenderer\") @:structAccess
+extern class IRenderer { public function Push(eff:Effect):Void; }
+@:include(\"e.h\") @:native(\"e::IEngine\") @:structAccess
+extern class IEngine { public function GetRenderer():cpp.Pointer<IRenderer>; }
+class User {
+  var engine:cpp.Pointer<IEngine>;
+  public function new() {}
+  public function go():Void { engine.GetRenderer().Push({ kind: 1 }); }
+}
+";
+    let out = gen_one(src, "User");
+    assert!(!out.contains("void _anon"), "anon arg must not fall back to void:\n{out}");
+    assert!(out.contains("e::Effect _anon"), "anon arg lowers to the struct param type:\n{out}");
+    assert!(
+        out.contains("engine->GetRenderer()->Push("),
+        "chained call resolves and dispatches via `->`:\n{out}"
+    );
+}
+
+/// Run the pre-codegen validation pass over a single synthetic source and return
+/// the error messages (the `@proxy` misuse checks live here, not in codegen).
+fn validation_errors(src: &str, stem: &str) -> Vec<String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("hatchet_v_{stem}_{}_{uniq}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{stem}.hx")), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some(stem))
+        .unwrap();
+    let errs = hatchet::sema::validate::unsupported_construct_errors(&prog, idx);
+    let _ = std::fs::remove_dir_all(&dir);
+    errs.into_iter().map(|d| d.message).collect()
+}
+
+#[test]
+fn consume_proxy_abstract_is_not_emitted_and_lowers_to_its_native_extern() {
+    // `@proxy("native")` on an `abstract Name(cpp.Pointer<T>)` is extern↔Haxe glue:
+    // never emitted, and every reference transpiles *as* the named native extern —
+    // so a field is `T*` and calls pass straight through (`->`) to the engine,
+    // bypassing the proxy's stub bodies entirely.
+    let src = "\
+@:include(\"engine.h\") @:native(\"eng::IRenderer\") @:structAccess
+extern class IRenderer { public function W():Int; }
+@:include(\"engine.h\") @:native(\"eng::IEngine\") @:structAccess
+extern class IEngine { public function GetRenderer():cpp.Pointer<IRenderer>; }
+
+@proxy(\"eng::IEngine\")
+abstract Engine(cpp.Pointer<IEngine>) {
+  public function GetRenderer():Renderer { return null; }
+}
+@proxy(\"eng::IRenderer\")
+abstract Renderer(cpp.Pointer<IRenderer>) {
+  public function W():Int { return 0; }
+}
+
+class User {
+  var engine:Engine;
+  public function new(engine:Engine) { this.engine = engine; }
+  public function go():Int { return engine.GetRenderer().W(); }
+}
+";
+    let head = gen_header(src, "User");
+    assert!(!head.contains("class Engine"), "proxy is not emitted:\n{head}");
+    assert!(!head.contains("class Renderer"), "proxy is not emitted:\n{head}");
+    assert!(head.contains("eng::IEngine* engine;"), "proxy field → native extern pointer:\n{head}");
+
+    let out = gen_one(src, "User");
+    assert!(
+        out.contains("engine->GetRenderer()->W()"),
+        "calls pass straight through the extern with `->`:\n{out}"
+    );
+}
+
+#[test]
+fn produce_proxy_abstract_class_is_a_native_base_subclasses_derive_from() {
+    // `@proxy("native")` on an `abstract class` is the produced-base form: the base
+    // is never emitted, but a subclass `extends` it as the native base
+    // (`: public mucus::IScene`) and its `super(...)` routes to the native ctor.
+    let src = "\
+@:include(\"mucus.h\") @:native(\"mucus::IScene\") @:structAccess
+extern class IScene {}
+
+@proxy(\"mucus::IScene\")
+abstract class Scene {
+  private var id:Int;
+  public function new(id:Int) {}
+  public abstract function OnLoad():Void;
+}
+
+class Title extends Scene {
+  public function new() { super(7); }
+  public function OnLoad():Void {}
+}
+";
+    let head = gen_header(src, "Title");
+    assert!(!head.contains("class Scene"), "produce-proxy base is not emitted:\n{head}");
+    assert!(
+        head.contains(": public mucus::IScene"),
+        "subclass derives from the native base:\n{head}"
+    );
+
+    let out = gen_one(src, "Title");
+    assert!(
+        out.contains("mucus::IScene(7)"),
+        "super(...) routes to the native base constructor:\n{out}"
+    );
+}
+
+#[test]
+fn proxy_without_argument_is_an_error() {
+    let src = "\
+@:native(\"mucus::IScene\") extern class IScene {}
+@proxy
+abstract class Scene { public function new() {} }
+";
+    let errs = validation_errors(src, "Scene");
+    assert!(
+        errs.iter().any(|e| e.contains("@proxy") && e.contains("requires the fully-qualified")),
+        "a `@proxy` with no argument must error, got: {errs:?}"
+    );
+}
+
+#[test]
+fn proxy_on_non_abstract_declaration_is_an_error() {
+    let src = "\
+@:native(\"mucus::IScene\") extern class IScene {}
+@proxy(\"mucus::IScene\")
+class Scene { public function new() {} }
+";
+    let errs = validation_errors(src, "Scene");
+    assert!(
+        errs.iter().any(|e| e.contains("@proxy") && e.contains("only valid on an `abstract`")),
+        "a `@proxy` on a normal class must error, got: {errs:?}"
+    );
+}
+
+#[test]
+fn proxy_naming_an_undeclared_native_is_an_error() {
+    let src = "\
+@proxy(\"mucus::IScene\")
+abstract class Scene { public function new() {} }
+";
+    let errs = validation_errors(src, "Scene");
+    assert!(
+        errs.iter().any(|e| e.contains("no matching `extern`")),
+        "a `@proxy` naming an undeclared native type must error, got: {errs:?}"
+    );
+}
+
+#[test]
+fn free_function_tail_return_frees_owned_local_once() {
+    // A top-level free `function` whose body ends in a `return` must free its owned
+    // heap local exactly once — before the `return` — not again at the closing
+    // brace. The tail-return emitter already frees owned locals, so an unguarded
+    // closing-brace delete is unreachable dead code AND a spurious second free.
+    let src = "\
+class Worker {
+  public function new() {}
+  public function run():Int { return 42; }
+}
+
+function go():Int {
+  var w = new Worker();
+  return w.run();
+}
+";
+    let out = gen_one(src, "M");
+    let deletes = out.matches("delete w;").count();
+    assert_eq!(deletes, 1, "owned local freed exactly once (no dead double-delete):\n{out}");
+}
+
+#[test]
+fn extern_module_final_is_not_emitted_but_references_resolve() {
+    // An `extern final` constant is provided by hand-written C++ — Hatchet emits
+    // no `static const` definition for it (in the header or the cpp), but a
+    // cross-namespace reference still resolves to its namespace-qualified name.
+    let eng = "\
+package eng;
+@:include(\"engine.h\") @:native(\"LIMIT\")
+extern inline final LIMIT:Int = 99;
+";
+    let game = "\
+package game;
+import eng.Engine;
+class User {
+  public function new() {}
+  public function cap():Int { return LIMIT; }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_externfinal_{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("eng")).unwrap();
+    std::fs::create_dir_all(dir.join("game")).unwrap();
+    std::fs::write(dir.join("eng").join("Engine.hx"), eng).unwrap();
+    std::fs::write(dir.join("game").join("Game.hx"), game).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Game"))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!out.contains("99"), "no definition for the extern const is emitted:\n{out}");
+    assert!(out.contains("eng::LIMIT"), "cross-namespace reference is qualified:\n{out}");
 }
 
 #[test]

@@ -214,11 +214,7 @@ impl<'a> BodyGen<'a> {
         for st in stmts {
             self.gen_stmt(st, 1, &mut body);
         }
-        // A tail `return` already freed the owned locals (and no path falls through
-        // past it), so the closing-brace deletes would be unreachable dead code.
-        if !matches!(stmts.last(), Some(Stmt::Return(..))) {
-            self.emit_owned_deletes(&mut body, 1);
-        }
+        self.emit_body_close_deletes(stmts, &mut body, 1);
         self.pop_scope();
         format!("\t{ret} {class_name}::{name}({params}) {{\n{body}\t}}\n")
     }
@@ -276,7 +272,7 @@ impl<'a> BodyGen<'a> {
                 for st in stmts {
                     self.gen_stmt(st, 1, &mut body_buf);
                 }
-                self.emit_owned_deletes(&mut body_buf, 1);
+                self.emit_body_close_deletes(stmts, &mut body_buf, 1);
             }
         }
         self.pop_scope();
@@ -308,7 +304,7 @@ impl<'a> BodyGen<'a> {
             for st in stmts {
                 self.gen_stmt(st, 1, &mut body_buf);
             }
-            self.emit_owned_deletes(&mut body_buf, 1);
+            self.emit_body_close_deletes(stmts, &mut body_buf, 1);
         }
         self.pop_scope();
         format!("{prefix}_EXPORT {ret_cpp} {prefix}_CALL {name}({plist}) {{\n{body_buf}}}\n")
@@ -361,7 +357,7 @@ impl<'a> BodyGen<'a> {
             for st in stmts {
                 self.gen_stmt(st, 1, &mut body_buf);
             }
-            self.emit_owned_deletes(&mut body_buf, 1);
+            self.emit_body_close_deletes(stmts, &mut body_buf, 1);
         }
         self.pop_scope();
         format!("\t{prefix}{ret_cpp} {name}({plist}) {{\n{body_buf}\t}}\n")

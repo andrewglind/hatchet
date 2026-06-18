@@ -452,6 +452,10 @@ pub struct GlobalVar {
     pub ty: Option<Type>,
     pub init: Option<Expr>,
     pub is_final: bool,
+    /// `extern` — the constant is provided by hand-written C++ (e.g. a native
+    /// `static const`), so its definition is not emitted; references still
+    /// resolve to its (`@:native`/namespace-qualified) name.
+    pub is_extern: bool,
     pub access: Access,
     pub meta: Vec<Meta>,
 }

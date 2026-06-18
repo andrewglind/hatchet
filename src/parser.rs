@@ -549,7 +549,7 @@ impl<'a> Parser<'a> {
             TokKind::Kw(Kw::Var) | TokKind::Kw(Kw::Final) => {
                 let is_final_kw = self.at_kw(Kw::Final);
                 self.bump();
-                let g = self.parse_global_var(meta, access, is_final_kw)?;
+                let g = self.parse_global_var(meta, access, is_final_kw, modifiers.is_extern)?;
                 Ok(Decl::Global(g))
             }
             other => Err(self.err(&format!("unexpected top-level token {:?}", other))),
@@ -848,6 +848,7 @@ impl<'a> Parser<'a> {
         meta: Vec<Meta>,
         access: Access,
         is_final: bool,
+        is_extern: bool,
     ) -> PResult<GlobalVar> {
         let name = self.expect_ident()?;
         let ty = if self.eat_sym(Sym::Colon) {
@@ -866,6 +867,7 @@ impl<'a> Parser<'a> {
             ty,
             init,
             is_final,
+            is_extern,
             access,
             meta,
         })

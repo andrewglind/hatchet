@@ -253,7 +253,57 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
     for d in &m.file.decls {
         flag_rest_params(d, &file, &mut out);
     }
+    // `@proxy("native::Name")` interop glue — argument mandatory, only on an
+    // `abstract`/`abstract class`, and must name a declared `extern`.
+    for d in &m.file.decls {
+        flag_proxy(prog, d, &file, &mut out);
+    }
     out
+}
+
+/// Validate `@proxy("native::Name")` usage: the fully-qualified native C++
+/// class name is a mandatory string argument, it applies only to an `abstract`
+/// newtype or an `abstract class`, and it must name a type declared `extern` with
+/// a matching `@:native`. Each rule is a hard error rather than a silent mis-emit.
+fn flag_proxy(prog: &Program, d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
+    let (meta, line, kind_label): (&[Meta], usize, &str) = match d {
+        Decl::Class(c) => (&c.meta, c.line, "a class"),
+        Decl::Interface(i) => (&i.meta, i.line, "an interface"),
+        Decl::Enum(e) => (&e.meta, 0, "an enum"),
+        Decl::Typedef(t) => (&t.meta, 0, "a typedef"),
+        Decl::Global(g) => (&g.meta, 0, "a variable"),
+        _ => return,
+    };
+    let Some(m) = meta.iter().find(|m| m.name == "proxy") else { return };
+    // Only an `abstract Name(T)` newtype or an `abstract class` may be a proxy.
+    let abstract_form =
+        matches!(d, Decl::Class(c) if c.abstract_underlying.is_some() || c.is_abstract);
+    if !abstract_form {
+        out.push(Diagnostic::error(
+            file.to_string(),
+            line,
+            format!("`@proxy` is only valid on an `abstract` or `abstract class` (found on {kind_label})"),
+        ));
+        return;
+    }
+    // The fully-qualified native class name is mandatory.
+    let native = m.first_arg().unwrap_or("").trim();
+    if native.is_empty() {
+        out.push(Diagnostic::error(
+            file.to_string(),
+            line,
+            "`@proxy` requires the fully-qualified native C++ class name as a string argument, e.g. `@proxy(\"mucus::IScene\")`".to_string(),
+        ));
+        return;
+    }
+    // The native type must be declared as an `extern` with a matching `@:native`.
+    if prog.resolve_proxy_target(native).is_none() {
+        out.push(Diagnostic::error(
+            file.to_string(),
+            line,
+            format!("`@proxy(\"{native}\")` names a native type with no matching `extern` declaration (expected an `extern class` with `@:native(\"{native}\")`)"),
+        ));
+    }
 }
 
 /// Flag every rest parameter (`...vals`) declared in `d` as unsupported.
@@ -1061,6 +1111,8 @@ impl Collector {
                 let known = map_primitive(name).is_some()
                     || container_template(name).is_some()
                     || name == "Null"
+                    // `cpp.Pointer<T>` lowers to `T*`; its param is still checked below.
+                    || name == "Pointer"
                     || matches!(name, "Dynamic" | "Any")
                     || self.type_params.contains(name);
                 if !known {

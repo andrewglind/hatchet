@@ -103,7 +103,8 @@ impl<'a> HeaderGen<'a> {
         let mut emitted_const = false;
         for decl in &m.file.decls {
             if let Decl::Global(g) = decl {
-                if g.is_final && g.access != Access::Private {
+                // `extern` finals are provided by hand-written C++ — not emitted.
+                if g.is_final && !g.is_extern && g.access != Access::Private {
                     if let Some(text) = crate::codegen::source::render_final_const(self.prog, self.mi, g) {
                         ns_body.push_str(&text);
                         emitted_const = true;
@@ -124,7 +125,7 @@ impl<'a> HeaderGen<'a> {
                 Decl::Enum(e) if !e.is_extern => Some(self.emit_enum(e, base)),
                 Decl::Typedef(t) if self.emit_typedef_wanted(t) => self.emit_typedef(t, base),
                 Decl::Interface(i) if !i.is_extern => Some(self.emit_interface(i, base)),
-                Decl::Class(c) if !c.is_extern => {
+                Decl::Class(c) if !c.is_extern && !has_meta(&c.meta, "proxy") => {
                     let (text, deferred) = self.emit_class(c, base);
                     deferred_defs.push_str(&deferred);
                     Some(text)
@@ -251,7 +252,7 @@ impl<'a> HeaderGen<'a> {
                 Decl::Enum(e) => !e.is_extern,
                 Decl::Typedef(t) => self.emit_typedef_wanted(t),
                 Decl::Interface(i) => !i.is_extern,
-                Decl::Class(c) => !c.is_extern,
+                Decl::Class(c) => !c.is_extern && !has_meta(&c.meta, "proxy"),
                 _ => false,
             })
             .collect()
