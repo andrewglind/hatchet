@@ -18,7 +18,9 @@ impl<'a> BodyGen<'a> {
             s.push('\n');
         }
         for m in self.class.methods.clone() {
-            let Some(mname) = m.name.clone() else { continue };
+            let Some(mname) = m.name.clone() else {
+                continue;
+            };
             if self.is_accessor_method(&mname) {
                 continue;
             }
@@ -81,7 +83,21 @@ impl<'a> BodyGen<'a> {
         self.emit_owned_deletes(&mut body, 1);
         self.pop_scope();
 
-        format!("\t{class_name}::{class_name}({params}){init} {{\n{body}\t}}\n")
+        format!(
+            "\t{inl}{class_name}::{class_name}({params}){init} {{\n{body}\t}}\n",
+            inl = self.inline_kw()
+        )
+    }
+
+    /// `"inline "` when emitting header-only definitions, else empty. A
+    /// constructor/method defined out-of-line inside a header needs `inline` so
+    /// including it from several translation units does not violate the ODR.
+    pub(super) fn inline_kw(&self) -> &'static str {
+        if self.inline_defs {
+            "inline "
+        } else {
+            ""
+        }
     }
 
     /// Emit the `XHolder` constructor + the class constructor (with its
@@ -111,8 +127,11 @@ impl<'a> BodyGen<'a> {
             let _ = writeln!(hbody, "\tthis->{mname} = {code};");
         }
         self.pop_scope();
-        let holder_ctor =
-            format!("\t{0}::{0}({params}) {{\n{hbody}\t}}\n", h.name);
+        let holder_ctor = format!(
+            "\t{inl}{0}::{0}({params}) {{\n{hbody}\t}}\n",
+            h.name,
+            inl = self.inline_kw()
+        );
 
         // 2. Class constructor: initialiser list calls XHolder with all params and
         //    the base with the mapped super arguments; body is the post-super code.
@@ -149,7 +168,10 @@ impl<'a> BodyGen<'a> {
         }
         self.emit_owned_deletes(&mut body, 1);
         self.pop_scope();
-        let class_ctor = format!("\t{class_name}::{class_name}({params}){init} {{\n{body}\t}}\n");
+        let class_ctor = format!(
+            "\t{inl}{class_name}::{class_name}({params}){init} {{\n{body}\t}}\n",
+            inl = self.inline_kw()
+        );
 
         format!("{holder_ctor}\n{class_ctor}")
     }
@@ -176,8 +198,20 @@ impl<'a> BodyGen<'a> {
     /// Generate a pre-super statement for an `XHolder` constructor: a `var` whose
     /// name is lifted becomes a member assignment (`this->name = ...`); everything
     /// else is an ordinary local statement.
-    pub(super) fn gen_holder_stmt(&mut self, st: &Stmt, lifted: &[String], ind: usize, out: &mut String) {
-        if let Stmt::Var { name, ty, init: Some(init), .. } = st {
+    pub(super) fn gen_holder_stmt(
+        &mut self,
+        st: &Stmt,
+        lifted: &[String],
+        ind: usize,
+        out: &mut String,
+    ) {
+        if let Stmt::Var {
+            name,
+            ty,
+            init: Some(init),
+            ..
+        } = st
+        {
             if lifted.iter().any(|n| n == name) {
                 let t = "\t".repeat(ind);
                 self.prelude_ind = ind;
@@ -196,7 +230,11 @@ impl<'a> BodyGen<'a> {
     /// so `this` (the underlying) lowers to the synthetic `this->__this` member
     /// inside method/ctor bodies. A no-op for an ordinary class.
     pub(super) fn set_abstract_this(&mut self) {
-        self.abstract_this = self.class.abstract_underlying.clone().map(|u| self.ty_of(&u));
+        self.abstract_this = self
+            .class
+            .abstract_underlying
+            .clone()
+            .map(|u| self.ty_of(&u));
     }
 
     pub(super) fn method_impl(&mut self, class_name: &str, m: &Function) -> String {
@@ -216,12 +254,19 @@ impl<'a> BodyGen<'a> {
         }
         self.emit_body_close_deletes(stmts, &mut body, 1);
         self.pop_scope();
-        format!("\t{ret} {class_name}::{name}({params}) {{\n{body}\t}}\n")
+        format!(
+            "\t{inl}{ret} {class_name}::{name}({params}) {{\n{body}\t}}\n",
+            inl = self.inline_kw()
+        )
     }
 
     /// Signature (`ret name(params)`) for a top-level free function; `with_defaults`
     /// keeps any ` = default` suffixes (for the declaration only).
-    pub(super) fn free_fn_signature(&mut self, g: &GlobalVar, with_defaults: bool) -> Option<String> {
+    pub(super) fn free_fn_signature(
+        &mut self,
+        g: &GlobalVar,
+        with_defaults: bool,
+    ) -> Option<String> {
         let (params, ret, body) = lambda_parts(g)?;
         let params = effective_lambda_params(params, g.ty.as_ref());
         self.push_scope();
@@ -243,7 +288,9 @@ impl<'a> BodyGen<'a> {
 
     /// Full definition of a top-level free function (`static` when file-local).
     pub(super) fn free_fn_def(&mut self, g: &GlobalVar) -> String {
-        let Some((params, ret, body)) = lambda_parts(g) else { return String::new() };
+        let Some((params, ret, body)) = lambda_parts(g) else {
+            return String::new();
+        };
         let params = effective_lambda_params(params, g.ty.as_ref());
         self.current_fn = g.name.clone();
         self.push_scope();
@@ -252,7 +299,11 @@ impl<'a> BodyGen<'a> {
         self.current_ret = ret_ty.clone();
         let ret_cpp = self.decl_spelling(&ret_ty);
         let plist = self.header_params(&params);
-        let prefix = if g.access == Access::Private { "static " } else { "" };
+        let prefix = if g.access == Access::Private {
+            "static "
+        } else {
+            ""
+        };
 
         let mut body_buf = String::new();
         match body {
@@ -276,7 +327,10 @@ impl<'a> BodyGen<'a> {
             }
         }
         self.pop_scope();
-        format!("\t{prefix}{ret_cpp} {}({plist}) {{\n{body_buf}\t}}\n", g.name)
+        format!(
+            "\t{prefix}{ret_cpp} {}({plist}) {{\n{body_buf}\t}}\n",
+            g.name
+        )
     }
 
     /// Full definition of an `extern inline` function as an `extern "C"` export at
@@ -285,14 +339,19 @@ impl<'a> BodyGen<'a> {
     /// qualified. The signature and braces sit at column 0; the body is indented one
     /// level (the function is not inside a namespace).
     pub(super) fn extern_fn_def(&mut self, f: &Function) -> String {
-        let Some(name) = f.name.clone() else { return String::new() };
+        let Some(name) = f.name.clone() else {
+            return String::new();
+        };
         let prefix = self.prog.export_macro.clone();
         self.current_fn = name.clone();
         self.push_scope();
         self.bind_params(&f.params);
         let ret_ty = match &f.ret {
             Some(t) => self.ty_of(t),
-            None => Ty { base: "void".to_string(), ..Default::default() },
+            None => Ty {
+                base: "void".to_string(),
+                ..Default::default()
+            },
         };
         self.current_ret = ret_ty.clone();
         let ret_cpp = self.decl_spelling(&ret_ty);
@@ -312,13 +371,20 @@ impl<'a> BodyGen<'a> {
 
     /// Signature (`ret name(params)`) for a plain module-level free function;
     /// `with_defaults` keeps any ` = default` suffixes (the header declaration).
-    pub(super) fn plain_fn_signature(&mut self, f: &Function, with_defaults: bool) -> Option<String> {
+    pub(super) fn plain_fn_signature(
+        &mut self,
+        f: &Function,
+        with_defaults: bool,
+    ) -> Option<String> {
         let name = f.name.clone()?;
         self.push_scope();
         self.bind_params(&f.params);
         let ret_ty = match &f.ret {
             Some(t) => self.ty_of(t),
-            None => Ty { base: "void".to_string(), ..Default::default() },
+            None => Ty {
+                base: "void".to_string(),
+                ..Default::default()
+            },
         };
         let ret_cpp = self.decl_spelling(&ret_ty);
         let plist = if with_defaults {
@@ -338,18 +404,27 @@ impl<'a> BodyGen<'a> {
     /// namespace free function (`static` when file-local). Unlike the lambda form,
     /// this has a real signature and statement body.
     pub(super) fn plain_fn_def(&mut self, f: &Function) -> String {
-        let Some(name) = f.name.clone() else { return String::new() };
+        let Some(name) = f.name.clone() else {
+            return String::new();
+        };
         self.current_fn = name.clone();
         self.push_scope();
         self.bind_params(&f.params);
         let ret_ty = match &f.ret {
             Some(t) => self.ty_of(t),
-            None => Ty { base: "void".to_string(), ..Default::default() },
+            None => Ty {
+                base: "void".to_string(),
+                ..Default::default()
+            },
         };
         self.current_ret = ret_ty.clone();
         let ret_cpp = self.decl_spelling(&ret_ty);
         let plist = self.header_params(&f.params);
-        let prefix = if f.access == Access::Private { "static " } else { "" };
+        let prefix = if f.access == Access::Private {
+            "static "
+        } else {
+            ""
+        };
 
         let mut body_buf = String::new();
         if let Some(stmts) = &f.body {
@@ -421,7 +496,8 @@ impl<'a> BodyGen<'a> {
                     // optional value-struct parameters are pointers
                     if p.optional && !ty.is_ptr {
                         if let Some(info) = &ty.info {
-                            if matches!(info.kind, TypeKind::StructTypedef | TypeKind::AliasTypedef) {
+                            if matches!(info.kind, TypeKind::StructTypedef | TypeKind::AliasTypedef)
+                            {
                                 ty.is_ptr = true;
                             }
                         }

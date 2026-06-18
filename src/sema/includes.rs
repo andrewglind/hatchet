@@ -166,7 +166,11 @@ fn relative_fs(from: &std::path::Path, to: &std::path::Path) -> String {
     }
     let ups = f.len() - common;
     let mut parts: Vec<String> = std::iter::repeat_n("..".to_string(), ups).collect();
-    parts.extend(t[common..].iter().map(|c| c.as_os_str().to_string_lossy().into_owned()));
+    parts.extend(
+        t[common..]
+            .iter()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned()),
+    );
     parts.join("/")
 }
 
@@ -181,7 +185,11 @@ mod tests {
     #[test]
     fn two_step_inherited_include() {
         // native/api declares ../../src/Native.h ; target is modules/
-        let got = resolve_include("../../src/Native.h", &parts("native/api"), &parts("modules"));
+        let got = resolve_include(
+            "../../src/Native.h",
+            &parts("native/api"),
+            &parts("modules"),
+        );
         assert_eq!(got, "../src/Native.h");
     }
 
@@ -211,8 +219,14 @@ mod tests {
     fn system_header_is_emitted_verbatim() {
         // Angle-bracket system headers are never path-resolved, even across
         // directories, and surrounding whitespace is trimmed.
-        assert_eq!(resolve_include("<string>", &parts("modules"), &parts("game")), "<string>");
-        assert_eq!(resolve_include("  <vector>  ", &parts("a/b"), &parts("a/b")), "<vector>");
+        assert_eq!(
+            resolve_include("<string>", &parts("modules"), &parts("game")),
+            "<string>"
+        );
+        assert_eq!(
+            resolve_include("  <vector>  ", &parts("a/b"), &parts("a/b")),
+            "<vector>"
+        );
     }
 
     #[test]
@@ -221,9 +235,18 @@ mod tests {
         // the filesystem is never consulted (these paths need not exist).
         let src = std::path::Path::new("/proj/Modules");
         let out = std::path::Path::new("/proj/Modules/out");
-        assert_eq!(rebase_if_escaping("Module.h", &parts("modules"), src, out), "Module.h");
-        assert_eq!(rebase_if_escaping("<string>", &parts("modules"), src, out), "<string>");
-        assert_eq!(rebase_if_escaping("../game/Scene.h", &parts("modules"), src, out), "../game/Scene.h");
+        assert_eq!(
+            rebase_if_escaping("Module.h", &parts("modules"), src, out),
+            "Module.h"
+        );
+        assert_eq!(
+            rebase_if_escaping("<string>", &parts("modules"), src, out),
+            "<string>"
+        );
+        assert_eq!(
+            rebase_if_escaping("../game/Scene.h", &parts("modules"), src, out),
+            "../game/Scene.h"
+        );
     }
 
     #[test]
@@ -239,7 +262,12 @@ mod tests {
         let out = t.join("Modules/out");
         std::fs::create_dir_all(out.join("modules")).unwrap();
 
-        let got = rebase_if_escaping("../../NativeEngine/src/Native.h", &parts("modules"), &src, &out);
+        let got = rebase_if_escaping(
+            "../../NativeEngine/src/Native.h",
+            &parts("modules"),
+            &src,
+            &out,
+        );
         let _ = std::fs::remove_dir_all(&t);
         assert_eq!(got, "../../../NativeEngine/src/Native.h");
     }
@@ -261,7 +289,12 @@ mod tests {
         let out = t.join("gate/Modules");
         std::fs::create_dir_all(out.join("modules")).unwrap();
 
-        let got = rebase_if_escaping("../../NativeEngine/src/Native.h", &parts("modules"), &src, &out);
+        let got = rebase_if_escaping(
+            "../../NativeEngine/src/Native.h",
+            &parts("modules"),
+            &src,
+            &out,
+        );
         let _ = std::fs::remove_dir_all(&t);
         assert_eq!(got, "../../NativeEngine/src/Native.h");
     }

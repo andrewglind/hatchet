@@ -13,8 +13,7 @@ fn gen_one(src: &str, stem: &str) -> String {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static SEQ: AtomicUsize = AtomicUsize::new(0);
     let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("hatchet_t_{stem}_{}_{uniq}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("hatchet_t_{stem}_{}_{uniq}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(format!("{stem}.hx")), src).unwrap();
     let prog = Program::from_src_dir(&dir).expect("build program");
@@ -74,7 +73,9 @@ class Probe {
     let _ = std::fs::remove_dir_all(&dir);
     // The misuse is the `var p:Pt = this.find();` on line 7 of `src`.
     assert!(
-        warnings.iter().any(|(line, w)| *line == 7 && w.contains("Null<T>")),
+        warnings
+            .iter()
+            .any(|(line, w)| *line == 7 && w.contains("Null<T>")),
         "expected a nullable warning on line 7, got: {warnings:?}"
     );
 }
@@ -161,10 +162,22 @@ class C {
     let out = generate_source(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("std::string s = this->props->GetOr(std::string(\"a\"), std::string(\"x\"))"), "String overload → std::string + wrapped literals:\n{out}");
-    assert!(out.contains("int n = this->props->GetOr(std::string(\"b\"), 5)"), "Int overload → int:\n{out}");
-    assert!(out.contains("bool f = this->props->GetOr(std::string(\"c\"), false)"), "Bool overload → bool:\n{out}");
-    assert!(!out.contains("void*"), "Dynamic no longer erases to void*:\n{out}");
+    assert!(
+        out.contains("std::string s = this->props->GetOr(std::string(\"a\"), std::string(\"x\"))"),
+        "String overload → std::string + wrapped literals:\n{out}"
+    );
+    assert!(
+        out.contains("int n = this->props->GetOr(std::string(\"b\"), 5)"),
+        "Int overload → int:\n{out}"
+    );
+    assert!(
+        out.contains("bool f = this->props->GetOr(std::string(\"c\"), false)"),
+        "Bool overload → bool:\n{out}"
+    );
+    assert!(
+        !out.contains("void*"),
+        "Dynamic no longer erases to void*:\n{out}"
+    );
 }
 
 #[test]
@@ -207,9 +220,15 @@ class C {
         "cpp.StdString param must match a std::string arg (no overload mismatch): {:?}",
         errors
     );
-    assert!(out.contains("int n = this->props->GetOr("), "Int overload return type resolves:\n{out}");
+    assert!(
+        out.contains("int n = this->props->GetOr("),
+        "Int overload return type resolves:\n{out}"
+    );
     // A typed `cast(_, cpp.Float32)` arg selects the float overload (not the first).
-    assert!(out.contains("float f = this->props->GetOr("), "typed cast selects the cpp.Float32 overload:\n{out}");
+    assert!(
+        out.contains("float f = this->props->GetOr("),
+        "typed cast selects the cpp.Float32 overload:\n{out}"
+    );
 }
 
 #[test]
@@ -245,21 +264,50 @@ class Atlas {
     let _ = std::fs::remove_dir_all(&dir);
 
     // Scalar final → static const (not a #define); struct finals → aggregate const.
-    assert!(out.contains("static const double SCALE = 2.0;"), "scalar final → static const:\n{out}");
-    assert!(!out.contains("#define SCALE"), "scalar final must not be a #define:\n{out}");
-    assert!(out.contains("static const Coord ORIGIN = { 0.0, 0.0 };"), "struct final → aggregate const:\n{out}");
-    assert!(out.contains("static const Coord CORNER = { 16.0, 32.0 };"), "struct final aggregate in field order:\n{out}");
+    assert!(
+        out.contains("static const double SCALE = 2.0;"),
+        "scalar final → static const:\n{out}"
+    );
+    assert!(
+        !out.contains("#define SCALE"),
+        "scalar final must not be a #define:\n{out}"
+    );
+    assert!(
+        out.contains("static const Coord ORIGIN = { 0.0, 0.0 };"),
+        "struct final → aggregate const:\n{out}"
+    );
+    assert!(
+        out.contains("static const Coord CORNER = { 16.0, 32.0 };"),
+        "struct final aggregate in field order:\n{out}"
+    );
     // Array final → builder helper + const vector object (stays a vector).
-    assert!(out.contains("_init_TABLE() {"), "array final → builder helper:\n{out}");
-    assert!(out.contains("v;") && out.contains("v.push_back(ORIGIN);") && out.contains("v.push_back(CORNER);"), "builder declares v and push_backs elements:\n{out}");
-    assert!(out.contains("return v;"), "builder returns the vector:\n{out}");
+    assert!(
+        out.contains("_init_TABLE() {"),
+        "array final → builder helper:\n{out}"
+    );
+    assert!(
+        out.contains("v;")
+            && out.contains("v.push_back(ORIGIN);")
+            && out.contains("v.push_back(CORNER);"),
+        "builder declares v and push_backs elements:\n{out}"
+    );
+    assert!(
+        out.contains("return v;"),
+        "builder returns the vector:\n{out}"
+    );
     assert!(
         out.contains("TABLE = _init_TABLE();") && out.contains("static const std::vector<Coord"),
         "array final → const vector object:\n{out}"
     );
     // Call site is unchanged — it indexes the vector object directly.
-    assert!(out.contains("return TABLE[i];"), "call site indexes the vector object:\n{out}");
-    assert!(!out.contains("Coord TABLE["), "array final must not become a C array:\n{out}");
+    assert!(
+        out.contains("return TABLE[i];"),
+        "call site indexes the vector object:\n{out}"
+    );
+    assert!(
+        !out.contains("Coord TABLE["),
+        "array final must not become a C array:\n{out}"
+    );
 }
 
 #[test]
@@ -271,7 +319,10 @@ fn array_pop_removes_and_returns_the_last_element() {
         "Q",
     );
     assert!(out.contains(".back()"), "reads the last element:\n{out}");
-    assert!(out.contains(".pop_back()"), "and removes it (the fix):\n{out}");
+    assert!(
+        out.contains(".pop_back()"),
+        "and removes it (the fix):\n{out}"
+    );
 }
 
 #[test]
@@ -282,9 +333,18 @@ fn string_concat_with_int_operands() {
         "class S {\n  public function new() {}\n  public function label(x:Int, y:Int):String { return x + \",\" + y; }\n}\n",
         "S",
     );
-    assert!(out.contains("sprintf("), "int operands are formatted to text:\n{out}");
-    assert!(out.contains("std::string(") && out.contains(" + "), "result is a std::string concatenation:\n{out}");
-    assert!(!out.contains("x + \",\""), "must not emit raw `int + const char*` pointer math:\n{out}");
+    assert!(
+        out.contains("sprintf("),
+        "int operands are formatted to text:\n{out}"
+    );
+    assert!(
+        out.contains("std::string(") && out.contains(" + "),
+        "result is a std::string concatenation:\n{out}"
+    );
+    assert!(
+        !out.contains("x + \",\""),
+        "must not emit raw `int + const char*` pointer math:\n{out}"
+    );
 }
 
 #[test]
@@ -296,10 +356,22 @@ fn cpp_qualified_fixed_width_uints_map_to_uint_aliases() {
         "package demo;\nclass W {\n  public function new() {}\n  public function f(a:cpp.UInt8, b:cpp.UInt16, t:Array<cpp.UInt32>):cpp.UInt32 { return b; }\n}\n",
         "W",
     );
-    assert!(out.contains("uint8_t a"), "cpp.UInt8 param → uint8_t:\n{out}");
-    assert!(out.contains("uint16_t b"), "cpp.UInt16 param → uint16_t:\n{out}");
-    assert!(out.contains("std::vector<uint32_t"), "Array<cpp.UInt32> → std::vector<uint32_t>:\n{out}");
-    assert!(out.contains("uint32_t W::f"), "cpp.UInt32 return → uint32_t:\n{out}");
+    assert!(
+        out.contains("uint8_t a"),
+        "cpp.UInt8 param → uint8_t:\n{out}"
+    );
+    assert!(
+        out.contains("uint16_t b"),
+        "cpp.UInt16 param → uint16_t:\n{out}"
+    );
+    assert!(
+        out.contains("std::vector<uint32_t"),
+        "Array<cpp.UInt32> → std::vector<uint32_t>:\n{out}"
+    );
+    assert!(
+        out.contains("uint32_t W::f"),
+        "cpp.UInt32 return → uint32_t:\n{out}"
+    );
 }
 
 #[test]
@@ -311,12 +383,24 @@ fn interpolation_builds_incrementally_without_a_guessed_buffer() {
         "class G {\n  public function new() {}\n  public function f(s:String, n:Int):String { return 'a${s}b${n}c'; }\n}\n",
         "G",
     );
-    assert!(out.contains("std::string "), "builds a std::string accumulator:\n{out}");
-    assert!(out.contains("+= s"), "the string operand is appended directly (unbounded-safe):\n{out}");
+    assert!(
+        out.contains("std::string "),
+        "builds a std::string accumulator:\n{out}"
+    );
+    assert!(
+        out.contains("+= s"),
+        "the string operand is appended directly (unbounded-safe):\n{out}"
+    );
     // No single value-guessed buffer (the old `char buf[n*50+lit]` form).
-    assert!(!out.contains("[50]") && !out.contains("* 50"), "no guessed buffer size:\n{out}");
+    assert!(
+        !out.contains("[50]") && !out.contains("* 50"),
+        "no guessed buffer size:\n{out}"
+    );
     // The numeric operand still gets a type-bounded buffer.
-    assert!(out.contains("char ") && out.contains("sprintf(") && out.contains("[24]"), "int → type-bounded buffer:\n{out}");
+    assert!(
+        out.contains("char ") && out.contains("sprintf(") && out.contains("[24]"),
+        "int → type-bounded buffer:\n{out}"
+    );
 }
 
 #[test]
@@ -348,13 +432,24 @@ fn range_loop_variables_are_unique_per_loop() {
         let name: String = piece.chars().take_while(|c| *c != ' ').collect();
         names.push(name);
     }
-    assert!(names.len() >= 4, "expected four range loops, found {}:\n{out}", names.len());
+    assert!(
+        names.len() >= 4,
+        "expected four range loops, found {}:\n{out}",
+        names.len()
+    );
     let mut sorted = names.clone();
     sorted.sort();
     sorted.dedup();
-    assert_eq!(sorted.len(), names.len(), "range loop control variables must be unique: {names:?}\n{out}");
+    assert_eq!(
+        sorted.len(),
+        names.len(),
+        "range loop control variables must be unique: {names:?}\n{out}"
+    );
     // And the user's bare `i` must not survive as a raw for-init (it was renamed).
-    assert!(!out.contains("for (int i ="), "the reused Haxe `i` must be renamed:\n{out}");
+    assert!(
+        !out.contains("for (int i ="),
+        "the reused Haxe `i` must be renamed:\n{out}"
+    );
 }
 
 #[test]
@@ -371,8 +466,14 @@ fn bare_enum_constant_is_qualified_in_expression_position() {
          }\n",
         "Paint",
     );
-    assert!(out.contains("return Color_::Green;"), "bare enum variant must be scoped:\n{out}");
-    assert!(!out.contains("return Green;"), "unqualified variant must not leak:\n{out}");
+    assert!(
+        out.contains("return Color_::Green;"),
+        "bare enum variant must be scoped:\n{out}"
+    );
+    assert!(
+        !out.contains("return Green;"),
+        "unqualified variant must not leak:\n{out}"
+    );
 }
 
 #[test]
@@ -418,9 +519,18 @@ class Scene {
     let out = generate_source(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("return native::MAX_CHARS;"), "native const → native namespace:\n{out}");
-    assert!(out.contains("return SCENE_ID;"), "same-namespace ref stays bare:\n{out}");
-    assert!(out.contains("case game::SCENE_ID:"), "global-scope ref → namespace-qualified:\n{out}");
+    assert!(
+        out.contains("return native::MAX_CHARS;"),
+        "native const → native namespace:\n{out}"
+    );
+    assert!(
+        out.contains("return SCENE_ID;"),
+        "same-namespace ref stays bare:\n{out}"
+    );
+    assert!(
+        out.contains("case game::SCENE_ID:"),
+        "global-scope ref → namespace-qualified:\n{out}"
+    );
 }
 
 #[test]
@@ -458,12 +568,22 @@ class Store {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
-        out.contains("std::map<std::string, Entry>::iterator") && out.contains("this->entries.find(key)"),
+        out.contains("std::map<std::string, Entry>::iterator")
+            && out.contains("this->entries.find(key)"),
         "get → find() iterator:\n{out}"
     );
-    assert!(out.contains("!= this->entries.end()"), "`!= null` → `!= map.end()`:\n{out}");
-    assert!(out.contains("->second.count"), "member use → it->second.count:\n{out}");
-    assert!(!out.contains("== NULL") && !out.contains("[key]"), "no NULL compare / operator[]:\n{out}");
+    assert!(
+        out.contains("!= this->entries.end()"),
+        "`!= null` → `!= map.end()`:\n{out}"
+    );
+    assert!(
+        out.contains("->second.count"),
+        "member use → it->second.count:\n{out}"
+    );
+    assert!(
+        !out.contains("== NULL") && !out.contains("[key]"),
+        "no NULL compare / operator[]:\n{out}"
+    );
 }
 
 #[test]
@@ -495,13 +615,154 @@ class Summer {
     let _ = std::fs::remove_dir_all(&dir);
 
     // The vector temp and its push_backs are emitted before the for header.
-    assert!(out.contains("std::vector<int "), "array temp is a std::vector<int>:\n{out}");
-    assert!(out.contains(".push_back(1)") && out.contains(".push_back(3)"), "literal elements pushed:\n{out}");
-    let push_pos = out.find(".push_back(1)").unwrap_or_else(|| panic!("element push expected:\n{out}"));
-    let for_pos = out.find("for (size_t").unwrap_or_else(|| panic!("index loop expected:\n{out}"));
-    assert!(push_pos < for_pos, "the vector must be built before the loop:\n{out}");
-    assert!(out.contains("int i = "), "loop binds element by value:\n{out}");
-    assert!(out.contains(".size(); ++"), "index loop over .size():\n{out}");
+    assert!(
+        out.contains("std::vector<int "),
+        "array temp is a std::vector<int>:\n{out}"
+    );
+    assert!(
+        out.contains(".push_back(1)") && out.contains(".push_back(3)"),
+        "literal elements pushed:\n{out}"
+    );
+    let push_pos = out
+        .find(".push_back(1)")
+        .unwrap_or_else(|| panic!("element push expected:\n{out}"));
+    let for_pos = out
+        .find("for (size_t")
+        .unwrap_or_else(|| panic!("index loop expected:\n{out}"));
+    assert!(
+        push_pos < for_pos,
+        "the vector must be built before the loop:\n{out}"
+    );
+    assert!(
+        out.contains("int i = "),
+        "loop binds element by value:\n{out}"
+    );
+    assert!(
+        out.contains(".size(); ++"),
+        "index loop over .size():\n{out}"
+    );
+}
+
+#[test]
+fn signed_unsigned_comparisons_cast_to_size_t() {
+    // `for (i in 0...arr.length)` compares an `int` counter against `.size()`
+    // (size_t); MSVC warns (C4018) on the mixed signed/unsigned comparison. C++
+    // already converts the signed side to size_t, so the lowering makes that cast
+    // explicit — in the loop header and in any body comparison against `.length` —
+    // while leaving signed/signed comparisons (`i < n`) untouched.
+    let src = "\
+class Keys {
+  public var objectKeys:Array<String>;
+  public function new() { objectKeys = []; }
+  public function scan():Void {
+    for (i in 0...this.objectKeys.length) {
+      if (i < this.objectKeys.length) {
+        trace(this.objectKeys[i]);
+      }
+      var n:Int = 5;
+      if (i < n) trace(\"low\");
+    }
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_c4018_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Keys.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Keys"))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The loop header casts the counter against `.size()`.
+    assert!(
+        out.contains("(size_t)") && out.contains("< this->objectKeys.size(); ++"),
+        "loop header compares the counter as size_t:\n{out}"
+    );
+    // A body comparison against `.length` is also cast.
+    assert!(
+        out.contains(") < this->objectKeys.size()"),
+        "body comparison against .length is cast to size_t:\n{out}"
+    );
+    // A signed/signed comparison (`i < n`) keeps its plain operands — no spurious cast.
+    assert!(
+        out.contains(" < n)"),
+        "the `i < n` comparison is not cast:\n{out}"
+    );
+}
+
+#[test]
+fn if_expression_comprehension_body_lowers_to_a_hoisted_temp() {
+    // An array comprehension whose body is an `if`/`else if`/`else` — each branch a
+    // block ending in a value. The `if` is a *value* expression (it has an `else`),
+    // so it desugars like a value `switch`: a hoisted temp the branches assign, then
+    // the temp is pushed. The element type is the branch value's type (`int`), not
+    // the surrounding array type.
+    let out = gen_one(
+        "class M {\n  public function new() {}\n  public function f(nums:Array<Int>):Array<Int> {\n    return [\n      for (n in nums)\n        if (n < 0) { -1; }\n        else if (n == 0) { var z = 0; z; }\n        else { var p = n * 2; p; }\n    ];\n  }\n}\n",
+        "M",
+    );
+    // Container is a vector of the branch value type, not the array type.
+    assert!(
+        out.contains("std::vector<int >"),
+        "element type is the branch value type:\n{out}"
+    );
+    assert!(
+        !out.contains("std::vector<std::vector"),
+        "the array type must not become the element type:\n{out}"
+    );
+    // The if-expression is hoisted to a temp the branches assign, then pushed.
+    assert!(out.contains("int _ifx"), "value `if` hoists a temp:\n{out}");
+    assert!(
+        out.contains(".push_back(_ifx"),
+        "the temp is the produced element:\n{out}"
+    );
+}
+
+#[test]
+fn comprehension_if_without_else_stays_a_filter() {
+    // A leading `if` with no `else` is a filter: the element is produced only when
+    // the condition holds (it is *not* a value `if`).
+    let out = gen_one(
+        "class M {\n  public function new() {}\n  public function f(nums:Array<Int>):Array<Int> {\n    return [for (n in nums) if (n > 0) n];\n  }\n}\n",
+        "M",
+    );
+    assert!(
+        out.contains("if (n > 0) {"),
+        "the filter guards the push:\n{out}"
+    );
+    assert!(
+        out.contains(".push_back(n)"),
+        "only the kept element is pushed:\n{out}"
+    );
+    assert!(
+        !out.contains("_ifx"),
+        "a no-else filter is not a value if-expression:\n{out}"
+    );
+}
+
+#[test]
+fn value_if_expression_in_assignment_position() {
+    // `var s = if (c) a else b` is a value `if`, desugared to a hoisted temp.
+    let out = gen_one(
+        "class M {\n  public function new() {}\n  public function f(flag:Bool):String {\n    var s = if (flag) \"yes\" else \"no\";\n    return s;\n  }\n}\n",
+        "M",
+    );
+    assert!(
+        out.contains("std::string _ifx"),
+        "the value `if` hoists a typed temp:\n{out}"
+    );
+    assert!(
+        out.contains("if (flag) {") && out.contains("} else {"),
+        "desugars to a statement if:\n{out}"
+    );
+    assert!(
+        out.contains("std::string s = _ifx"),
+        "the assignment reads the temp:\n{out}"
+    );
 }
 
 #[test]
@@ -541,8 +802,14 @@ class Tracer {
 
     // --no-traces: the calls are stripped to no-ops.
     let stripped = generate_source_diagnostics(&prog, idx, 1, true).unwrap().0;
-    assert!(!stripped.contains("printf("), "no-traces must emit no printf:\n{stripped}");
-    assert!(stripped.contains("((void)0);"), "no-traces lowers trace to a no-op:\n{stripped}");
+    assert!(
+        !stripped.contains("printf("),
+        "no-traces must emit no printf:\n{stripped}"
+    );
+    assert!(
+        stripped.contains("((void)0);"),
+        "no-traces lowers trace to a no-op:\n{stripped}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -577,19 +844,34 @@ class Maths {
     let out = generate_source(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("#ifdef DREAMCAST"), "`#if FLAG` → `#ifdef FLAG`:\n{out}");
+    assert!(
+        out.contains("#ifdef DREAMCAST"),
+        "`#if FLAG` → `#ifdef FLAG`:\n{out}"
+    );
     assert!(out.contains("#else"), "`#else` preserved:\n{out}");
     assert!(out.contains("#endif"), "`#end` → `#endif`:\n{out}");
-    assert!(out.contains("#include <dc/fmath.h>"), "stmt `@:include` → `#include`:\n{out}");
+    assert!(
+        out.contains("#include <dc/fmath.h>"),
+        "stmt `@:include` → `#include`:\n{out}"
+    );
     assert!(
         out.contains("return fsqrtf(dx * dx + dy * dy);"),
         "`untyped` operand emitted verbatim:\n{out}"
     );
-    assert!(!out.contains("untyped"), "the `untyped` keyword must not survive:\n{out}");
+    assert!(
+        !out.contains("untyped"),
+        "the `untyped` keyword must not survive:\n{out}"
+    );
     // Preprocessor directives sit at column 0 so they are valid.
-    assert!(out.contains("\n#ifdef DREAMCAST"), "directive at column 0:\n{out}");
+    assert!(
+        out.contains("\n#ifdef DREAMCAST"),
+        "directive at column 0:\n{out}"
+    );
     // The #else branch is transpiled normally.
-    assert!(out.contains("sqrt("), "Math.sqrt → sqrt in the else branch:\n{out}");
+    assert!(
+        out.contains("sqrt("),
+        "Math.sqrt → sqrt in the else branch:\n{out}"
+    );
 }
 
 #[test]
@@ -618,10 +900,22 @@ class Greeter {
 
     // Built incrementally: a `std::string` accumulator with the string operand appended
     // directly (no fixed-size buffer — unbounded-safe), the `$5` staying literal.
-    assert!(out.contains("std::string"), "interpolation builds a std::string accumulator:\n{out}");
-    assert!(out.contains("+= name"), "the string operand is appended directly:\n{out}");
-    assert!(!out.contains("sprintf"), "a string interpolation needs no fixed-size buffer:\n{out}");
-    assert!(out.contains("$5"), "a `$` not before an identifier stays a literal:\n{out}");
+    assert!(
+        out.contains("std::string"),
+        "interpolation builds a std::string accumulator:\n{out}"
+    );
+    assert!(
+        out.contains("+= name"),
+        "the string operand is appended directly:\n{out}"
+    );
+    assert!(
+        !out.contains("sprintf"),
+        "a string interpolation needs no fixed-size buffer:\n{out}"
+    );
+    assert!(
+        out.contains("$5"),
+        "a `$` not before an identifier stays a literal:\n{out}"
+    );
 }
 
 #[test]
@@ -663,10 +957,20 @@ class Runner {
         .expect("run method present");
     // The owned local is freed exactly twice — once per return path — and never a
     // third (dead) time after the tail return.
-    assert_eq!(run.matches("delete h;").count(), 2, "h freed once per return path:\n{out}");
+    assert_eq!(
+        run.matches("delete h;").count(),
+        2,
+        "h freed once per return path:\n{out}"
+    );
     // Each delete immediately precedes a return (freed *before* exiting).
-    assert!(run.contains("delete h;\n\t\treturn"), "early return frees before exiting:\n{out}");
-    assert!(run.contains("delete h;\n\treturn"), "tail return frees before exiting:\n{out}");
+    assert!(
+        run.contains("delete h;\n\t\treturn"),
+        "early return frees before exiting:\n{out}"
+    );
+    assert!(
+        run.contains("delete h;\n\treturn"),
+        "tail return frees before exiting:\n{out}"
+    );
 }
 
 #[test]
@@ -705,7 +1009,9 @@ class C {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
-        errors.iter().any(|(_, e)| e.contains("GetOr") && e.contains("matches no @:overload")),
+        errors
+            .iter()
+            .any(|(_, e)| e.contains("GetOr") && e.contains("matches no @:overload")),
         "expected an overload-mismatch error for the Float call, got: {errors:?}"
     );
 }
@@ -749,12 +1055,27 @@ class Grid {
     let _ = std::fs::remove_dir_all(&dir);
 
     // Both pushes are inline; the constructor never deletes the just-pushed object.
-    assert!(body.contains("tiles.push_back(new Tile(1));"), "direct field push should be inline:\n{body}");
-    assert!(body.contains("row.push_back(new Tile(2));"), "local-container push should be inline:\n{body}");
-    assert!(!body.contains("delete "), "the constructor must not delete a pushed `new`:\n{body}");
+    assert!(
+        body.contains("tiles.push_back(new Tile(1));"),
+        "direct field push should be inline:\n{body}"
+    );
+    assert!(
+        body.contains("row.push_back(new Tile(2));"),
+        "local-container push should be inline:\n{body}"
+    );
+    assert!(
+        !body.contains("delete "),
+        "the constructor must not delete a pushed `new`:\n{body}"
+    );
     // The destructor frees both containers (the owner of the heap objects).
-    assert!(header.contains("delete this->tiles[") , "dtor should free the tiles vector:\n{header}");
-    assert!(header.contains("delete this->rows["), "dtor should free the rows vector:\n{header}");
+    assert!(
+        header.contains("delete this->tiles["),
+        "dtor should free the tiles vector:\n{header}"
+    );
+    assert!(
+        header.contains("delete this->rows["),
+        "dtor should free the rows vector:\n{header}"
+    );
 }
 
 #[test]
@@ -805,7 +1126,10 @@ class Owner {
         !body.contains("delete "),
         "the constructor must not free the escaped nested new:\n{body}"
     );
-    assert!(header.contains("delete this->h;"), "destructor must free the owned field:\n{header}");
+    assert!(
+        header.contains("delete this->h;"),
+        "destructor must free the owned field:\n{header}"
+    );
 }
 
 #[test]
@@ -839,8 +1163,14 @@ class M {}
         body.contains("double Cross(const Vec& a, const Vec& b)"),
         "untyped arrow params take their type from the function annotation:\n{body}"
     );
-    assert!(!body.contains("int a"), "params must not default to int:\n{body}");
-    assert!(body.contains("return a.x * b.y - a.y * b.x;"), "body uses the typed params:\n{body}");
+    assert!(
+        !body.contains("int a"),
+        "params must not default to int:\n{body}"
+    );
+    assert!(
+        body.contains("return a.x * b.y - a.y * b.x;"),
+        "body uses the typed params:\n{body}"
+    );
 }
 
 #[test]
@@ -893,7 +1223,10 @@ class User {
         "a `new` into an @owned ctor param must be inline:\n{body}"
     );
     let owns = &body[body.find("User::owns").unwrap()..body.find("User::borrows").unwrap()];
-    assert!(owns.contains("delete o;"), "the scope frees the owner:\n{owns}");
+    assert!(
+        owns.contains("delete o;"),
+        "the scope frees the owner:\n{owns}"
+    );
     assert!(
         !owns.contains("delete _v"),
         "the owned child must not be separately scope-deleted (double-free):\n{owns}"
@@ -935,7 +1268,10 @@ class C {
     let body = generate_source(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(body.contains("delete t;"), "@delete forces a scope-close free of the local:\n{body}");
+    assert!(
+        body.contains("delete t;"),
+        "@delete forces a scope-close free of the local:\n{body}"
+    );
 }
 
 #[test]
@@ -971,7 +1307,10 @@ class G {
     let body = generate_source(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(body.contains(".resize("), "array index write must grow the vector first:\n{body}");
+    assert!(
+        body.contains(".resize("),
+        "array index write must grow the vector first:\n{body}"
+    );
     assert!(
         body.contains(">= a.size()) a.resize("),
         "the grow-guard resizes when the index is past the end:\n{body}"
@@ -1015,7 +1354,10 @@ class Widget {
     let header = hatchet::codegen::generate_header(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(header.contains("delete this->dep;"), "@owned scalar pointer → plain delete:\n{header}");
+    assert!(
+        header.contains("delete this->dep;"),
+        "@owned scalar pointer → plain delete:\n{header}"
+    );
     assert!(
         header.contains("delete this->kids[_i0];"),
         "@owned container → element-wise delete loop:\n{header}"
@@ -1135,8 +1477,14 @@ class Grid {
         out.contains("->GetValue());"),
         "the property should be read off the local via the accessor:\n{out}"
     );
-    assert!(!out.contains("new Cell(7)->"), "no field access directly on a new-expression:\n{out}");
-    assert!(!out.contains("delete "), "the hoisted wrapper must not be freed:\n{out}");
+    assert!(
+        !out.contains("new Cell(7)->"),
+        "no field access directly on a new-expression:\n{out}"
+    );
+    assert!(
+        !out.contains("delete "),
+        "the hoisted wrapper must not be freed:\n{out}"
+    );
 }
 
 #[test]
@@ -1166,9 +1514,18 @@ class S {
     let out = generate_source(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("if (palette.empty()) {"), "`== null` → `.empty()`:\n{out}");
-    assert!(out.contains("if (!s.empty()) {"), "`!= null` → `!...empty()`:\n{out}");
-    assert!(!out.contains("== NULL") && !out.contains("!= NULL"), "no NULL comparison on a string:\n{out}");
+    assert!(
+        out.contains("if (palette.empty()) {"),
+        "`== null` → `.empty()`:\n{out}"
+    );
+    assert!(
+        out.contains("if (!s.empty()) {"),
+        "`!= null` → `!...empty()`:\n{out}"
+    );
+    assert!(
+        !out.contains("== NULL") && !out.contains("!= NULL"),
+        "no NULL comparison on a string:\n{out}"
+    );
 }
 
 #[test]
@@ -1219,7 +1576,10 @@ class S {
         assert!(out.contains(needle), "missing `{needle}` in:\n{out}");
     }
     // A `new String(...)` is a value, not a heap pointer — it is never deleted.
-    assert!(!out.contains("delete copy"), "string value must not be deleted:\n{out}");
+    assert!(
+        !out.contains("delete copy"),
+        "string value must not be deleted:\n{out}"
+    );
 }
 
 #[test]
@@ -1251,8 +1611,14 @@ class A {
     let _ = std::fs::remove_dir_all(&dir);
 
     // The ascription gives `null` a pointer type and `[]` an element type.
-    assert!(out.contains("Widget* w = NULL;"), "class-typed null follows the ascription:\n{out}");
-    assert!(out.contains("std::vector<int> xs"), "empty array literal follows the ascription:\n{out}");
+    assert!(
+        out.contains("Widget* w = NULL;"),
+        "class-typed null follows the ascription:\n{out}"
+    );
+    assert!(
+        out.contains("std::vector<int> xs"),
+        "empty array literal follows the ascription:\n{out}"
+    );
 }
 
 #[test]
@@ -1283,14 +1649,31 @@ class S {
     let _ = std::fs::remove_dir_all(&dir);
 
     // Case mapping is an ASCII range check + offset (no toupper/tolower).
-    assert!(out.contains(">= 'a' && ") && out.contains("- 'a' + 'A'"), "toUpperCase ASCII map:\n{out}");
-    assert!(out.contains(">= 'A' && ") && out.contains("- 'A' + 'a'"), "toLowerCase ASCII map:\n{out}");
-    assert!(!out.contains("toupper") && !out.contains("tolower"), "no <cctype> dependency:\n{out}");
+    assert!(
+        out.contains(">= 'a' && ") && out.contains("- 'a' + 'A'"),
+        "toUpperCase ASCII map:\n{out}"
+    );
+    assert!(
+        out.contains(">= 'A' && ") && out.contains("- 'A' + 'a'"),
+        "toLowerCase ASCII map:\n{out}"
+    );
+    assert!(
+        !out.contains("toupper") && !out.contains("tolower"),
+        "no <cctype> dependency:\n{out}"
+    );
     // split builds a vector via find/substr (npos sentinel), no <algorithm>.
-    assert!(out.contains("std::vector<std::string >"), "split returns a vector:\n{out}");
-    assert!(out.contains(".find(") && out.contains(".substr(") && out.contains("std::string::npos"),
-        "split tokenizes with find/substr:\n{out}");
-    assert!(!out.contains("std::find"), "no <algorithm> dependency:\n{out}");
+    assert!(
+        out.contains("std::vector<std::string >"),
+        "split returns a vector:\n{out}"
+    );
+    assert!(
+        out.contains(".find(") && out.contains(".substr(") && out.contains("std::string::npos"),
+        "split tokenizes with find/substr:\n{out}"
+    );
+    assert!(
+        !out.contains("std::find"),
+        "no <algorithm> dependency:\n{out}"
+    );
 }
 
 #[test]
@@ -1325,17 +1708,23 @@ class M {
         "sin(1.0)",
         "pow(2.0, 8.0)",
         "atan2(1.0, 2.0)",
-        "floor(2.7)",                        // Math.ffloor → Float (double) floor
-        "((int)floor(2.7))",                // Math.floor → int
-        "((int)floor((2.5) + 0.5))",        // Math.round → int
-        "(rand() / (RAND_MAX + 1.0))",       // Math.random ∈ [0,1)
-        "3.141592653589793",                 // Math.PI literal (no M_PI), double precision
+        "floor(2.7)",                  // Math.ffloor → Float (double) floor
+        "((int)floor(2.7))",           // Math.floor → int
+        "((int)floor((2.5) + 0.5))",   // Math.round → int
+        "(rand() / (RAND_MAX + 1.0))", // Math.random ∈ [0,1)
+        "3.141592653589793",           // Math.PI literal (no M_PI), double precision
     ] {
         assert!(out.contains(needle), "missing `{needle}` in:\n{out}");
     }
     // min is NaN-propagating inline (no helper), and no shim names leak in.
-    assert!(out.contains("== (1.0) ? (2.0) : (1.0)"), "min NaN-aware inline:\n{out}");
-    assert!(!out.contains("haxe_min") && !out.contains("haxe_"), "no helper shims:\n{out}");
+    assert!(
+        out.contains("== (1.0) ? (2.0) : (1.0)"),
+        "min NaN-aware inline:\n{out}"
+    );
+    assert!(
+        !out.contains("haxe_min") && !out.contains("haxe_"),
+        "no helper shims:\n{out}"
+    );
 }
 
 #[test]
@@ -1368,18 +1757,37 @@ class S {
     let _ = std::fs::remove_dir_all(&dir);
 
     // Std.string(int) → sprintf %d into a buffer, returned as std::string.
-    assert!(out.contains("sprintf(") && out.contains("\"%d\""), "Std.string(int) via sprintf:\n{out}");
-    assert!(out.contains("std::string("), "Std.string returns a std::string:\n{out}");
+    assert!(
+        out.contains("sprintf(") && out.contains("\"%d\""),
+        "Std.string(int) via sprintf:\n{out}"
+    );
+    assert!(
+        out.contains("std::string("),
+        "Std.string returns a std::string:\n{out}"
+    );
     // Std.string of a literal and a bool.
-    assert!(out.contains("std::string(\"hi\")"), "Std.string(literal):\n{out}");
-    assert!(out.contains("std::string(\"true\")") && out.contains("std::string(\"false\")"),
-        "Std.string(bool) maps to \"true\"/\"false\":\n{out}");
+    assert!(
+        out.contains("std::string(\"hi\")"),
+        "Std.string(literal):\n{out}"
+    );
+    assert!(
+        out.contains("std::string(\"true\")") && out.contains("std::string(\"false\")"),
+        "Std.string(bool) maps to \"true\"/\"false\":\n{out}"
+    );
     // parseInt (hex-aware) and parseFloat — a bare string literal is a const char*,
     // so no invalid `.c_str()` is appended.
-    assert!(out.contains("(int)strtol(\"0x1F\", NULL, 0)"), "Std.parseInt → strtol base 0:\n{out}");
-    assert!(out.contains("atof(\"3.14\")"), "Std.parseFloat → atof:\n{out}");
-    assert!(!out.contains("\".c_str()") && !out.contains("\"0x1F\".c_str()"),
-        "no .c_str() on a string literal:\n{out}");
+    assert!(
+        out.contains("(int)strtol(\"0x1F\", NULL, 0)"),
+        "Std.parseInt → strtol base 0:\n{out}"
+    );
+    assert!(
+        out.contains("atof(\"3.14\")"),
+        "Std.parseFloat → atof:\n{out}"
+    );
+    assert!(
+        !out.contains("\".c_str()") && !out.contains("\"0x1F\".c_str()"),
+        "no .c_str() on a string literal:\n{out}"
+    );
     // No custom runtime helpers.
     assert!(!out.contains("haxe_"), "no helper shims:\n{out}");
 }
@@ -1421,18 +1829,42 @@ class C {
     let _ = std::fs::remove_dir_all(&dir);
 
     // Array methods.
-    assert!(out.contains("== 2)") && out.contains("= true; break;"), "contains scan:\n{out}");
-    assert!(out.contains("int ") && out.contains("= -1;") && out.contains("== 3)"), "indexOf scan:\n{out}");
-    assert!(out.contains(".erase(") && out.contains(".begin() +"), "remove erases by index:\n{out}");
+    assert!(
+        out.contains("== 2)") && out.contains("= true; break;"),
+        "contains scan:\n{out}"
+    );
+    assert!(
+        out.contains("int ") && out.contains("= -1;") && out.contains("== 3)"),
+        "indexOf scan:\n{out}"
+    );
+    assert!(
+        out.contains(".erase(") && out.contains(".begin() +"),
+        "remove erases by index:\n{out}"
+    );
     assert!(out.contains(".size() / 2"), "reverse swap loop:\n{out}");
-    assert!(out.contains("std::vector<int>(xs)"), "copy via copy-constructor:\n{out}");
-    assert!(out.contains("sprintf(") && out.contains("\"%d\""), "numeric join via sprintf:\n{out}");
+    assert!(
+        out.contains("std::vector<int>(xs)"),
+        "copy via copy-constructor:\n{out}"
+    );
+    assert!(
+        out.contains("sprintf(") && out.contains("\"%d\""),
+        "numeric join via sprintf:\n{out}"
+    );
     // Map methods.
     assert!(out.contains("[\"k\"] = 7"), "Map.set → m[k]=v:\n{out}");
-    assert!(out.contains(".erase(\"k\") != 0"), "Map.remove → erase != 0:\n{out}");
-    assert!(out.contains("->first") && out.contains("std::vector<std::string >"), "Map.keys → vector of keys:\n{out}");
+    assert!(
+        out.contains(".erase(\"k\") != 0"),
+        "Map.remove → erase != 0:\n{out}"
+    );
+    assert!(
+        out.contains("->first") && out.contains("std::vector<std::string >"),
+        "Map.keys → vector of keys:\n{out}"
+    );
     // No <algorithm>-only names or runtime helpers leak in.
-    assert!(!out.contains("std::find") && !out.contains("std::reverse"), "no <algorithm> dependency:\n{out}");
+    assert!(
+        !out.contains("std::find") && !out.contains("std::reverse"),
+        "no <algorithm> dependency:\n{out}"
+    );
     assert!(!out.contains("haxe_"), "no helper shims:\n{out}");
 }
 
@@ -1464,15 +1896,100 @@ class M {
     let out = generate_source(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("std::map<std::string, int>::iterator"), "map iterator type:\n{out}");
-    assert!(out.contains(".begin();") && out.contains(".end();"), "iterator bounds:\n{out}");
+    assert!(
+        out.contains("std::map<std::string, int>::const_iterator"),
+        "map iterator type:\n{out}"
+    );
+    assert!(
+        out.contains(".begin();") && out.contains(".end();"),
+        "iterator bounds:\n{out}"
+    );
     // `for (v in m)` binds the value only.
-    assert!(out.contains("int v = ") && out.contains("->second;"), "value binding:\n{out}");
+    assert!(
+        out.contains("int v = ") && out.contains("->second;"),
+        "value binding:\n{out}"
+    );
     // `for (k => val in m)` binds key and value.
-    assert!(out.contains("std::string k = ") && out.contains("->first;"), "key binding:\n{out}");
-    assert!(out.contains("int val = ") && out.contains("->second;"), "key/value value binding:\n{out}");
+    assert!(
+        out.contains("std::string k = ") && out.contains("->first;"),
+        "key binding:\n{out}"
+    );
+    assert!(
+        out.contains("int val = ") && out.contains("->second;"),
+        "key/value value binding:\n{out}"
+    );
     // The map must NOT be iterated with the index path.
-    assert!(!out.contains("m.size()") && !out.contains("m[_i"), "map must not use index iteration:\n{out}");
+    assert!(
+        !out.contains("m.size()") && !out.contains("m[_i"),
+        "map must not use index iteration:\n{out}"
+    );
+}
+
+#[test]
+fn array_key_value_iteration_binds_the_index() {
+    // `for (index => value in array)` is valid Haxe — the key is the Int index.
+    // Exercised in both statement and comprehension position.
+    let src = "\
+class A {
+  public function new() {}
+  public function run(xs:Array<String>):Void {
+    for (i => s in xs) { trace(i); }
+  }
+  public function idx(xs:Array<String>):Array<Int> {
+    return [for (i => s in xs) i];
+  }
+}
+";
+    let out = gen_one(src, "A");
+    // Statement form: an index loop binding the Int key and the element value.
+    assert!(
+        out.contains("int i = (int)"),
+        "Array key bound as Int index:\n{out}"
+    );
+    assert!(
+        out.contains("std::string s = "),
+        "Array element value bound:\n{out}"
+    );
+    // Comprehension form: same bindings, pushing the key.
+    assert!(
+        out.contains(".push_back(i)"),
+        "comprehension yields the index key:\n{out}"
+    );
+    // It must use index iteration, never the map iterator path.
+    assert!(
+        !out.contains("::const_iterator"),
+        "Array iteration is not a map iterator:\n{out}"
+    );
+}
+
+#[test]
+fn member_access_on_a_native_renamed_container_element_resolves() {
+    // A container element whose type is `@:native`-renamed is spelled by its C++
+    // name in the vector base (`std::vector<val*>`). Recovering the element's
+    // `TypeInfo` to resolve `vals[i].s` must match that native name, not only the
+    // Haxe name — otherwise `.s` is untyped and the map value degrades to `void*`.
+    let src = "\
+@:native(\"val\")
+class Val {
+  public var s:String;
+  public var keys:Array<String>;
+  public var vals:Array<Val>;
+  public function new() { this.s = \"\"; this.keys = []; this.vals = []; }
+}
+abstract Holder(Val) {
+  public function new() { this = new Val(); }
+  public function toMap():Map<String,String> {
+    return [for (i => k in this.keys) k => this.vals[i].s];
+  }
+}
+";
+    let out = gen_one(src, "Holder");
+    // The field `s` resolves to `std::string`, so the map value type is concrete.
+    assert!(
+        out.contains("std::map<std::string, std::string >"),
+        "native-renamed element field resolves (no void* fallback):\n{out}"
+    );
+    assert!(!out.contains("void*"), "no void* value type:\n{out}");
 }
 
 #[test]
@@ -1531,7 +2048,10 @@ final Square:(Int, Int) -> Int = (a:Int, b:Int) -> a * b;
         out.contains("int Square(int a, int b)"),
         "return type taken from the (Int,Int)->Int annotation:\n{out}"
     );
-    assert!(out.contains("return a * b;"), "lambda body transpiled:\n{out}");
+    assert!(
+        out.contains("return a * b;"),
+        "lambda body transpiled:\n{out}"
+    );
 }
 
 #[test]
@@ -1543,7 +2063,10 @@ fn elseif_conditional_compilation_maps_to_elif_defined() {
         "Cond",
     );
     assert!(out.contains("#ifdef WIN98"), "#if → #ifdef:\n{out}");
-    assert!(out.contains("#elif defined(DREAMCAST)"), "#elseif → #elif defined(...):\n{out}");
+    assert!(
+        out.contains("#elif defined(DREAMCAST)"),
+        "#elseif → #elif defined(...):\n{out}"
+    );
     assert!(out.contains("#else"), "#else preserved:\n{out}");
     assert!(out.contains("#endif"), "#end → #endif:\n{out}");
 }
@@ -1555,9 +2078,15 @@ fn stringbuf_lowers_to_a_string_accumulator() {
         "class B {\n  public function new() {}\n  public function build():String {\n    var b = new StringBuf();\n    b.add(\"n=\");\n    b.add(7);\n    b.addChar(33);\n    return b.toString();\n  }\n}\n",
         "B",
     );
-    assert!(out.contains("std::string"), "StringBuf declared as std::string:\n{out}");
+    assert!(
+        out.contains("std::string"),
+        "StringBuf declared as std::string:\n{out}"
+    );
     assert!(out.contains("+= "), "add/addChar append with +=:\n{out}");
-    assert!(!out.contains("new StringBuf"), "StringBuf is not heap-allocated:\n{out}");
+    assert!(
+        !out.contains("new StringBuf"),
+        "StringBuf is not heap-allocated:\n{out}"
+    );
 }
 
 #[test]
@@ -1576,8 +2105,14 @@ fn stringtools_statics_lower_without_using() {
         "class Stools {\n  public function new() {}\n  public function clean(s:String):String {\n    return StringTools.replace(StringTools.trim(s), \"a\", \"b\");\n  }\n}\n",
         "Stools",
     );
-    assert!(out.contains(".replace("), "StringTools.replace → std::string::replace loop:\n{out}");
-    assert!(out.contains(".substr("), "StringTools.trim → substr of the trimmed range:\n{out}");
+    assert!(
+        out.contains(".replace("),
+        "StringTools.replace → std::string::replace loop:\n{out}"
+    );
+    assert!(
+        out.contains(".substr("),
+        "StringTools.trim → substr of the trimmed range:\n{out}"
+    );
 }
 
 #[test]
@@ -1589,8 +2124,14 @@ fn int_enum_abstract_members_qualify_in_bodies() {
         "enum abstract Dir(Int) { var North; var South; }\nclass Nav {\n  public function new() {}\n  public function code(d:Dir):Int {\n    switch (d) {\n      case North: return 0;\n      case South: return 1;\n    }\n    return -1;\n  }\n  public function home():Dir { return South; }\n}\n",
         "Nav",
     );
-    assert!(out.contains("case Dir_::North:"), "switch case qualifies the member:\n{out}");
-    assert!(out.contains("return Dir_::South;"), "bare member in return qualifies:\n{out}");
+    assert!(
+        out.contains("case Dir_::North:"),
+        "switch case qualifies the member:\n{out}"
+    );
+    assert!(
+        out.contains("return Dir_::South;"),
+        "bare member in return qualifies:\n{out}"
+    );
 }
 
 #[test]
@@ -1603,14 +2144,23 @@ fn string_subject_switch_lowers_to_an_if_else_chain() {
         "class Sw {\n  public function new() {}\n  public function f(s:String):Int {\n    switch (s) {\n      case \"one\": return 1;\n      case \"two\", \"deux\": return 2;\n      default: return -1;\n    }\n  }\n}\n",
         "Sw",
     );
-    assert!(!out.contains("switch ("), "no C++ switch on a string:\n{out}");
-    assert!(out.contains("std::string") && out.contains(" = s;"), "subject hoisted once:\n{out}");
+    assert!(
+        !out.contains("switch ("),
+        "no C++ switch on a string:\n{out}"
+    );
+    assert!(
+        out.contains("std::string") && out.contains(" = s;"),
+        "subject hoisted once:\n{out}"
+    );
     assert!(out.contains("== \"one\""), "first pattern compared:\n{out}");
     assert!(
         out.contains("== \"two\" || ") && out.contains("== \"deux\""),
         "multi-pattern case is OR-ed:\n{out}"
     );
-    assert!(out.contains("} else {"), "default becomes the trailing else:\n{out}");
+    assert!(
+        out.contains("} else {"),
+        "default becomes the trailing else:\n{out}"
+    );
 }
 
 #[test]
@@ -1623,10 +2173,22 @@ fn switch_expression_lowers_to_a_hoisted_temp() {
         "E",
     );
     // A hoisted std::string temp, assigned inside the switch, then bound to `s`.
-    assert!(out.contains("std::string _swx"), "result temp is declared:\n{out}");
-    assert!(out.contains("switch ("), "desugars to a statement switch:\n{out}");
-    assert!(out.contains("= \"zero\";") && out.contains("= \"other\";"), "arms assign the temp:\n{out}");
-    assert!(out.contains("std::string s = _swx"), "expression evaluates to the temp:\n{out}");
+    assert!(
+        out.contains("std::string _swx"),
+        "result temp is declared:\n{out}"
+    );
+    assert!(
+        out.contains("switch ("),
+        "desugars to a statement switch:\n{out}"
+    );
+    assert!(
+        out.contains("= \"zero\";") && out.contains("= \"other\";"),
+        "arms assign the temp:\n{out}"
+    );
+    assert!(
+        out.contains("std::string s = _swx"),
+        "expression evaluates to the temp:\n{out}"
+    );
 }
 
 #[test]
@@ -1637,9 +2199,18 @@ fn array_filter_lowers_to_a_predicate_loop() {
         "class Flt {\n  public function new() {}\n  public function f(xs:Array<Int>):Array<Int> {\n    return xs.filter(n -> n > 2);\n  }\n}\n",
         "Flt",
     );
-    assert!(out.contains("std::vector<int >"), "result is a vector of the element type:\n{out}");
-    assert!(out.contains("int n = "), "predicate param bound to the element:\n{out}");
-    assert!(out.contains("if (n > 2)") && out.contains(".push_back(n)"), "predicate guards the push:\n{out}");
+    assert!(
+        out.contains("std::vector<int >"),
+        "result is a vector of the element type:\n{out}"
+    );
+    assert!(
+        out.contains("int n = "),
+        "predicate param bound to the element:\n{out}"
+    );
+    assert!(
+        out.contains("if (n > 2)") && out.contains(".push_back(n)"),
+        "predicate guards the push:\n{out}"
+    );
 }
 
 #[test]
@@ -1650,9 +2221,18 @@ fn array_sort_lowers_to_an_inline_insertion_sort() {
         "class Srt {\n  public function new() {}\n  public function s():Void {\n    var xs = [3, 1, 2];\n    xs.sort((a, b) -> a - b);\n  }\n}\n",
         "Srt",
     );
-    assert!(!out.contains("std::sort") && !out.contains("<algorithm>"), "no <algorithm>:\n{out}");
-    assert!(out.contains("while (") && out.contains("break;"), "insertion-sort shift loop:\n{out}");
-    assert!(out.contains("int _cmp") && out.contains("= a - b;"), "comparator inlined over a/b:\n{out}");
+    assert!(
+        !out.contains("std::sort") && !out.contains("<algorithm>"),
+        "no <algorithm>:\n{out}"
+    );
+    assert!(
+        out.contains("while (") && out.contains("break;"),
+        "insertion-sort shift loop:\n{out}"
+    );
+    assert!(
+        out.contains("int _cmp") && out.contains("= a - b;"),
+        "comparator inlined over a/b:\n{out}"
+    );
 }
 
 #[test]
@@ -1666,9 +2246,18 @@ fn try_catch_lowers_to_cpp_exception_handling() {
         "Tc",
     );
     assert!(out.contains("try {"), "emits a C++ try block:\n{out}");
-    assert!(out.contains("throw std::string(\"x\")"), "String throw is coerced:\n{out}");
-    assert!(out.contains("catch (const std::string& e)"), "typed catch maps the exception type:\n{out}");
-    assert!(out.contains("catch (...)"), "Dynamic catch is the non-binding catch-all:\n{out}");
+    assert!(
+        out.contains("throw std::string(\"x\")"),
+        "String throw is coerced:\n{out}"
+    );
+    assert!(
+        out.contains("catch (const std::string& e)"),
+        "typed catch maps the exception type:\n{out}"
+    );
+    assert!(
+        out.contains("catch (...)"),
+        "Dynamic catch is the non-binding catch-all:\n{out}"
+    );
 }
 
 #[test]
@@ -1690,7 +2279,9 @@ fn untyped_catch_using_its_value_is_an_error() {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
-        errors.iter().any(|(_, e)| e.contains("untyped") && e.contains("catch")),
+        errors
+            .iter()
+            .any(|(_, e)| e.contains("untyped") && e.contains("catch")),
         "expected an error for using an untyped catch's value, got: {errors:?}"
     );
 }
@@ -1703,7 +2294,10 @@ fn untyped_catch_ignoring_its_value_is_a_plain_catch_all() {
         "class Tci {\n  public function new() {}\n  public function run():Void {\n    try {} catch (e) { trace(\"oops\"); }\n  }\n}\n",
         "Tci",
     );
-    assert!(out.contains("catch (...)"), "untyped catch ignoring the value → catch(...):\n{out}");
+    assert!(
+        out.contains("catch (...)"),
+        "untyped catch ignoring the value → catch(...):\n{out}"
+    );
 }
 
 #[test]
@@ -1729,7 +2323,10 @@ class Bits {
         out.contains("x = (int)((unsigned int)(x) >> 1)"),
         "`>>>=` must expand through unsigned int:\n{out}"
     );
-    assert!(out.contains("x >> 1"), "plain `>>` stays a signed shift:\n{out}");
+    assert!(
+        out.contains("x >> 1"),
+        "plain `>>` stays a signed shift:\n{out}"
+    );
 }
 
 #[test]
@@ -1784,9 +2381,18 @@ class Wrap {
 }
 ";
     let out = gen_one(src, "Wrap");
-    assert!(out.contains("fmod(a, b)"), "Float % Float must lower to fmod:\n{out}");
-    assert!(out.contains("r = fmod(r, 1.5)"), "`%=` with a float target must lower to fmod:\n{out}");
-    assert!(out.contains("return a % b;"), "Int % Int stays the plain operator:\n{out}");
+    assert!(
+        out.contains("fmod(a, b)"),
+        "Float % Float must lower to fmod:\n{out}"
+    );
+    assert!(
+        out.contains("r = fmod(r, 1.5)"),
+        "`%=` with a float target must lower to fmod:\n{out}"
+    );
+    assert!(
+        out.contains("return a % b;"),
+        "Int % Int stays the plain operator:\n{out}"
+    );
 }
 
 #[test]
@@ -1807,8 +2413,14 @@ class SwWild {
 }
 ";
     let out = gen_one(src, "SwWild");
-    assert!(!out.contains("case _"), "`case _:` must not leak as a C++ label:\n{out}");
-    assert!(out.contains("default:"), "`case _:` lowers to default:\n{out}");
+    assert!(
+        !out.contains("case _"),
+        "`case _:` must not leak as a C++ label:\n{out}"
+    );
+    assert!(
+        out.contains("default:"),
+        "`case _:` lowers to default:\n{out}"
+    );
     assert!(
         out.contains("case 1:") && out.contains("case 2:") && !out.contains("case 1 | 2"),
         "`case 1 | 2:` is the or-pattern, two labels — not a bitwise OR:\n{out}"
@@ -1893,8 +2505,14 @@ class Gauge {
 }
 ";
     let out = gen_one(src, "Gauge");
-    assert!(out.contains("this->set_level(50)"), "ctor write routes:\n{out}");
-    assert!(out.contains("this->set_level(250)"), "internal write routes:\n{out}");
+    assert!(
+        out.contains("this->set_level(50)"),
+        "ctor write routes:\n{out}"
+    );
+    assert!(
+        out.contains("this->set_level(250)"),
+        "internal write routes:\n{out}"
+    );
     assert!(
         out.contains("this->set_level(this->level + 10)"),
         "compound write desugars through the setter:\n{out}"
@@ -1907,12 +2525,18 @@ class Gauge {
         out.contains("this->level = v < 0 ? 0 : (v > 100 ? 100 : v);"),
         "inside set_level the store is direct:\n{out}"
     );
-    assert!(out.contains("other->set_level(1)"), "external write routes:\n{out}");
+    assert!(
+        out.contains("other->set_level(1)"),
+        "external write routes:\n{out}"
+    );
     assert!(
         out.contains("other->set_level(other->GetLevel() + 2)"),
         "external compound reads via the getter, writes via the setter:\n{out}"
     );
-    assert!(!out.contains("SetLevel"), "no trivial setter generated when set_level exists:\n{out}");
+    assert!(
+        !out.contains("SetLevel"),
+        "no trivial setter generated when set_level exists:\n{out}"
+    );
 }
 
 #[test]
@@ -1943,8 +2567,14 @@ class Pool {
 }
 ";
     let out = gen_one(src, "Pool");
-    assert!(out.contains("this->set_buf(new Thing(0))"), "ctor write routes:\n{out}");
-    assert!(out.contains("this->set_buf(new Thing(5))"), "bump write routes:\n{out}");
+    assert!(
+        out.contains("this->set_buf(new Thing(0))"),
+        "ctor write routes:\n{out}"
+    );
+    assert!(
+        out.contains("this->set_buf(new Thing(5))"),
+        "bump write routes:\n{out}"
+    );
     assert!(
         out.contains("this->buf = new Thing(v->id + 1);"),
         "inside set_buf the store is direct:\n{out}"
@@ -2049,7 +2679,9 @@ class MutWarn {
     ];
     for (line, needle) in expect {
         assert!(
-            warnings.iter().any(|(l, w)| *l == line && w.contains(needle)),
+            warnings
+                .iter()
+                .any(|(l, w)| *l == line && w.contains(needle)),
             "expected `{needle}` on line {line}, got: {warnings:?}"
         );
     }
@@ -2078,7 +2710,10 @@ class Esc {
 }
 ";
     let out = gen_one(src, "Esc");
-    assert!(out.contains("return \"a\\nb\";"), "`\\n` stays a single C++ escape:\n{out}");
+    assert!(
+        out.contains("return \"a\\nb\";"),
+        "`\\n` stays a single C++ escape:\n{out}"
+    );
     assert!(
         out.contains("((int)(unsigned char)(\"\\\"\")[0])"),
         "`\"\\\"\".code` compares against the quote (34), not the backslash:\n{out}"
@@ -2092,7 +2727,10 @@ class Esc {
         "`\\\\.code` is a single backslash:\n{out}"
     );
     // \x41\x42 → octal \101\102 ("AB"), byte-exact and non-greedy.
-    assert!(out.contains("\\101\\102"), "hex byte escapes normalise to octal:\n{out}");
+    assert!(
+        out.contains("\\101\\102"),
+        "hex byte escapes normalise to octal:\n{out}"
+    );
 }
 
 #[test]
@@ -2151,7 +2789,9 @@ class W {
     let (_, warnings, _) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
-        warnings.iter().any(|(_, w)| w.contains("`@sink` on parameter `n` has no effect")),
+        warnings
+            .iter()
+            .any(|(_, w)| w.contains("`@sink` on parameter `n` has no effect")),
         "expected a no-op `@sink` warning, got: {warnings:?}"
     );
 }
@@ -2183,22 +2823,50 @@ class Use {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("Use.hx"), src).unwrap();
         let prog = Program::from_src_dir(&dir).expect("build program");
-        let idx = prog.modules.iter().position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Use")).unwrap();
+        let idx = prog
+            .modules
+            .iter()
+            .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Use"))
+            .unwrap();
         let h = hatchet::codegen::generate_header(&prog, idx).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         h
     };
     // value field, and a non-virtual destructor (no vtable → flat value layout)
-    assert!(head.contains("Vec2 here;"), "value field is by value, not a pointer:\n{head}");
-    assert!(head.contains("\t~Vec2() {}"), "value class destructor is non-virtual:\n{head}");
-    assert!(!head.contains("virtual ~Vec2"), "no virtual destructor on a value class:\n{head}");
+    assert!(
+        head.contains("Vec2 here;"),
+        "value field is by value, not a pointer:\n{head}"
+    );
+    assert!(
+        head.contains("\t~Vec2() {}"),
+        "value class destructor is non-virtual:\n{head}"
+    );
+    assert!(
+        !head.contains("virtual ~Vec2"),
+        "no virtual destructor on a value class:\n{head}"
+    );
 
     let out = gen_one(src, "Use");
-    assert!(out.contains("Vec2 v = Vec2(3.0, 4.0)"), "`new` is value construction, not heap:\n{out}");
-    assert!(out.contains("std::vector<Vec2>"), "Array<Vec2> is a value vector:\n{out}");
-    assert!(out.contains("pts.push_back(Vec2(1.0, 2.0))"), "pushed value, no heap:\n{out}");
-    assert!(out.contains("this->here = Vec2(0.0, 0.0)"), "value field init, no `new`:\n{out}");
-    assert!(!out.contains("new Vec2") && !out.contains("delete"), "no heap or frees for a value class:\n{out}");
+    assert!(
+        out.contains("Vec2 v = Vec2(3.0, 4.0)"),
+        "`new` is value construction, not heap:\n{out}"
+    );
+    assert!(
+        out.contains("std::vector<Vec2>"),
+        "Array<Vec2> is a value vector:\n{out}"
+    );
+    assert!(
+        out.contains("pts.push_back(Vec2(1.0, 2.0))"),
+        "pushed value, no heap:\n{out}"
+    );
+    assert!(
+        out.contains("this->here = Vec2(0.0, 0.0)"),
+        "value field init, no `new`:\n{out}"
+    );
+    assert!(
+        !out.contains("new Vec2") && !out.contains("delete"),
+        "no heap or frees for a value class:\n{out}"
+    );
 }
 
 #[test]
@@ -2221,8 +2889,14 @@ class Factory {
 }
 ";
     let out = gen_one(src, "Factory");
-    assert!(out.contains("case ALIENBEACH_SCENE_ID:"), "final constant is a valid case label:\n{out}");
-    assert!(out.contains("case POINTS_SCENE_ID:"), "final constant is a valid case label:\n{out}");
+    assert!(
+        out.contains("case ALIENBEACH_SCENE_ID:"),
+        "final constant is a valid case label:\n{out}"
+    );
+    assert!(
+        out.contains("case POINTS_SCENE_ID:"),
+        "final constant is a valid case label:\n{out}"
+    );
 }
 
 #[test]
@@ -2246,9 +2920,18 @@ class Factory {
 }
 ";
     let out = gen_one(src, "Factory");
-    assert!(out.contains("Scene* _swx"), "temp is the base/return type, not the first arm:\n{out}");
-    assert!(!out.contains("AlienBeach* _swx"), "temp must not be typed as the first arm's subclass:\n{out}");
-    assert!(out.contains("_swx1 = new Points()"), "a sibling subclass assigns to the base temp:\n{out}");
+    assert!(
+        out.contains("Scene* _swx"),
+        "temp is the base/return type, not the first arm:\n{out}"
+    );
+    assert!(
+        !out.contains("AlienBeach* _swx"),
+        "temp must not be typed as the first arm's subclass:\n{out}"
+    );
+    assert!(
+        out.contains("_swx1 = new Points()"),
+        "a sibling subclass assigns to the base temp:\n{out}"
+    );
 }
 
 #[test]
@@ -2271,18 +2954,37 @@ class Use {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("Use.hx"), src).unwrap();
         let prog = Program::from_src_dir(&dir).expect("build program");
-        let idx = prog.modules.iter().position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Use")).unwrap();
+        let idx = prog
+            .modules
+            .iter()
+            .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Use"))
+            .unwrap();
         let h = hatchet::codegen::generate_header(&prog, idx).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         h
     };
-    assert!(head.contains("double __this;"), "underlying wrapped in __this:\n{head}");
-    assert!(head.contains("\t~Meters() {}"), "value class: non-virtual destructor:\n{head}");
+    assert!(
+        head.contains("double __this;"),
+        "underlying wrapped in __this:\n{head}"
+    );
+    assert!(
+        head.contains("\t~Meters() {}"),
+        "value class: non-virtual destructor:\n{head}"
+    );
 
     let out = gen_one(src, "Use");
-    assert!(out.contains("this->__this = v;"), "`this = v` writes the underlying:\n{out}");
-    assert!(out.contains("return this->__this * 2.0;"), "`this` reads the underlying:\n{out}");
-    assert!(out.contains("Meters m = Meters(3.5)"), "`new` is value construction:\n{out}");
+    assert!(
+        out.contains("this->__this = v;"),
+        "`this = v` writes the underlying:\n{out}"
+    );
+    assert!(
+        out.contains("return this->__this * 2.0;"),
+        "`this` reads the underlying:\n{out}"
+    );
+    assert!(
+        out.contains("Meters m = Meters(3.5)"),
+        "`new` is value construction:\n{out}"
+    );
 }
 
 #[test]
@@ -2301,8 +3003,14 @@ class Use {
 }
 ";
     let out = gen_one(src, "Use");
-    assert!(out.contains("Money::zero()"), "static call uses scope resolution:\n{out}");
-    assert!(!out.contains("Money.zero()"), "no member-access dot for a static call:\n{out}");
+    assert!(
+        out.contains("Money::zero()"),
+        "static call uses scope resolution:\n{out}"
+    );
+    assert!(
+        !out.contains("Money.zero()"),
+        "no member-access dot for a static call:\n{out}"
+    );
 }
 
 #[test]
@@ -2337,7 +3045,10 @@ abstract View(ViewData) {
     let head = hatchet::codegen::generate_header(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(head.contains("class View;"), "later sibling is forward-declared:\n{head}");
+    assert!(
+        head.contains("class View;"),
+        "later sibling is forward-declared:\n{head}"
+    );
     assert!(
         head.contains("View operator[](int i);"),
         "the cyclic forwarder is declared in-class:\n{head}"
@@ -2369,14 +3080,29 @@ class Use {
 }
 ";
     let head = gen_header(src, "Use");
-    assert!(head.contains("class pt {"), "renamed class definition:\n{head}");
+    assert!(
+        head.contains("class pt {"),
+        "renamed class definition:\n{head}"
+    );
     assert!(head.contains("pt(int x);"), "renamed constructor:\n{head}");
-    assert!(head.contains("pt p;"), "uses of the type are renamed:\n{head}");
-    assert!(!head.contains("Point"), "the Haxe name must not leak:\n{head}");
+    assert!(
+        head.contains("pt p;"),
+        "uses of the type are renamed:\n{head}"
+    );
+    assert!(
+        !head.contains("Point"),
+        "the Haxe name must not leak:\n{head}"
+    );
 
     let out = gen_one(src, "Use");
-    assert!(out.contains("pt::pt(int x)"), "ctor definition qualifier renamed:\n{out}");
-    assert!(out.contains("int pt::gx()"), "method definition qualifier renamed:\n{out}");
+    assert!(
+        out.contains("pt::pt(int x)"),
+        "ctor definition qualifier renamed:\n{out}"
+    );
+    assert!(
+        out.contains("int pt::gx()"),
+        "method definition qualifier renamed:\n{out}"
+    );
 }
 
 #[test]
@@ -2395,10 +3121,22 @@ class User {
 }
 ";
     let head = gen_header(src, "User");
-    assert!(!head.contains("class Engine"), "extern class must not be emitted:\n{head}");
-    assert!(head.contains("#include \"engine.h\""), "its @:include is pulled:\n{head}");
-    assert!(head.contains("class User"), "the non-extern class is emitted:\n{head}");
-    assert!(head.contains("Engine* e;"), "the extern type is referenced (by pointer):\n{head}");
+    assert!(
+        !head.contains("class Engine"),
+        "extern class must not be emitted:\n{head}"
+    );
+    assert!(
+        head.contains("#include \"engine.h\""),
+        "its @:include is pulled:\n{head}"
+    );
+    assert!(
+        head.contains("class User"),
+        "the non-extern class is emitted:\n{head}"
+    );
+    assert!(
+        head.contains("Engine* e;"),
+        "the extern type is referenced (by pointer):\n{head}"
+    );
 }
 
 #[test]
@@ -2423,7 +3161,10 @@ class User {
         head.contains("eng::IEngine* engine;"),
         "cpp.Pointer<IEngine> → eng::IEngine* (inner @:native rename applied):\n{head}"
     );
-    assert!(head.contains("std::string name;"), "cpp.StdString → std::string:\n{head}");
+    assert!(
+        head.contains("std::string name;"),
+        "cpp.StdString → std::string:\n{head}"
+    );
 
     let out = gen_one(src, "User");
     assert!(
@@ -2451,8 +3192,14 @@ class User {
 }
 ";
     let out = gen_one(src, "User");
-    assert!(!out.contains("void _anon"), "anon arg must not fall back to void:\n{out}");
-    assert!(out.contains("e::Effect _anon"), "anon arg lowers to the struct param type:\n{out}");
+    assert!(
+        !out.contains("void _anon"),
+        "anon arg must not fall back to void:\n{out}"
+    );
+    assert!(
+        out.contains("e::Effect _anon"),
+        "anon arg lowers to the struct param type:\n{out}"
+    );
     assert!(
         out.contains("engine->GetRenderer()->Push("),
         "chained call resolves and dispatches via `->`:\n{out}"
@@ -2507,9 +3254,18 @@ class User {
 }
 ";
     let head = gen_header(src, "User");
-    assert!(!head.contains("class Engine"), "proxy is not emitted:\n{head}");
-    assert!(!head.contains("class Renderer"), "proxy is not emitted:\n{head}");
-    assert!(head.contains("eng::IEngine* engine;"), "proxy field → native extern pointer:\n{head}");
+    assert!(
+        !head.contains("class Engine"),
+        "proxy is not emitted:\n{head}"
+    );
+    assert!(
+        !head.contains("class Renderer"),
+        "proxy is not emitted:\n{head}"
+    );
+    assert!(
+        head.contains("eng::IEngine* engine;"),
+        "proxy field → native extern pointer:\n{head}"
+    );
 
     let out = gen_one(src, "User");
     assert!(
@@ -2540,7 +3296,10 @@ class Title extends Scene {
 }
 ";
     let head = gen_header(src, "Title");
-    assert!(!head.contains("class Scene"), "produce-proxy base is not emitted:\n{head}");
+    assert!(
+        !head.contains("class Scene"),
+        "produce-proxy base is not emitted:\n{head}"
+    );
     assert!(
         head.contains(": public mucus::IScene"),
         "subclass derives from the native base:\n{head}"
@@ -2562,7 +3321,8 @@ abstract class Scene { public function new() {} }
 ";
     let errs = validation_errors(src, "Scene");
     assert!(
-        errs.iter().any(|e| e.contains("@proxy") && e.contains("requires the fully-qualified")),
+        errs.iter()
+            .any(|e| e.contains("@proxy") && e.contains("requires the fully-qualified")),
         "a `@proxy` with no argument must error, got: {errs:?}"
     );
 }
@@ -2576,7 +3336,8 @@ class Scene { public function new() {} }
 ";
     let errs = validation_errors(src, "Scene");
     assert!(
-        errs.iter().any(|e| e.contains("@proxy") && e.contains("only valid on an `abstract`")),
+        errs.iter()
+            .any(|e| e.contains("@proxy") && e.contains("only valid on an `abstract`")),
         "a `@proxy` on a normal class must error, got: {errs:?}"
     );
 }
@@ -2613,7 +3374,10 @@ function go():Int {
 ";
     let out = gen_one(src, "M");
     let deletes = out.matches("delete w;").count();
-    assert_eq!(deletes, 1, "owned local freed exactly once (no dead double-delete):\n{out}");
+    assert_eq!(
+        deletes, 1,
+        "owned local freed exactly once (no dead double-delete):\n{out}"
+    );
 }
 
 #[test]
@@ -2647,8 +3411,14 @@ class User {
         .unwrap();
     let out = generate_source(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(!out.contains("99"), "no definition for the extern const is emitted:\n{out}");
-    assert!(out.contains("eng::LIMIT"), "cross-namespace reference is qualified:\n{out}");
+    assert!(
+        !out.contains("99"),
+        "no definition for the extern const is emitted:\n{out}"
+    );
+    assert!(
+        out.contains("eng::LIMIT"),
+        "cross-namespace reference is qualified:\n{out}"
+    );
 }
 
 #[test]
@@ -2664,7 +3434,42 @@ function helper(n:Int):Int { return n + 1; }
         head.contains("HATCHET_EXPORT int HATCHET_CALL pick(int n)"),
         "@:abi → a macro-wrapped global export:\n{head}"
     );
-    assert!(head.contains("int helper(int n)"), "a plain function stays a free function:\n{head}");
+    assert!(
+        head.contains("int helper(int n)"),
+        "a plain function stays a free function:\n{head}"
+    );
     // The export lives at global scope, the free function inside the namespace.
-    assert!(!head.contains("HATCHET_EXPORT int HATCHET_CALL helper"), "plain fn is not exported:\n{head}");
+    assert!(
+        !head.contains("HATCHET_EXPORT int HATCHET_CALL helper"),
+        "plain fn is not exported:\n{head}"
+    );
+}
+
+#[test]
+fn empty_array_return_is_a_default_constructed_vector() {
+    // `return []` for a by-value `Array<T>` (`std::vector<...>`) must
+    // default-construct the container — you cannot `return NULL` from a function
+    // returning a vector by value. A `Null<Array<T>>` (pointer) still returns NULL.
+    let src = "\
+class Thing { public function new() {} }
+class Probe {
+  public function new() {}
+  public function ints():Array<Int> { return []; }
+  public function things():Array<Thing> { return []; }
+  public function maybe():Null<Array<Int>> { return []; }
+}
+";
+    let out = gen_one(src, "Probe");
+    assert!(
+        out.contains("return std::vector<int>();"),
+        "empty Array<Int> → default vector:\n{out}"
+    );
+    assert!(
+        out.contains("return std::vector<Thing*>();"),
+        "empty Array<Thing> → default vector:\n{out}"
+    );
+    assert!(
+        out.contains("return NULL;"),
+        "empty Null<Array<Int>> (pointer) still returns NULL:\n{out}"
+    );
 }

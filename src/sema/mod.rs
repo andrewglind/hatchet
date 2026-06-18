@@ -120,6 +120,11 @@ pub struct Module {
     pub package: Vec<String>,
     pub file: File,
     pub is_stdafx: bool,
+    /// A resolve-only module brought in via `--include`: parsed so its types
+    /// (`extern`/`@:native` stubs) resolve and its native `@:include`s propagate,
+    /// but **never emitted** (no `.h`/`.cpp`) and never folded into a header-only
+    /// amalgamation. The Haxe equivalent of a C/C++ header passed for resolution.
+    pub is_include: bool,
     /// Module indices brought into scope by this module's `import`s.
     pub imports_resolved: Vec<usize>,
 }
@@ -141,6 +146,13 @@ pub struct Program {
     /// the real output location. `None` (the default, and what tests use) keeps
     /// every include purely source-relative — correct for in-place generation.
     pub include_rebase: Option<(PathBuf, PathBuf)>,
+    /// When true, `trace(...)` calls are stripped (mirrors `--no-traces`). Read by
+    /// the header generator when it emits a header-only class's method bodies
+    /// inline, so they match what the `.cpp` path would have produced.
+    pub no_trace: bool,
+    /// Buried-`Null<T>` auto-extract depth (the `--depth` flag). Read by the header
+    /// generator for inline header-only bodies; default 1.
+    pub extract_depth: usize,
 }
 
 impl Program {
@@ -150,7 +162,8 @@ impl Program {
             .map_err(|e| format!("scanning {}: {e}", src_root.display()))?;
         let mut units = Vec::new();
         for f in files {
-            let src = std::fs::read_to_string(&f).map_err(|e| format!("reading {}: {e}", f.display()))?;
+            let src =
+                std::fs::read_to_string(&f).map_err(|e| format!("reading {}: {e}", f.display()))?;
             let parsed = parser::parse(&src).map_err(|e| format!("{}: {e}", f.display()))?;
             units.push((f, parsed));
         }
@@ -176,6 +189,7 @@ impl Program {
             };
             modules.push(Module {
                 is_stdafx: discover::is_stdafx_named(&path, stdafx_stem),
+                is_include: false,
                 path,
                 dir,
                 package,
@@ -191,6 +205,8 @@ impl Program {
             stdafx_stem: stdafx_stem.to_string(),
             export_macro: "HATCHET".to_string(),
             include_rebase: None,
+            no_trace: false,
+            extract_depth: 1,
         };
         prog.index_types();
         prog.resolve_imports();
@@ -379,6 +395,23 @@ impl Program {
         Some(found)
     }
 
+    /// Resolve a type from a bare **C++ leaf name** — the spelling that appears in
+    /// generated container bases. Container element/value `TypeInfo` is recovered
+    /// from the C++ base (`std::vector<jvalue*>` → `jvalue`), but `resolve_type`
+    /// keys on the *Haxe* name, so a `@:native`-renamed type (`@:native("jvalue")
+    /// class JValue`) is missed by its native spelling. Tries the Haxe name first
+    /// (the common case), then falls back to matching a type's `cpp_name()`, so
+    /// member access on a renamed container element still resolves (`vals[i].s`).
+    pub fn resolve_type_by_cpp(&self, bare: &str, ctx_module: usize) -> Option<&TypeInfo> {
+        let owned = [bare.to_string()];
+        if let Some(t) = self.resolve_type(&owned, ctx_module) {
+            return Some(t);
+        }
+        self.types
+            .iter()
+            .find(|t| t.proxy_native.is_none() && t.cpp_name() == bare)
+    }
+
     /// The `extern` type a `@proxy("native::Name")` stands for: the (non-proxy)
     /// type whose fully-qualified `@:native` name equals `native`. This is both the
     /// redirect target for a consume proxy and the spelling source for a produce
@@ -398,7 +431,12 @@ impl Program {
     /// emitted in this module's namespace. A `final` whose value is a
     /// function/lambda is a free function, not a constant, and is left alone.
     /// Searches the current module first, then its imports.
-    pub fn global_final_ref(&self, name: &str, ctx_module: usize, current_ns: &[String]) -> Option<String> {
+    pub fn global_final_ref(
+        &self,
+        name: &str,
+        ctx_module: usize,
+        current_ns: &[String],
+    ) -> Option<String> {
         let m = &self.modules[ctx_module];
         let scope = std::iter::once(ctx_module).chain(m.imports_resolved.iter().copied());
         for mi in scope {
@@ -432,13 +470,17 @@ impl Program {
 
     /// Whether `path` resolves to a value class (`@:stackOnly` or an `abstract`).
     pub fn is_value_class(&self, path: &[String], ctx_module: usize) -> bool {
-        self.resolve_type(path, ctx_module).map(|t| t.is_value).unwrap_or(false)
+        self.resolve_type(path, ctx_module)
+            .map(|t| t.is_value)
+            .unwrap_or(false)
     }
 
     /// Whether `path` resolves to a `@:stackOnly` (stack-restricted) value class
     /// — one hxcpp forbids from being nested as a field/element.
     pub fn is_stack_restricted(&self, path: &[String], ctx_module: usize) -> bool {
-        self.resolve_type(path, ctx_module).map(|t| t.stack_restricted).unwrap_or(false)
+        self.resolve_type(path, ctx_module)
+            .map(|t| t.stack_restricted)
+            .unwrap_or(false)
     }
 
     /// The kind of a referenced type, if known.
@@ -474,12 +516,18 @@ impl Program {
             .collect();
         let mut seen: BTreeSet<(Vec<String>, String)> = BTreeSet::new();
         while let Some(base) = frontier.pop() {
-            let Type::Named { path, .. } = &base else { continue };
-            let Some(ti) = self.resolve_type(path, ctx_module) else { continue };
+            let Type::Named { path, .. } = &base else {
+                continue;
+            };
+            let Some(ti) = self.resolve_type(path, ctx_module) else {
+                continue;
+            };
             if !seen.insert((ti.package.clone(), ti.name.clone())) {
                 continue;
             }
-            let Some(decl) = self.type_decl(ti) else { continue };
+            let Some(decl) = self.type_decl(ti) else {
+                continue;
+            };
             if decl_has_method(decl, name) {
                 return true;
             }
@@ -493,7 +541,12 @@ impl Program {
     /// pointer when the *base* declaration is `virtual`. So a base method that any
     /// descendant overrides must itself be emitted `virtual`, or calls through a
     /// base pointer would statically bind to the base version.
-    pub fn method_overridden_in_subclass(&self, class: &Class, ctx_module: usize, name: &str) -> bool {
+    pub fn method_overridden_in_subclass(
+        &self,
+        class: &Class,
+        ctx_module: usize,
+        name: &str,
+    ) -> bool {
         let Some(base_ti) = self.resolve_type(std::slice::from_ref(&class.name), ctx_module) else {
             return false;
         };
@@ -526,8 +579,12 @@ impl Program {
             .collect();
         let mut seen: BTreeSet<(Vec<String>, String)> = BTreeSet::new();
         while let Some(base) = frontier.pop() {
-            let Type::Named { path, .. } = &base else { continue };
-            let Some(ti) = self.resolve_type(path, ctx_module) else { continue };
+            let Type::Named { path, .. } = &base else {
+                continue;
+            };
+            let Some(ti) = self.resolve_type(path, ctx_module) else {
+                continue;
+            };
             let key = (ti.package.clone(), ti.name.clone());
             if &key == target {
                 return true;
@@ -535,7 +592,9 @@ impl Program {
             if !seen.insert(key) {
                 continue;
             }
-            let Some(decl) = self.type_decl(ti) else { continue };
+            let Some(decl) = self.type_decl(ti) else {
+                continue;
+            };
             frontier.extend(decl_bases(decl));
         }
         false
@@ -586,9 +645,10 @@ impl Program {
                     // `extends`/`super`/variable sites. A *consume* proxy was already
                     // redirected to its extern by `resolve_type`, so `ti` there is the
                     // extern itself and falls through to `qualify`.
-                    Some(ti) if ti.proxy_native.is_some() => {
-                        ti.proxy_native.clone().unwrap_or_else(|| qualify(ti, current_ns))
-                    }
+                    Some(ti) if ti.proxy_native.is_some() => ti
+                        .proxy_native
+                        .clone()
+                        .unwrap_or_else(|| qualify(ti, current_ns)),
                     Some(ti) => qualify(ti, current_ns),
                     // Unknown (e.g. a generic parameter) — emit the name verbatim.
                     None => name.to_string(),
@@ -613,7 +673,11 @@ impl Program {
         if let Type::Named { path, params, .. } = ty {
             if path.last().map(|s| s.as_str()) == Some("Null") && params.len() == 1 {
                 let inner = self.map_type_use(&params[0], ctx_module, current_ns);
-                return if inner.ends_with('*') { inner } else { format!("{inner}*") };
+                return if inner.ends_with('*') {
+                    inner
+                } else {
+                    format!("{inner}*")
+                };
             }
         }
         let base = self.map_type_base(ty, ctx_module, current_ns);
@@ -631,7 +695,9 @@ impl Program {
     /// `extern` type declarations, plus `UInt8/16/32` shims) do not — importers
     /// inherit their `@:include`s instead.
     pub fn generates_header(&self, m: &Module) -> bool {
-        if m.is_stdafx {
+        // The prelude source and resolve-only `--include` stubs are never emitted,
+        // so they also never contribute a self-header `#include` to importers.
+        if m.is_stdafx || m.is_include {
             return false;
         }
         m.file.decls.iter().any(|d| self.is_emittable(d))
@@ -684,23 +750,42 @@ impl Program {
 
         // This module's own @:include directives (resolved against itself).
         for raw in module_includes_raw(&m.file) {
-            push(self.finalize_include(includes::resolve_include(&raw, &m.dir, target_dir), target_dir), &mut out);
+            push(
+                self.finalize_include(
+                    includes::resolve_include(&raw, &m.dir, target_dir),
+                    target_dir,
+                ),
+                &mut out,
+            );
         }
 
         // Helper: pull in a module's header (or, for native-interop modules that
         // emit none, their @:include directives).
-        let pull_module = |im: &Module, out: &mut Vec<String>, push: &mut dyn FnMut(String, &mut Vec<String>)| {
-            if self.generates_header(im) {
-                let mut header = im.dir.clone();
-                let stem = im.path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                header.push(format!("{stem}.h"));
-                push(self.finalize_include(includes::relative_header(&header, target_dir), target_dir), out);
-            } else {
-                for raw in module_includes_raw(&im.file) {
-                    push(self.finalize_include(includes::resolve_include(&raw, &im.dir, target_dir), target_dir), out);
+        let pull_module =
+            |im: &Module, out: &mut Vec<String>, push: &mut dyn FnMut(String, &mut Vec<String>)| {
+                if self.generates_header(im) {
+                    let mut header = im.dir.clone();
+                    let stem = im.path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    header.push(format!("{stem}.h"));
+                    push(
+                        self.finalize_include(
+                            includes::relative_header(&header, target_dir),
+                            target_dir,
+                        ),
+                        out,
+                    );
+                } else {
+                    for raw in module_includes_raw(&im.file) {
+                        push(
+                            self.finalize_include(
+                                includes::resolve_include(&raw, &im.dir, target_dir),
+                                target_dir,
+                            ),
+                            out,
+                        );
+                    }
                 }
-            }
-        };
+            };
 
         for &imp in &m.imports_resolved {
             pull_module(&self.modules[imp], &mut out, &mut push);
@@ -712,6 +797,55 @@ impl Program {
         // makes standalone, import-free projects compile.
         for dep in validate::referenced_modules(self, module_index) {
             pull_module(&self.modules[dep], &mut out, &mut push);
+        }
+        out
+    }
+
+    /// The native `@:include` headers a header-only amalgamation must hoist for
+    /// `module_index`: this module's own `@:include`s plus those of every referenced
+    /// native-interop module (an `extern` / `--include` stub that emits no header of
+    /// its own). Excludes the prelude header and any in-amalgamation module header —
+    /// both are inlined into the single output header rather than `#include`d.
+    pub fn native_includes(&self, module_index: usize) -> Vec<String> {
+        let m = &self.modules[module_index];
+        let target_dir = &m.dir;
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut push = |inc: String, out: &mut Vec<String>| {
+            if seen.insert(inc.clone()) {
+                out.push(inc);
+            }
+        };
+        for raw in module_includes_raw(&m.file) {
+            push(
+                self.finalize_include(
+                    includes::resolve_include(&raw, &m.dir, target_dir),
+                    target_dir,
+                ),
+                &mut out,
+            );
+        }
+        // Only native-interop modules (which emit no header) contribute `@:include`s;
+        // a referenced module that emits its own header is already in the amalgamation.
+        let pull_native =
+            |im: &Module, out: &mut Vec<String>, push: &mut dyn FnMut(String, &mut Vec<String>)| {
+                if !self.generates_header(im) {
+                    for raw in module_includes_raw(&im.file) {
+                        push(
+                            self.finalize_include(
+                                includes::resolve_include(&raw, &im.dir, target_dir),
+                                target_dir,
+                            ),
+                            out,
+                        );
+                    }
+                }
+            };
+        for &imp in &m.imports_resolved {
+            pull_native(&self.modules[imp], &mut out, &mut push);
+        }
+        for dep in validate::referenced_modules(self, module_index) {
+            pull_native(&self.modules[dep], &mut out, &mut push);
         }
         out
     }
@@ -747,7 +881,12 @@ fn dir_components(src_root: &Path, file: &Path) -> Vec<String> {
 fn leading_package(path: &[String]) -> Vec<String> {
     path.iter()
         .take(path.len() - 1) // never include the type name itself
-        .take_while(|c| c.chars().next().map(|ch| ch.is_lowercase()).unwrap_or(false))
+        .take_while(|c| {
+            c.chars()
+                .next()
+                .map(|ch| ch.is_lowercase())
+                .unwrap_or(false)
+        })
         .cloned()
         .collect()
 }
@@ -903,18 +1042,25 @@ mod tests {
              import modules.Module;\n\
              class Vertex extends Module {}",
         );
-        let module = (
-            "/src/modules/Module.hx",
-            "package modules; class Module {}",
-        );
+        let module = ("/src/modules/Module.hx", "package modules; class Module {}");
         let p = prog(&[native, vertex, module]);
-        let vidx = p.modules.iter().position(|m| m.path.ends_with("Vertex.hx")).unwrap();
+        let vidx = p
+            .modules
+            .iter()
+            .position(|m| m.path.ends_with("Vertex.hx"))
+            .unwrap();
         let ns = vec!["modules".to_string()];
 
         // native interface → native::IEngine*, pointer because it's a reference type
-        assert_eq!(p.map_type_use(&named(&["IEngine"]), vidx, &ns), "native::IEngine*");
+        assert_eq!(
+            p.map_type_use(&named(&["IEngine"]), vidx, &ns),
+            "native::IEngine*"
+        );
         // native struct typedef → value, namespaced
-        assert_eq!(p.map_type_use(&named(&["Effects"]), vidx, &ns), "native::Effects");
+        assert_eq!(
+            p.map_type_use(&named(&["Effects"]), vidx, &ns),
+            "native::Effects"
+        );
         // qualified native type disambiguates from the local `modules.Vertex` class
         let qualified = named(&["native", "api", "Native", "Vertex"]);
         assert_eq!(p.map_type_base(&qualified, vidx, &ns), "native::Vertex");
@@ -941,7 +1087,11 @@ mod tests {
              class Vertex extends Module {}",
         );
         let p = prog(&[native, stdafx, module, vertex]);
-        let vidx = p.modules.iter().position(|m| m.path.ends_with("Vertex.hx")).unwrap();
+        let vidx = p
+            .modules
+            .iter()
+            .position(|m| m.path.ends_with("Vertex.hx"))
+            .unwrap();
         let incs = p.header_includes(vidx);
         // StdAfx (present in this package) first, the inherited native include,
         // then the user-class header.
@@ -959,9 +1109,17 @@ mod tests {
             "class B { var a:A; public function new() { this.a = new A(); } }",
         );
         let p = prog(&[a, b]);
-        let bidx = p.modules.iter().position(|m| m.path.ends_with("B.hx")).unwrap();
+        let bidx = p
+            .modules
+            .iter()
+            .position(|m| m.path.ends_with("B.hx"))
+            .unwrap();
         let incs = p.header_includes(bidx);
-        assert_eq!(incs, vec!["StdAfx.h", "A.h"], "StdAfx.h always, plus A.h by reference");
+        assert_eq!(
+            incs,
+            vec!["StdAfx.h", "A.h"],
+            "StdAfx.h always, plus A.h by reference"
+        );
     }
 
     #[test]
@@ -973,11 +1131,22 @@ mod tests {
             "@:include(\"<string>\")\nclass W { public function new() {} }",
         );
         let p = prog(&[w]);
-        let idx = p.modules.iter().position(|m| m.path.ends_with("W.hx")).unwrap();
+        let idx = p
+            .modules
+            .iter()
+            .position(|m| m.path.ends_with("W.hx"))
+            .unwrap();
         let incs = p.header_includes(idx);
-        assert!(incs.contains(&"<string>".to_string()), "system @:include kept verbatim: {incs:?}");
+        assert!(
+            incs.contains(&"<string>".to_string()),
+            "system @:include kept verbatim: {incs:?}"
+        );
         // StdAfx.h is always included (Hatchet generates one for every directory).
-        assert_eq!(incs.first().map(String::as_str), Some("StdAfx.h"), "StdAfx.h first: {incs:?}");
+        assert_eq!(
+            incs.first().map(String::as_str),
+            Some("StdAfx.h"),
+            "StdAfx.h first: {incs:?}"
+        );
     }
 
     #[test]

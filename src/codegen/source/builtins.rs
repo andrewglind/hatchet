@@ -28,7 +28,10 @@ impl<'a> BodyGen<'a> {
                 let pos = self.gen_expr(&args[0]).0;
                 let elem = self.elem_member_ty(_rty);
                 let val = self.gen_args_typed(&args[1..2], &[Some(elem)], false);
-                Some((format!("{rcode}.insert({rcode}.begin() + {pos}, {val})"), Ty::default()))
+                Some((
+                    format!("{rcode}.insert({rcode}.begin() + {pos}, {val})"),
+                    Ty::default(),
+                ))
             }
             "pop" => {
                 // Haxe `Array.pop()` removes AND returns the last element; C++
@@ -38,7 +41,8 @@ impl<'a> BodyGen<'a> {
                 let spell = self.decl_spelling(&elem);
                 let tmp = self.fresh("pop");
                 let t = "\t".repeat(self.prelude_ind);
-                self.prelude.push_str(&format!("{t}{spell} {tmp} = {rcode}.back();\n"));
+                self.prelude
+                    .push_str(&format!("{t}{spell} {tmp} = {rcode}.back();\n"));
                 self.prelude.push_str(&format!("{t}{rcode}.pop_back();\n"));
                 Some((tmp, elem))
             }
@@ -49,7 +53,13 @@ impl<'a> BodyGen<'a> {
             }
             "exists" if rcode_is_map(_rty) => {
                 let k = self.gen_expr(&args[0]).0;
-                Some((format!("({rcode}.find({k}) != {rcode}.end())"), Ty { base: "bool".into(), ..Default::default() }))
+                Some((
+                    format!("({rcode}.find({k}) != {rcode}.end())"),
+                    Ty {
+                        base: "bool".into(),
+                        ..Default::default()
+                    },
+                ))
             }
             // Array.map(f) → a hoisted std::vector populated by a loop that applies
             // the lambda to each element (the Map-comprehension + Lambda composition).
@@ -106,7 +116,13 @@ impl<'a> BodyGen<'a> {
                     _rty.base
                 );
                 self.prelude.push_str(&pre);
-                Some((acc, Ty { base: format!("std::vector<{kspell} >"), ..Default::default() }))
+                Some((
+                    acc,
+                    Ty {
+                        base: format!("std::vector<{kspell} >"),
+                        ..Default::default()
+                    },
+                ))
             }
 
             // ---- Array (std::vector) methods -------------------------------
@@ -128,7 +144,11 @@ impl<'a> BodyGen<'a> {
             // `Array.indexOf(x[, fromIndex])` → first matching index or -1.
             "indexOf" => {
                 let x = self.gen_expr(&args[0]).0;
-                let start = if args.len() > 1 { self.gen_expr(&args[1]).0 } else { "0".to_string() };
+                let start = if args.len() > 1 {
+                    self.gen_expr(&args[1]).0
+                } else {
+                    "0".to_string()
+                };
                 let i = self.fresh("i");
                 let idx = self.fresh("idx");
                 let t = "\t".repeat(self.prelude_ind);
@@ -195,7 +215,13 @@ impl<'a> BodyGen<'a> {
                     );
                 }
                 self.prelude.push_str(&pre);
-                Some((acc, Ty { base: "std::string".into(), ..Default::default() }))
+                Some((
+                    acc,
+                    Ty {
+                        base: "std::string".into(),
+                        ..Default::default()
+                    },
+                ))
             }
             // `Array.concat(other)` → a new vector: a copy of this with `other`'s
             // elements appended (Haxe returns a fresh array, leaving both operands).
@@ -217,7 +243,11 @@ impl<'a> BodyGen<'a> {
             // indices count from the end, and the range is clamped to the array.
             "slice" => {
                 let pos = self.gen_expr(&args[0]).0;
-                let end = if args.len() > 1 { Some(self.gen_expr(&args[1]).0) } else { None };
+                let end = if args.len() > 1 {
+                    Some(self.gen_expr(&args[1]).0)
+                } else {
+                    None
+                };
                 let acc = self.fresh("slc");
                 let a = self.fresh("a");
                 let b = self.fresh("b");
@@ -244,15 +274,20 @@ impl<'a> BodyGen<'a> {
                 let spell = self.decl_spelling(&elem);
                 let tmp = self.fresh("shift");
                 let t = "\t".repeat(self.prelude_ind);
-                self.prelude.push_str(&format!("{t}{spell} {tmp} = {rcode}.front();\n"));
-                self.prelude.push_str(&format!("{t}{rcode}.erase({rcode}.begin());\n"));
+                self.prelude
+                    .push_str(&format!("{t}{spell} {tmp} = {rcode}.front();\n"));
+                self.prelude
+                    .push_str(&format!("{t}{rcode}.erase({rcode}.begin());\n"));
                 Some((tmp, elem))
             }
             // `Array.unshift(x)` → insert `x` at the front (Void).
             "unshift" => {
                 let elem = self.elem_member_ty(_rty);
                 let val = self.gen_args_typed(args, &[Some(elem)], false);
-                Some((format!("{rcode}.insert({rcode}.begin(), {val})"), Ty::default()))
+                Some((
+                    format!("{rcode}.insert({rcode}.begin(), {val})"),
+                    Ty::default(),
+                ))
             }
             // `Array.lastIndexOf(x[, fromIndex])` → last matching index or -1,
             // searching backward from `fromIndex` (default: the last element).
@@ -286,8 +321,16 @@ impl<'a> BodyGen<'a> {
     /// rather than returning `""`/`null` — an error-path divergence from Haxe.
     /// Returns `None` for methods not in Tier 1 (e.g. `split`, the `startIndex`
     /// form of `lastIndexOf`), which fall through to a later tier.
-    pub(super) fn string_call(&mut self, rcode: &str, method: &str, args: &[Expr]) -> Option<(String, Ty)> {
-        let str_ty = Ty { base: "std::string".into(), ..Default::default() };
+    pub(super) fn string_call(
+        &mut self,
+        rcode: &str,
+        method: &str,
+        args: &[Expr],
+    ) -> Option<(String, Ty)> {
+        let str_ty = Ty {
+            base: "std::string".into(),
+            ..Default::default()
+        };
         match method {
             "toString" => Some((rcode.to_string(), str_ty)),
             "charAt" => {
@@ -325,7 +368,11 @@ impl<'a> BodyGen<'a> {
                 let acc = self.fresh("case");
                 let i = self.fresh("i");
                 let t = "\t".repeat(self.prelude_ind);
-                let (lo, hi, delta) = if upper { ('a', 'z', "- 'a' + 'A'") } else { ('A', 'Z', "- 'A' + 'a'") };
+                let (lo, hi, delta) = if upper {
+                    ('a', 'z', "- 'a' + 'A'")
+                } else {
+                    ('A', 'Z', "- 'A' + 'a'")
+                };
                 let mut pre = String::new();
                 let _ = writeln!(pre, "{t}std::string {acc} = {rcode};");
                 let _ = writeln!(
@@ -355,20 +402,36 @@ impl<'a> BodyGen<'a> {
                 let _ = writeln!(pre, "{t}}} else {{");
                 let _ = writeln!(pre, "{t}\tsize_t {start} = 0;");
                 let _ = writeln!(pre, "{t}\tsize_t {found};");
-                let _ = writeln!(pre, "{t}\twhile (({found} = {s}.find({d}, {start})) != std::string::npos) {{");
-                let _ = writeln!(pre, "{t}\t\t{acc}.push_back({s}.substr({start}, {found} - {start}));");
+                let _ = writeln!(
+                    pre,
+                    "{t}\twhile (({found} = {s}.find({d}, {start})) != std::string::npos) {{"
+                );
+                let _ = writeln!(
+                    pre,
+                    "{t}\t\t{acc}.push_back({s}.substr({start}, {found} - {start}));"
+                );
                 let _ = writeln!(pre, "{t}\t\t{start} = {found} + {d}.size();");
                 let _ = writeln!(pre, "{t}\t}}");
                 let _ = writeln!(pre, "{t}\t{acc}.push_back({s}.substr({start}));");
                 let _ = writeln!(pre, "{t}}}");
                 self.prelude.push_str(&pre);
-                Some((acc, Ty { base: "std::vector<std::string >".into(), ..Default::default() }))
+                Some((
+                    acc,
+                    Ty {
+                        base: "std::vector<std::string >".into(),
+                        ..Default::default()
+                    },
+                ))
             }
             // `substr(pos, ?len)` — `pos` may be negative (counted from the end);
             // `len` omitted means "to the end". Indices are clamped to the string.
             "substr" => {
                 let pos = self.gen_expr(&args[0]).0;
-                let len = if args.len() > 1 { Some(self.gen_expr(&args[1]).0) } else { None };
+                let len = if args.len() > 1 {
+                    Some(self.gen_expr(&args[1]).0)
+                } else {
+                    None
+                };
                 let s = self.fresh("s");
                 let p = self.fresh("p");
                 let res = self.fresh("sub");
@@ -378,11 +441,17 @@ impl<'a> BodyGen<'a> {
                 let _ = writeln!(pre, "{t}int {p} = (int)({pos});");
                 let _ = writeln!(pre, "{t}if ({p} < 0) {p} += (int){s}.size();");
                 let _ = writeln!(pre, "{t}if ({p} < 0) {p} = 0;");
-                let _ = writeln!(pre, "{t}if ((size_t){p} > {s}.size()) {p} = (int){s}.size();");
+                let _ = writeln!(
+                    pre,
+                    "{t}if ((size_t){p} > {s}.size()) {p} = (int){s}.size();"
+                );
                 if let Some(len) = len {
                     let n = self.fresh("n");
                     let _ = writeln!(pre, "{t}int {n} = (int)({len}); if ({n} < 0) {n} = 0;");
-                    let _ = writeln!(pre, "{t}std::string {res} = {s}.substr((size_t){p}, (size_t){n});");
+                    let _ = writeln!(
+                        pre,
+                        "{t}std::string {res} = {s}.substr((size_t){p}, (size_t){n});"
+                    );
                 } else {
                     let _ = writeln!(pre, "{t}std::string {res} = {s}.substr((size_t){p});");
                 }
@@ -393,7 +462,11 @@ impl<'a> BodyGen<'a> {
             // are swapped when start > end (Haxe semantics).
             "substring" => {
                 let start = self.gen_expr(&args[0]).0;
-                let end = if args.len() > 1 { Some(self.gen_expr(&args[1]).0) } else { None };
+                let end = if args.len() > 1 {
+                    Some(self.gen_expr(&args[1]).0)
+                } else {
+                    None
+                };
                 let s = self.fresh("s");
                 let a = self.fresh("a");
                 let b = self.fresh("b");
@@ -410,8 +483,14 @@ impl<'a> BodyGen<'a> {
                         let _ = writeln!(pre, "{t}int {b} = (int){s}.size();");
                     }
                 }
-                let _ = writeln!(pre, "{t}if ({a} > {b}) {{ int t = {a}; {a} = {b}; {b} = t; }}");
-                let _ = writeln!(pre, "{t}std::string {res} = {s}.substr((size_t){a}, (size_t)({b} - {a}));");
+                let _ = writeln!(
+                    pre,
+                    "{t}if ({a} > {b}) {{ int t = {a}; {a} = {b}; {b} = t; }}"
+                );
+                let _ = writeln!(
+                    pre,
+                    "{t}std::string {res} = {s}.substr((size_t){a}, (size_t)({b} - {a}));"
+                );
                 self.prelude.push_str(&pre);
                 Some((res, str_ty))
             }
@@ -422,15 +501,22 @@ impl<'a> BodyGen<'a> {
                 Some((format!("{rcode} += {sv}"), Ty::default()))
             }
             // `StringBuf.addChar(c)` → append a single byte.
-            "addChar" => Some((format!("{rcode} += (char)({})", self.gen_expr(&args[0]).0), Ty::default())),
+            "addChar" => Some((
+                format!("{rcode} += (char)({})", self.gen_expr(&args[0]).0),
+                Ty::default(),
+            )),
             _ => None,
         }
     }
 
     pub(super) fn callee_param_types(&self, recv: &Ty, method: &str) -> Vec<Option<Ty>> {
-        let Some(info) = &recv.info else { return Vec::new() };
+        let Some(info) = &recv.info else {
+            return Vec::new();
+        };
         let cmi = info.module_index;
-        let Some(decl) = self.prog.type_decl(info) else { return Vec::new() };
+        let Some(decl) = self.prog.type_decl(info) else {
+            return Vec::new();
+        };
         let methods = match decl {
             Decl::Class(c) => &c.methods,
             Decl::Interface(i) => &i.methods,
@@ -444,8 +530,17 @@ impl<'a> BodyGen<'a> {
     }
 
     pub(super) fn own_method_param_types(&self, name: &str) -> Vec<Option<Ty>> {
-        match self.class.methods.iter().find(|m| m.name.as_deref() == Some(name)) {
-            Some(m) => m.params.iter().map(|p| self.param_ty_in(p, self.mi)).collect(),
+        match self
+            .class
+            .methods
+            .iter()
+            .find(|m| m.name.as_deref() == Some(name))
+        {
+            Some(m) => m
+                .params
+                .iter()
+                .map(|p| self.param_ty_in(p, self.mi))
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -454,8 +549,12 @@ impl<'a> BodyGen<'a> {
     /// callee consumes, so a `new` passed there is emitted inline (the receiver
     /// frees it) rather than freed by the caller.
     pub(super) fn callee_sink_params(&self, recv: &Ty, method: &str) -> Vec<bool> {
-        let Some(info) = &recv.info else { return Vec::new() };
-        let Some(decl) = self.prog.type_decl(info) else { return Vec::new() };
+        let Some(info) = &recv.info else {
+            return Vec::new();
+        };
+        let Some(decl) = self.prog.type_decl(info) else {
+            return Vec::new();
+        };
         let methods = match decl {
             Decl::Class(c) => &c.methods,
             Decl::Interface(i) => &i.methods,
@@ -470,7 +569,12 @@ impl<'a> BodyGen<'a> {
     /// `@sink` flags for a bare call: an own-class method, else a module-level
     /// free function of that name.
     pub(super) fn bare_sink_params(&self, name: &str) -> Vec<bool> {
-        if let Some(m) = self.class.methods.iter().find(|m| m.name.as_deref() == Some(name)) {
+        if let Some(m) = self
+            .class
+            .methods
+            .iter()
+            .find(|m| m.name.as_deref() == Some(name))
+        {
             return param_sink_flags(&m.params);
         }
         for d in &self.prog.modules[self.mi].file.decls {
@@ -485,7 +589,12 @@ impl<'a> BodyGen<'a> {
 
     // ---- intrinsics ----------------------------------------------------
 
-    pub(super) fn intrinsic_call(&mut self, obj: &str, method: &str, args: &[Expr]) -> Option<(String, Ty)> {
+    pub(super) fn intrinsic_call(
+        &mut self,
+        obj: &str,
+        method: &str,
+        args: &[Expr],
+    ) -> Option<(String, Ty)> {
         let f = |this: &mut Self, i: usize| this.gen_expr(&args[i]).0;
         match (obj, method) {
             // Direct <math.h> functions (Float → Float).
@@ -498,7 +607,9 @@ impl<'a> BodyGen<'a> {
             ("Math", "atan") => Some((format!("atan({})", f(self, 0)), float_ty())),
             ("Math", "exp") => Some((format!("exp({})", f(self, 0)), float_ty())),
             ("Math", "log") => Some((format!("log({})", f(self, 0)), float_ty())),
-            ("Math", "atan2") => Some((format!("atan2({}, {})", f(self, 0), f(self, 1)), float_ty())),
+            ("Math", "atan2") => {
+                Some((format!("atan2({}, {})", f(self, 0), f(self, 1)), float_ty()))
+            }
             ("Math", "pow") => Some((format!("pow({}, {})", f(self, 0), f(self, 1)), float_ty())),
             // Float-returning rounding (ffloor/fceil/fround).
             ("Math", "ffloor") => Some((format!("floor({})", f(self, 0)), float_ty())),
@@ -511,7 +622,11 @@ impl<'a> BodyGen<'a> {
             ("Math", "abs") => {
                 // abs for Int, fabs for Float — choose by inferred argument type
                 let (c, ty) = self.gen_expr(&args[0]);
-                let fname = if matches!(ty.base.as_str(), "float" | "double") { "fabs" } else { "abs" };
+                let fname = if matches!(ty.base.as_str(), "float" | "double") {
+                    "fabs"
+                } else {
+                    "abs"
+                };
                 Some((format!("{fname}({c})"), ty))
             }
             ("Math", "min") => Some((self.min_max("<", args), float_ty())),
@@ -524,7 +639,13 @@ impl<'a> BodyGen<'a> {
                 Some((format!("(({a}) != ({a}))"), bool_ty()))
             }
             ("Math", "isFinite") => Some((format!("((({}) * 0.0) == 0.0)", f(self, 0)), bool_ty())),
-            ("Std", "int") => Some((format!("(int)({})", f(self, 0)), Ty { base: "int".into(), ..Default::default() })),
+            ("Std", "int") => Some((
+                format!("(int)({})", f(self, 0)),
+                Ty {
+                    base: "int".into(),
+                    ..Default::default()
+                },
+            )),
             ("Std", "string") => Some(self.gen_std_string(&args[0])),
             // `Std.parseInt` accepts decimal and `0x` hex (strtol base 0). Haxe
             // returns `Null<Int>`; the C++98 lowering yields a plain `int` (0 on a
@@ -542,7 +663,10 @@ impl<'a> BodyGen<'a> {
             // Haxe). The argument is virtually always pure, so re-using it is safe.
             ("Std", "random") => {
                 let n = f(self, 0);
-                Some((format!("(((int)({n})) > 0 ? (rand() % (int)({n})) : 0)"), int_ty()))
+                Some((
+                    format!("(((int)({n})) > 0 ? (rand() % (int)({n})) : 0)"),
+                    int_ty(),
+                ))
             }
             // `StringTools.replace(s, sub, by)` → replace every occurrence of `sub`.
             ("StringTools", "replace") => {
@@ -607,7 +731,10 @@ impl<'a> BodyGen<'a> {
                 } else {
                     format!("{sv}.compare({sv}.size() - {ss}.size(), {ss}.size(), {ss}) == 0")
                 };
-                let _ = writeln!(pre, "{t}bool {res} = ({sv}.size() >= {ss}.size() && {cmp});");
+                let _ = writeln!(
+                    pre,
+                    "{t}bool {res} = ({sv}.size() >= {ss}.size() && {cmp});"
+                );
                 self.prelude.push_str(&pre);
                 Some((res, bool_ty()))
             }
@@ -621,7 +748,10 @@ impl<'a> BodyGen<'a> {
                 let _ = writeln!(pre, "{t}char {buf}[32];");
                 if args.len() > 1 {
                     let digits = self.gen_expr(&args[1]).0;
-                    let _ = writeln!(pre, "{t}sprintf({buf}, \"%0*X\", (int)({digits}), (unsigned int)({n}));");
+                    let _ = writeln!(
+                        pre,
+                        "{t}sprintf({buf}, \"%0*X\", (int)({digits}), (unsigned int)({n}));"
+                    );
                 } else {
                     let _ = writeln!(pre, "{t}sprintf({buf}, \"%X\", (unsigned int)({n}));");
                 }
@@ -636,7 +766,10 @@ impl<'a> BodyGen<'a> {
             // `String.fromCharCode(c)` → a one-char string (low byte only on VC6).
             ("String", "fromCharCode") => Some((
                 format!("std::string(1, (char)(({}) & 0xFF))", f(self, 0)),
-                Ty { base: "std::string".into(), ..Default::default() },
+                Ty {
+                    base: "std::string".into(),
+                    ..Default::default()
+                },
             )),
             _ => None,
         }
@@ -651,7 +784,10 @@ impl<'a> BodyGen<'a> {
     }
 
     pub(super) fn gen_string(&mut self, raw: &str, interpolated: bool) -> (String, Ty) {
-        let str_ty = Ty { base: "std::string".into(), ..Default::default() };
+        let str_ty = Ty {
+            base: "std::string".into(),
+            ..Default::default()
+        };
         if !interpolated || !has_interpolation(raw) {
             return (format!("\"{}\"", escape_str(raw)), str_ty);
         }
@@ -711,7 +847,13 @@ impl<'a> BodyGen<'a> {
             // A bare string literal is already a `const char*`; everything else
             // goes through the interpolation type→spec mapping (a `std::string`
             // value needs `.c_str()`, which `spec_for` supplies).
-            let (spec, arg) = if matches!(a, Expr::Str { interpolated: false, .. }) {
+            let (spec, arg) = if matches!(
+                a,
+                Expr::Str {
+                    interpolated: false,
+                    ..
+                }
+            ) {
                 ("%s".to_string(), code)
             } else {
                 self.spec_for(&code, &ty)
@@ -733,10 +875,19 @@ impl<'a> BodyGen<'a> {
     /// value is formatted via `sprintf` into a stack buffer (reusing `spec_for`'s
     /// type→conversion mapping).
     pub(super) fn gen_std_string(&mut self, arg: &Expr) -> (String, Ty) {
-        let str_ty = Ty { base: "std::string".into(), ..Default::default() };
+        let str_ty = Ty {
+            base: "std::string".into(),
+            ..Default::default()
+        };
         // A bare string literal is emitted as a `const char*`; wrap it so the
         // result is a genuine `std::string` value.
-        if matches!(arg, Expr::Str { interpolated: false, .. }) {
+        if matches!(
+            arg,
+            Expr::Str {
+                interpolated: false,
+                ..
+            }
+        ) {
             let (code, _) = self.gen_expr(arg);
             return (format!("std::string({code})"), str_ty);
         }
@@ -760,7 +911,13 @@ impl<'a> BodyGen<'a> {
         let (code, ty) = self.gen_expr(arg);
         // A bare string literal is already a `const char*` — `.c_str()` on it is
         // invalid; everything else of string type is a `std::string` value.
-        if matches!(arg, Expr::Str { interpolated: false, .. }) {
+        if matches!(
+            arg,
+            Expr::Str {
+                interpolated: false,
+                ..
+            }
+        ) {
             code
         } else if ty.base == "std::string" {
             format!("{code}.c_str()")
@@ -797,7 +954,9 @@ impl<'a> BodyGen<'a> {
         };
         let buf = self.fresh("buf");
         let t = "\t".repeat(self.prelude_ind);
-        self.prelude.push_str(&format!("{t}char {buf}[{size}]; sprintf({buf}, \"{spec}\", {arg});\n"));
+        self.prelude.push_str(&format!(
+            "{t}char {buf}[{size}]; sprintf({buf}, \"{spec}\", {arg});\n"
+        ));
         buf
     }
 

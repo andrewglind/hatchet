@@ -1,6 +1,6 @@
 //! Compile + run gate for the Tier-1 standard-library lowerings (`String.substr`/
 //! `substring`, `StringBuf`, `StringTools`, `Std.random`, and the extra `Array`
-//! methods). Like `example_compile`, it needs nothing outside the repository: it
+//! methods). Like the other `*_compile` gates, it needs nothing outside the repository: it
 //! synthesises a small Haxe program in a temp dir, transpiles it with the built
 //! `hatchet` binary, compiles the output under `g++ -std=c++98`, runs it, and
 //! checks the printed results — so it validates that the generated C++ both
@@ -20,7 +20,11 @@ fn find_gxx() -> Option<String> {
         Some(r"C:\msys64\mingw32\bin\g++.exe".to_string()),
     ];
     candidates.into_iter().flatten().find(|c| {
-        Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+        Command::new(c)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     })
 }
 
@@ -120,9 +124,16 @@ fn stdlib_lowerings_compile_and_run() {
     assert!(gen_ok, "transpiling the stdlib demo failed");
 
     // Compile the generated C++ together with the entry point.
-    let exe = out.join(if cfg!(windows) { "stdlib.exe" } else { "stdlib" });
+    let exe = out.join(if cfg!(windows) {
+        "stdlib.exe"
+    } else {
+        "stdlib"
+    });
     let mut cmd = Command::new(&gxx);
-    cmd.args(["-std=c++98", "-pedantic", "-Wall"]).arg("-I").arg(&out).arg(&main_cpp);
+    cmd.args(["-std=c++98", "-pedantic", "-Wall"])
+        .arg("-I")
+        .arg(&out)
+        .arg(&main_cpp);
     for f in cpp_files(&out) {
         cmd.arg(f);
     }
@@ -143,5 +154,8 @@ fn stdlib_lowerings_compile_and_run() {
         stdout.contains("hello|world|world|world|x=42!|a-b-c|hi|TT|00FF"),
         "string lowerings wrong:\n{stdout}"
     );
-    assert!(stdout.contains("5|3|1|2|2,5,8"), "array lowerings wrong:\n{stdout}");
+    assert!(
+        stdout.contains("5|3|1|2|2,5,8"),
+        "array lowerings wrong:\n{stdout}"
+    );
 }

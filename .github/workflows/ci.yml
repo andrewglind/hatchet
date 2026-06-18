@@ -34,7 +34,7 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
 
-      # The compile gate (tests/example_compile.rs) and the ownership-runtime
+      # The compile-gate tests (tests/*_compile.rs) and the ownership-runtime
       # tests compile generated C++ with a C++98 compiler. The tests auto-detect
       # `g++` on PATH (and skip gracefully if absent), so each runner just needs
       # one available:

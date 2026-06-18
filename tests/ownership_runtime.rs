@@ -25,7 +25,11 @@ fn find_gxx() -> Option<String> {
         Some(r"C:\msys64\mingw32\bin\g++.exe".to_string()),
     ];
     candidates.into_iter().flatten().find(|c| {
-        Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+        Command::new(c)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     })
 }
 
@@ -91,7 +95,10 @@ fn parse_result(stdout: &str) -> MemResult {
             .and_then(|v| v.parse().ok())
             .unwrap_or(-1)
     };
-    MemResult { live: get("LIVE="), double_free: get("DOUBLEFREE=") }
+    MemResult {
+        live: get("LIVE="),
+        double_free: get("DOUBLEFREE="),
+    }
 }
 
 fn unique_dir(tag: &str) -> PathBuf {
@@ -99,11 +106,20 @@ fn unique_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("hatchet_own_{}_{}_{}", tag, std::process::id(), stamp))
+    std::env::temp_dir().join(format!(
+        "hatchet_own_{}_{}_{}",
+        tag,
+        std::process::id(),
+        stamp
+    ))
 }
 
 fn exe_name() -> &'static str {
-    if cfg!(windows) { "scn.exe" } else { "scn" }
+    if cfg!(windows) {
+        "scn.exe"
+    } else {
+        "scn"
+    }
 }
 
 /// `.cpp` files directly inside `dir`.
@@ -196,7 +212,11 @@ fn harness_detects_a_double_free() {
     std::fs::write(dir.join("main.cpp"), main).unwrap();
     let r = compile_run(&gxx, "selftest", &dir);
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(r.double_free > 0, "the harness must catch a deliberate double-free (got {})", r.double_free);
+    assert!(
+        r.double_free > 0,
+        "the harness must catch a deliberate double-free (got {})",
+        r.double_free
+    );
 }
 
 /// A `new` into an `@owned` constructor parameter is freed exactly once by the
@@ -289,7 +309,10 @@ class Scenario {
         eprintln!("skipping: no C++ compiler");
         return;
     };
-    assert_eq!(r.double_free, 0, "an aliased object must never be double-freed (leak is OK)");
+    assert_eq!(
+        r.double_free, 0,
+        "an aliased object must never be double-freed (leak is OK)"
+    );
 }
 
 /// Haxe's auto-extending array writes run correctly at runtime (the Graph crash):
@@ -345,7 +368,10 @@ class Scenario {
         eprintln!("skipping: no C++ compiler");
         return;
     };
-    assert_eq!(r.double_free, 0, "owned container elements must not double-free");
+    assert_eq!(
+        r.double_free, 0,
+        "owned container elements must not double-free"
+    );
     assert_eq!(r.live, 0, "every pushed item must be freed");
 }
 
@@ -412,8 +438,14 @@ class Scenario {
         eprintln!("skipping: no C++ compiler");
         return;
     };
-    assert_eq!(r.double_free, 0, "reassigned owned field must not double-free");
-    assert_eq!(r.live, 0, "the prior value is freed before overwrite (no leak)");
+    assert_eq!(
+        r.double_free, 0,
+        "reassigned owned field must not double-free"
+    );
+    assert_eq!(
+        r.live, 0,
+        "the prior value is freed before overwrite (no leak)"
+    );
 }
 
 /// The bare-field escape bug, end to end: `o = new Outer(new Inner())` (with `this.`
@@ -448,7 +480,10 @@ class Scenario {
         eprintln!("skipping: no C++ compiler");
         return;
     };
-    assert_eq!(r.double_free, 0, "bare-field nested owned new must not double-free");
+    assert_eq!(
+        r.double_free, 0,
+        "bare-field nested owned new must not double-free"
+    );
     assert_eq!(r.live, 0, "outer + inner must both be freed");
 }
 
@@ -480,7 +515,10 @@ class Scenario {
         eprintln!("skipping: no C++ compiler");
         return;
     };
-    assert_eq!(r.double_free, 0, "a transferred-out new must never be double-freed");
+    assert_eq!(
+        r.double_free, 0,
+        "a transferred-out new must never be double-freed"
+    );
 }
 
 /// `@delete` on a local frees it at scope close — even a returned pointer the
@@ -511,7 +549,10 @@ class Scenario {
         return;
     };
     assert_eq!(r.double_free, 0, "@delete must not double-free");
-    assert_eq!(r.live, 0, "@delete frees the returned pointer the analysis would leak");
+    assert_eq!(
+        r.live, 0,
+        "@delete frees the returned pointer the analysis would leak"
+    );
 }
 
 // ---- real-world structural features (engine-free) -------------------------
@@ -545,7 +586,10 @@ class Scenario {
         eprintln!("skipping: no C++ compiler");
         return;
     };
-    assert_eq!(r.double_free, 0, "owned property field must not double-free");
+    assert_eq!(
+        r.double_free, 0,
+        "owned property field must not double-free"
+    );
     assert_eq!(r.live, 0, "owner + child must both be freed");
 }
 
@@ -584,7 +628,10 @@ class Scenario {
         return;
     };
     assert_eq!(r.double_free, 0, "inherited owner must not double-free");
-    assert_eq!(r.live, 0, "the owned leaf must be freed; the value tag has nothing to free");
+    assert_eq!(
+        r.live, 0,
+        "the owned leaf must be freed; the value tag has nothing to free"
+    );
 }
 
 /// Base-from-member holder idiom (computed locals before `super`, as in Actor) with

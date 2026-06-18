@@ -19,7 +19,11 @@ fn find_gxx() -> Option<String> {
         Some(r"C:\msys64\mingw32\bin\g++.exe".to_string()),
     ];
     candidates.into_iter().flatten().find(|c| {
-        Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+        Command::new(c)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     })
 }
 
@@ -149,9 +153,16 @@ fn int_enum_abstract_compiles_and_runs() {
         .unwrap_or(false);
     assert!(gen_ok, "transpiling the enum-abstract demo failed");
 
-    let exe = out.join(if cfg!(windows) { "enumabs.exe" } else { "enumabs" });
+    let exe = out.join(if cfg!(windows) {
+        "enumabs.exe"
+    } else {
+        "enumabs"
+    });
     let mut cmd = Command::new(&gxx);
-    cmd.args(["-std=c++98", "-pedantic", "-Wall"]).arg("-I").arg(&out).arg(&main_cpp);
+    cmd.args(["-std=c++98", "-pedantic", "-Wall"])
+        .arg("-I")
+        .arg(&out)
+        .arg(&main_cpp);
     for f in cpp_files(&out) {
         cmd.arg(f);
     }
@@ -163,15 +174,26 @@ fn int_enum_abstract_compiles_and_runs() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    let run = Command::new(&exe).output().expect("run the enum-abstract demo");
+    let run = Command::new(&exe)
+        .output()
+        .expect("run the enum-abstract demo");
     let stdout = String::from_utf8_lossy(&run.stdout);
     let _ = std::fs::remove_dir_all(&root);
 
     // Auto-incremented Dir + switch dispatch.
-    assert!(stdout.contains("NESW"), "enum auto-increment / switch wrong:\n{stdout}");
+    assert!(
+        stdout.contains("NESW"),
+        "enum auto-increment / switch wrong:\n{stdout}"
+    );
     // AB (A|B = 3) + Shift (1<<4 = 16) = 19; South = 2.
-    assert!(stdout.contains("19 2"), "explicit values / bit-flag expressions wrong:\n{stdout}");
+    assert!(
+        stdout.contains("19 2"),
+        "explicit values / bit-flag expressions wrong:\n{stdout}"
+    );
     // String-backed enum abstract (switch on the String subject) + Float-backed
     // (Half + Quarter = 0.75).
-    assert!(stdout.contains("hearts|spades|0.75"), "String/Float enum abstract wrong:\n{stdout}");
+    assert!(
+        stdout.contains("hearts|spades|0.75"),
+        "String/Float enum abstract wrong:\n{stdout}"
+    );
 }

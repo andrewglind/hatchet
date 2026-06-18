@@ -110,7 +110,10 @@ mod tests {
 
     #[test]
     fn reads_package() {
-        assert_eq!(package_parts("package modules;\nclass X {}"), vec!["modules"]);
+        assert_eq!(
+            package_parts("package modules;\nclass X {}"),
+            vec!["modules"]
+        );
         assert_eq!(
             package_parts("// c\npackage native.api;\n"),
             vec!["native", "api"]

@@ -16,7 +16,11 @@ fn find_gxx() -> Option<String> {
         Some(r"C:\msys64\mingw32\bin\g++.exe".to_string()),
     ];
     candidates.into_iter().flatten().find(|c| {
-        Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+        Command::new(c)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     })
 }
 
@@ -104,15 +108,33 @@ fn abstract_operators_and_conversions_compile_and_run() {
 
     // The abstract lowered to a value class with the operators/conversions.
     let header = std::fs::read_to_string(out.join("lib").join("Vec2.h")).unwrap();
-    assert!(header.contains("Vec2Data __this;"), "underlying wrapped in __this:\n{header}");
-    assert!(header.contains("operator[](int i)"), "@:op([]) → operator[]:\n{header}");
-    assert!(header.contains("operator+(Vec2"), "@:op(A + B) → operator+:\n{header}");
-    assert!(header.contains("operator int()"), "@:to Int → operator int:\n{header}");
-    assert!(header.contains("operator std::string()"), "@:to String → conversion:\n{header}");
+    assert!(
+        header.contains("Vec2Data __this;"),
+        "underlying wrapped in __this:\n{header}"
+    );
+    assert!(
+        header.contains("operator[](int i)"),
+        "@:op([]) → operator[]:\n{header}"
+    );
+    assert!(
+        header.contains("operator+(Vec2"),
+        "@:op(A + B) → operator+:\n{header}"
+    );
+    assert!(
+        header.contains("operator int()"),
+        "@:to Int → operator int:\n{header}"
+    );
+    assert!(
+        header.contains("operator std::string()"),
+        "@:to String → conversion:\n{header}"
+    );
 
     let exe = out.join(if cfg!(windows) { "abs.exe" } else { "abs" });
     let mut cmd = Command::new(&gxx);
-    cmd.args(["-std=c++98", "-pedantic", "-Wall"]).arg("-I").arg(&out).arg(&main_cpp);
+    cmd.args(["-std=c++98", "-pedantic", "-Wall"])
+        .arg("-I")
+        .arg(&out)
+        .arg(&main_cpp);
     for f in cpp_files(&out) {
         cmd.arg(f);
     }
@@ -128,9 +150,24 @@ fn abstract_operators_and_conversions_compile_and_run() {
     let stdout = String::from_utf8_lossy(&run.stdout);
     let _ = std::fs::remove_dir_all(&root);
 
-    assert!(stdout.contains("at=3,4"), "subscript operator wrong:\n{stdout}");
-    assert!(stdout.contains("plus=13"), "binary operator wrong:\n{stdout}");
-    assert!(stdout.contains("sum=7"), "@:to int conversion wrong:\n{stdout}");
-    assert!(stdout.contains("s=vec"), "@:to string conversion wrong:\n{stdout}");
-    assert!(stdout.contains("d=5,5"), "@:from converting ctor wrong:\n{stdout}");
+    assert!(
+        stdout.contains("at=3,4"),
+        "subscript operator wrong:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("plus=13"),
+        "binary operator wrong:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("sum=7"),
+        "@:to int conversion wrong:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("s=vec"),
+        "@:to string conversion wrong:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("d=5,5"),
+        "@:from converting ctor wrong:\n{stdout}"
+    );
 }

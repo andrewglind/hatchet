@@ -34,8 +34,14 @@ fn decl_class_uses_the_portable_export_macro() {
     let out = generate_header(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("class NATIVE_CLASS Widget"), "@:decl → macro-decorated class:\n{out}");
-    assert!(!out.contains("__declspec"), "no raw MSVC token leaks into output:\n{out}");
+    assert!(
+        out.contains("class NATIVE_CLASS Widget"),
+        "@:decl → macro-decorated class:\n{out}"
+    );
+    assert!(
+        !out.contains("__declspec"),
+        "no raw MSVC token leaks into output:\n{out}"
+    );
 }
 
 #[test]
@@ -63,7 +69,10 @@ fn base_method_overridden_by_a_subclass_is_virtual() {
     let base = header(&prog, "Base");
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(base.contains("virtual double area();"), "overridden base method must be virtual:\n{base}");
+    assert!(
+        base.contains("virtual double area();"),
+        "overridden base method must be virtual:\n{base}"
+    );
     assert!(
         base.contains("std::string label();") && !base.contains("virtual std::string label();"),
         "a method no subclass overrides stays non-virtual:\n{base}"
@@ -87,13 +96,31 @@ fn int_enum_abstract_lowers_to_a_cpp_enum_with_values() {
     let out = header(&prog, "Flag");
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("struct Flag_ {") && out.contains("enum Enum {"), "enum struct idiom:\n{out}");
-    assert!(out.contains("typedef Flag_::Enum Flag;"), "enum typedef:\n{out}");
-    assert!(out.contains("A = 1") && out.contains("B = 2"), "explicit values emitted:\n{out}");
-    assert!(out.contains("AB = A | B"), "sibling bit-flag expression emitted:\n{out}");
-    assert!(out.contains("Shift = 1 << 4"), "shift expression emitted:\n{out}");
+    assert!(
+        out.contains("struct Flag_ {") && out.contains("enum Enum {"),
+        "enum struct idiom:\n{out}"
+    );
+    assert!(
+        out.contains("typedef Flag_::Enum Flag;"),
+        "enum typedef:\n{out}"
+    );
+    assert!(
+        out.contains("A = 1") && out.contains("B = 2"),
+        "explicit values emitted:\n{out}"
+    );
+    assert!(
+        out.contains("AB = A | B"),
+        "sibling bit-flag expression emitted:\n{out}"
+    );
+    assert!(
+        out.contains("Shift = 1 << 4"),
+        "shift expression emitted:\n{out}"
+    );
     // A value-less member is emitted bare (auto-increment), with no `= ` suffix.
-    assert!(out.contains("None,") || out.contains("None\n"), "value-less member emitted bare:\n{out}");
+    assert!(
+        out.contains("None,") || out.contains("None\n"),
+        "value-less member emitted bare:\n{out}"
+    );
 }
 
 #[test]
@@ -114,7 +141,10 @@ fn abstract_function_is_a_pure_virtual_method() {
     let out = header(&prog, "Shape");
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("virtual double area() = 0;"), "abstract method → pure virtual:\n{out}");
+    assert!(
+        out.contains("virtual double area() = 0;"),
+        "abstract method → pure virtual:\n{out}"
+    );
     // A concrete method is not made pure virtual.
     assert!(
         out.contains("std::string describe();") && !out.contains("describe() = 0"),
@@ -139,15 +169,27 @@ fn string_enum_abstract_lowers_to_namespaced_static_consts() {
     let out = header(&prog, "Suit");
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("namespace Suit_ {"), "members live in a `Suit_` namespace:\n{out}");
+    assert!(
+        out.contains("namespace Suit_ {"),
+        "members live in a `Suit_` namespace:\n{out}"
+    );
     assert!(
         out.contains("static const std::string Hearts = \"H\";"),
         "string member → static const std::string:\n{out}"
     );
-    assert!(!out.contains("enum Enum"), "no C++ enum for a non-integral backing:\n{out}");
-    assert!(!out.contains("typedef"), "no typedef — the type maps straight to std::string:\n{out}");
+    assert!(
+        !out.contains("enum Enum"),
+        "no C++ enum for a non-integral backing:\n{out}"
+    );
+    assert!(
+        !out.contains("typedef"),
+        "no typedef — the type maps straight to std::string:\n{out}"
+    );
     // The method returns `Suit`, which maps to the underlying `std::string`.
-    assert!(out.contains("std::string f();"), "Suit maps to std::string in signatures:\n{out}");
+    assert!(
+        out.contains("std::string f();"),
+        "Suit maps to std::string in signatures:\n{out}"
+    );
 }
 
 #[test]
@@ -169,12 +211,21 @@ fn plain_module_function_is_declared_after_the_types_it_uses() {
     let out = header(&prog, "Geom");
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("Vec2 makeVec(double x, double y);"), "public function declared in header:\n{out}");
-    assert!(!out.contains("helper"), "private function is static in the .cpp, not in the header:\n{out}");
+    assert!(
+        out.contains("Vec2 makeVec(double x, double y);"),
+        "public function declared in header:\n{out}"
+    );
+    assert!(
+        !out.contains("helper"),
+        "private function is static in the .cpp, not in the header:\n{out}"
+    );
     // The `struct Vec2` definition must precede the function that returns it.
     let struct_at = out.find("struct Vec2").expect("Vec2 struct emitted");
     let fn_at = out.find("Vec2 makeVec").expect("makeVec declared");
-    assert!(struct_at < fn_at, "the type must be defined before the function that uses it:\n{out}");
+    assert!(
+        struct_at < fn_at,
+        "the type must be defined before the function that uses it:\n{out}"
+    );
 }
 
 #[test]
@@ -214,10 +265,19 @@ fn mutually_recursive_classes_get_targeted_forward_declarations() {
     let out = header(&prog, "Pair");
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("class B;"), "B is referenced before its definition → forward-declared:\n{out}");
-    assert!(!out.contains("class A;"), "A is defined first → no forward declaration (targeted):\n{out}");
+    assert!(
+        out.contains("class B;"),
+        "B is referenced before its definition → forward-declared:\n{out}"
+    );
+    assert!(
+        !out.contains("class A;"),
+        "A is defined first → no forward declaration (targeted):\n{out}"
+    );
     // the forward declaration precedes the class definition that needs it
     let fwd = out.find("class B;").unwrap();
     let def = out.find("class A {").unwrap();
-    assert!(fwd < def, "forward declaration must precede the referring class:\n{out}");
+    assert!(
+        fwd < def,
+        "forward declaration must precede the referring class:\n{out}"
+    );
 }

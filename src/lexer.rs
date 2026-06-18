@@ -18,13 +18,19 @@ pub enum TokKind {
     Kw(Kw),
     Int(String),
     Float(String),
-    Str { raw: String, interpolated: bool },
+    Str {
+        raw: String,
+        interpolated: bool,
+    },
     /// `@:name` or `@name` — the leading `@`/`@:` is stripped, name retained.
     Meta(String),
     /// A regular-expression literal `~/pattern/flags` — the raw pattern and flag
     /// letters, slashes stripped. Hatchet does not transpile regex (it is flagged
     /// `Unsupported`), but it is lexed so the diagnostic is clean.
-    Regex { pattern: String, flags: String },
+    Regex {
+        pattern: String,
+        flags: String,
+    },
     /// A Haxe conditional-compilation directive. Hatchet only targets C++, so
     /// these are not used for *Haxe* conditional compilation; instead they are
     /// repurposed as a clean front end for the C++ preprocessor (`#if FLAG` →
@@ -45,33 +51,108 @@ pub enum PpKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kw {
-    Package, Import, Using,
-    Class, Interface, Enum, Typedef, Abstract,
-    Extends, Implements,
-    Function, Var, Final,
-    Public, Private, Static, Inline, Extern, Override, Dynamic, Macro,
-    New, Return, If, Else, For, While, Do,
-    Switch, Case, Default, Break, Continue,
-    True, False, Null, This, Super, Cast, In,
-    Throw, Try, Catch, Untyped,
+    Package,
+    Import,
+    Using,
+    Class,
+    Interface,
+    Enum,
+    Typedef,
+    Abstract,
+    Extends,
+    Implements,
+    Function,
+    Var,
+    Final,
+    Public,
+    Private,
+    Static,
+    Inline,
+    Extern,
+    Override,
+    Dynamic,
+    Macro,
+    New,
+    Return,
+    If,
+    Else,
+    For,
+    While,
+    Do,
+    Switch,
+    Case,
+    Default,
+    Break,
+    Continue,
+    True,
+    False,
+    Null,
+    This,
+    Super,
+    Cast,
+    In,
+    Throw,
+    Try,
+    Catch,
+    Untyped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sym {
-    LParen, RParen, LBrace, RBrace, LBracket, RBracket,
-    Semi, Comma, Colon, Dot, DotDotDot,
-    Arrow,      // ->
-    FatArrow,   // =>
-    Question, QuestionDot, QuestionQuestion, QuestionQuestionEq,
-    Assign, Eq, Ne, Lt, Gt, Le, Ge,
-    Plus, Minus, Star, Slash, Percent,
-    PlusEq, MinusEq, StarEq, SlashEq, PercentEq,
-    PlusPlus, MinusMinus,
-    AmpAmp, PipePipe, Bang,
-    Amp, Pipe, Caret, Tilde, Shl, Shr, UShr,
-    AmpEq, PipeEq, CaretEq, ShlEq, ShrEq, UShrEq,
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    LBracket,
+    RBracket,
+    Semi,
+    Comma,
+    Colon,
+    Dot,
+    DotDotDot,
+    Arrow,    // ->
+    FatArrow, // =>
+    Question,
+    QuestionDot,
+    QuestionQuestion,
+    QuestionQuestionEq,
+    Assign,
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
+    PercentEq,
+    PlusPlus,
+    MinusMinus,
+    AmpAmp,
+    PipePipe,
+    Bang,
+    Amp,
+    Pipe,
+    Caret,
+    Tilde,
+    Shl,
+    Shr,
+    UShr,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    ShlEq,
+    ShrEq,
+    UShrEq,
     At,
-    Dollar,     // $ — only appears in Haxe macro reification, which is unsupported
+    Dollar, // $ — only appears in Haxe macro reification, which is unsupported
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,21 +180,50 @@ impl std::error::Error for LexError {}
 pub fn keyword(word: &str) -> Option<Kw> {
     use Kw::*;
     Some(match word {
-        "package" => Package, "import" => Import, "using" => Using,
-        "class" => Class, "interface" => Interface, "enum" => Enum,
-        "typedef" => Typedef, "abstract" => Abstract,
-        "extends" => Extends, "implements" => Implements,
-        "function" => Function, "var" => Var, "final" => Final,
-        "public" => Public, "private" => Private, "static" => Static,
-        "inline" => Inline, "extern" => Extern, "override" => Override,
-        "dynamic" => Dynamic, "macro" => Macro,
-        "new" => New, "return" => Return, "if" => If, "else" => Else,
-        "for" => For, "while" => While, "do" => Do,
-        "switch" => Switch, "case" => Case, "default" => Default,
-        "break" => Break, "continue" => Continue,
-        "true" => True, "false" => False, "null" => Null,
-        "this" => This, "super" => Super, "cast" => Cast, "in" => In,
-        "throw" => Throw, "try" => Try, "catch" => Catch, "untyped" => Untyped,
+        "package" => Package,
+        "import" => Import,
+        "using" => Using,
+        "class" => Class,
+        "interface" => Interface,
+        "enum" => Enum,
+        "typedef" => Typedef,
+        "abstract" => Abstract,
+        "extends" => Extends,
+        "implements" => Implements,
+        "function" => Function,
+        "var" => Var,
+        "final" => Final,
+        "public" => Public,
+        "private" => Private,
+        "static" => Static,
+        "inline" => Inline,
+        "extern" => Extern,
+        "override" => Override,
+        "dynamic" => Dynamic,
+        "macro" => Macro,
+        "new" => New,
+        "return" => Return,
+        "if" => If,
+        "else" => Else,
+        "for" => For,
+        "while" => While,
+        "do" => Do,
+        "switch" => Switch,
+        "case" => Case,
+        "default" => Default,
+        "break" => Break,
+        "continue" => Continue,
+        "true" => True,
+        "false" => False,
+        "null" => Null,
+        "this" => This,
+        "super" => Super,
+        "cast" => Cast,
+        "in" => In,
+        "throw" => Throw,
+        "try" => Try,
+        "catch" => Catch,
+        "untyped" => Untyped,
         _ => return None,
     })
 }
@@ -159,7 +269,12 @@ impl<'a> Lexer<'a> {
             };
             let end = self.i;
             let line = self.line;
-            self.out.push(Token { kind, line, start, end });
+            self.out.push(Token {
+                kind,
+                line,
+                start,
+                end,
+            });
         }
         self.out.push(Token {
             kind: TokKind::Eof,
@@ -319,10 +434,7 @@ impl<'a> Lexer<'a> {
         let n = self.bytes.len();
         let start = self.i;
         // hex
-        if self.bytes[self.i] == b'0'
-            && self.i + 1 < n
-            && (self.bytes[self.i + 1] | 0x20) == b'x'
-        {
+        if self.bytes[self.i] == b'0' && self.i + 1 < n && (self.bytes[self.i + 1] | 0x20) == b'x' {
             self.i += 2;
             while self.i < n && self.bytes[self.i].is_ascii_hexdigit() {
                 self.i += 1;
@@ -334,7 +446,10 @@ impl<'a> Lexer<'a> {
         }
         let mut is_float = false;
         // fractional part — but only if not the `...` range operator
-        if self.i < n && self.bytes[self.i] == b'.' && !(self.i + 1 < n && self.bytes[self.i + 1] == b'.') {
+        if self.i < n
+            && self.bytes[self.i] == b'.'
+            && !(self.i + 1 < n && self.bytes[self.i + 1] == b'.')
+        {
             is_float = true;
             self.i += 1;
             while self.i < n && self.bytes[self.i].is_ascii_digit() {
@@ -379,9 +494,21 @@ impl<'a> Lexer<'a> {
     fn lex_symbol(&mut self) -> Result<TokKind, LexError> {
         let n = self.bytes.len();
         let c = self.bytes[self.i];
-        let c1 = if self.i + 1 < n { self.bytes[self.i + 1] } else { 0 };
-        let c2 = if self.i + 2 < n { self.bytes[self.i + 2] } else { 0 };
-        let c3 = if self.i + 3 < n { self.bytes[self.i + 3] } else { 0 };
+        let c1 = if self.i + 1 < n {
+            self.bytes[self.i + 1]
+        } else {
+            0
+        };
+        let c2 = if self.i + 2 < n {
+            self.bytes[self.i + 2]
+        } else {
+            0
+        };
+        let c3 = if self.i + 3 < n {
+            self.bytes[self.i + 3]
+        } else {
+            0
+        };
         use Sym::*;
 
         // four-character (`>>>=` must win over `>>>`)
@@ -437,14 +564,30 @@ impl<'a> Lexer<'a> {
 
         // one-character
         let one = match c {
-            b'(' => LParen, b')' => RParen,
-            b'{' => LBrace, b'}' => RBrace,
-            b'[' => LBracket, b']' => RBracket,
-            b';' => Semi, b',' => Comma, b':' => Colon, b'.' => Dot,
+            b'(' => LParen,
+            b')' => RParen,
+            b'{' => LBrace,
+            b'}' => RBrace,
+            b'[' => LBracket,
+            b']' => RBracket,
+            b';' => Semi,
+            b',' => Comma,
+            b':' => Colon,
+            b'.' => Dot,
             b'?' => Question,
-            b'=' => Assign, b'<' => Lt, b'>' => Gt,
-            b'+' => Plus, b'-' => Minus, b'*' => Star, b'/' => Slash, b'%' => Percent,
-            b'!' => Bang, b'&' => Amp, b'|' => Pipe, b'^' => Caret, b'~' => Tilde,
+            b'=' => Assign,
+            b'<' => Lt,
+            b'>' => Gt,
+            b'+' => Plus,
+            b'-' => Minus,
+            b'*' => Star,
+            b'/' => Slash,
+            b'%' => Percent,
+            b'!' => Bang,
+            b'&' => Amp,
+            b'|' => Pipe,
+            b'^' => Caret,
+            b'~' => Tilde,
             b'$' => Dollar,
             _ => return Err(self.err(&format!("unexpected character '{}'", c as char))),
         };
@@ -477,7 +620,12 @@ mod tests {
     use super::*;
 
     fn kinds(src: &str) -> Vec<TokKind> {
-        lex(src).unwrap().into_iter().map(|t| t.kind).filter(|k| *k != TokKind::Eof).collect()
+        lex(src)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.kind)
+            .filter(|k| *k != TokKind::Eof)
+            .collect()
     }
 
     #[test]
@@ -514,26 +662,41 @@ mod tests {
         // `~/pattern/flags` → one Regex token; slashes stripped, flags captured.
         assert_eq!(
             kinds("~/haxe/i"),
-            vec![TokKind::Regex { pattern: "haxe".into(), flags: "i".into() }]
+            vec![TokKind::Regex {
+                pattern: "haxe".into(),
+                flags: "i".into()
+            }]
         );
         // An escaped slash `\/` stays part of the pattern; no flags is fine.
         assert_eq!(
             kinds(r"~/a\/b/"),
-            vec![TokKind::Regex { pattern: r"a\/b".into(), flags: "".into() }]
+            vec![TokKind::Regex {
+                pattern: r"a\/b".into(),
+                flags: "".into()
+            }]
         );
         // A bare `~` is still bitwise-not when not followed by `/`.
-        assert_eq!(kinds("~x"), vec![TokKind::Sym(Sym::Tilde), TokKind::Ident("x".into())]);
+        assert_eq!(
+            kinds("~x"),
+            vec![TokKind::Sym(Sym::Tilde), TokKind::Ident("x".into())]
+        );
     }
 
     #[test]
     fn strings_interpolation_flag() {
         assert_eq!(
             kinds("'${x}_y'"),
-            vec![TokKind::Str { raw: "${x}_y".into(), interpolated: true }]
+            vec![TokKind::Str {
+                raw: "${x}_y".into(),
+                interpolated: true
+            }]
         );
         assert_eq!(
             kinds("\"plain\""),
-            vec![TokKind::Str { raw: "plain".into(), interpolated: false }]
+            vec![TokKind::Str {
+                raw: "plain".into(),
+                interpolated: false
+            }]
         );
     }
 
@@ -552,11 +715,16 @@ mod tests {
         assert_eq!(
             kinds("a ?? b => c -> d ?.e ??= f"),
             vec![
-                TokKind::Ident("a".into()), TokKind::Sym(QuestionQuestion),
-                TokKind::Ident("b".into()), TokKind::Sym(FatArrow),
-                TokKind::Ident("c".into()), TokKind::Sym(Arrow),
-                TokKind::Ident("d".into()), TokKind::Sym(QuestionDot),
-                TokKind::Ident("e".into()), TokKind::Sym(QuestionQuestionEq),
+                TokKind::Ident("a".into()),
+                TokKind::Sym(QuestionQuestion),
+                TokKind::Ident("b".into()),
+                TokKind::Sym(FatArrow),
+                TokKind::Ident("c".into()),
+                TokKind::Sym(Arrow),
+                TokKind::Ident("d".into()),
+                TokKind::Sym(QuestionDot),
+                TokKind::Ident("e".into()),
+                TokKind::Sym(QuestionQuestionEq),
                 TokKind::Ident("f".into()),
             ]
         );

@@ -203,8 +203,7 @@ impl<'a> Parser<'a> {
                 }
                 b'_' | b'a'..=b'z' | b'A'..=b'Z' => {
                     let start = i;
-                    while i < bytes.len()
-                        && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric())
+                    while i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric())
                     {
                         i += 1;
                     }
@@ -221,7 +220,6 @@ impl<'a> Parser<'a> {
         }
         Ok(out)
     }
-
 
     /// Skip a declaration body: advance to the next `{`, then consume the balanced
     /// `{ … }` group. Used for declarations Hatchet recognises but does not yet
@@ -470,7 +468,11 @@ impl<'a> Parser<'a> {
             alias = Some(self.expect_ident()?);
         }
         self.expect_sym(Sym::Semi)?;
-        Ok(Import { path, wildcard, alias })
+        Ok(Import {
+            path,
+            wildcard,
+            alias,
+        })
     }
 
     fn expect_sym_kw(&mut self, k: Kw) -> PResult<()> {
@@ -522,16 +524,18 @@ impl<'a> Parser<'a> {
                 is_final_class,
                 is_abstract_class,
             )?))),
-            TokKind::Kw(Kw::Interface) => {
-                Ok(Decl::Interface(self.parse_interface(meta, modifiers.is_extern)?))
-            }
+            TokKind::Kw(Kw::Interface) => Ok(Decl::Interface(
+                self.parse_interface(meta, modifiers.is_extern)?,
+            )),
             // `enum abstract X(T) { … }` — Haxe's typed-constant idiom. An integral
             // backing lowers to a plain C++ `enum` (with explicit member values); a
             // `String`/`Float` backing lowers to a namespace of `static const`s.
             TokKind::Kw(Kw::Enum) if matches!(self.peek2(), TokKind::Kw(Kw::Abstract)) => {
                 self.bump(); // enum
                 self.bump(); // abstract
-                Ok(Decl::Enum(self.parse_enum_abstract(meta, modifiers.is_extern)?))
+                Ok(Decl::Enum(
+                    self.parse_enum_abstract(meta, modifiers.is_extern)?,
+                ))
             }
             TokKind::Kw(Kw::Enum) => self.parse_enum(meta, modifiers.is_extern),
             // A bare `abstract X(T) { … }` newtype (the `abstract class` form is
@@ -627,7 +631,7 @@ impl<'a> Parser<'a> {
     fn parse_abstract(&mut self, meta: Vec<Meta>, line: usize) -> PResult<Decl> {
         let name = self.expect_ident()?;
         self.parse_type_params()?; // generic abstracts not supported; discard
-        // The underlying type `(T)`.
+                                   // The underlying type `(T)`.
         self.expect_sym(Sym::LParen)?;
         let underlying = self.parse_type()?;
         self.expect_sym(Sym::RParen)?;
@@ -742,7 +746,11 @@ impl<'a> Parser<'a> {
                 params = self.parse_params()?;
             }
             self.eat_sym(Sym::Semi);
-            variants.push(EnumVariant { name: vname, params, value: None });
+            variants.push(EnumVariant {
+                name: vname,
+                params,
+                value: None,
+            });
         }
         self.expect_sym(Sym::RBrace)?;
         // Generic enums have no C++98 template lowering (and their variants almost
@@ -755,7 +763,13 @@ impl<'a> Parser<'a> {
                 line,
             });
         }
-        Ok(Decl::Enum(Enum { name, is_extern, meta, variants, underlying: None }))
+        Ok(Decl::Enum(Enum {
+            name,
+            is_extern,
+            meta,
+            variants,
+            underlying: None,
+        }))
     }
 
     /// Parse `enum abstract X(T) { var A [= expr]; ... }`. The leading
@@ -783,8 +797,11 @@ impl<'a> Parser<'a> {
             }
             while matches!(
                 self.peek(),
-                TokKind::Kw(Kw::Public) | TokKind::Kw(Kw::Private) | TokKind::Kw(Kw::Inline)
-                    | TokKind::Kw(Kw::Static) | TokKind::Kw(Kw::Final)
+                TokKind::Kw(Kw::Public)
+                    | TokKind::Kw(Kw::Private)
+                    | TokKind::Kw(Kw::Inline)
+                    | TokKind::Kw(Kw::Static)
+                    | TokKind::Kw(Kw::Final)
             ) {
                 self.bump();
             }
@@ -813,10 +830,20 @@ impl<'a> Parser<'a> {
                 None
             };
             self.eat_sym(Sym::Semi);
-            variants.push(EnumVariant { name: vname, params: Vec::new(), value });
+            variants.push(EnumVariant {
+                name: vname,
+                params: Vec::new(),
+                value,
+            });
         }
         self.expect_sym(Sym::RBrace)?;
-        Ok(Enum { name, is_extern, meta, variants, underlying: Some(underlying) })
+        Ok(Enum {
+            name,
+            is_extern,
+            meta,
+            variants,
+            underlying: Some(underlying),
+        })
     }
 
     fn parse_typedef(&mut self, meta: Vec<Meta>) -> PResult<Decl> {
@@ -1098,7 +1125,10 @@ impl<'a> Parser<'a> {
             self.expect_sym(Sym::RParen)?;
             self.expect_sym(Sym::Arrow)?;
             let ret = self.parse_type()?;
-            return Ok(Type::Func { params, ret: Box::new(ret) });
+            return Ok(Type::Func {
+                params,
+                ret: Box::new(ret),
+            });
         }
         let first = self.parse_type_atom()?;
         // function type `A -> B`
@@ -1245,7 +1275,14 @@ impl<'a> Parser<'a> {
             None
         };
         self.eat_sym(Sym::Semi);
-        Ok(Stmt::Var { name, ty, init, is_final, delete, line })
+        Ok(Stmt::Var {
+            name,
+            ty,
+            init,
+            is_final,
+            delete,
+            line,
+        })
     }
 
     fn parse_stmt(&mut self) -> PResult<Stmt> {
@@ -1258,7 +1295,9 @@ impl<'a> Parser<'a> {
             TokKind::Meta(name) if name == "delete" => {
                 self.bump();
                 if !(self.at_kw(Kw::Var) || self.at_kw(Kw::Final)) {
-                    return Err(self.err("@delete must immediately precede a local `var` declaration"));
+                    return Err(
+                        self.err("@delete must immediately precede a local `var` declaration")
+                    );
                 }
                 self.parse_var_stmt(line, true)
             }
@@ -1398,7 +1437,43 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(Stmt::If { cond, then, els, line })
+        Ok(Stmt::If {
+            cond,
+            then,
+            els,
+            line,
+        })
+    }
+
+    /// An `if`/`else` reached in expression position (`var x = if (c) a else b`, a
+    /// `return if (…) …`, or an array-comprehension body). Each branch is a block
+    /// (`{ … }`), a nested `if`, or a plain value expression; codegen desugars the
+    /// whole thing to a hoisted temporary like a value `switch`.
+    fn parse_if_expr(&mut self) -> PResult<Expr> {
+        self.expect_sym_kw(Kw::If)?;
+        self.expect_sym(Sym::LParen)?;
+        let cond = Box::new(self.parse_expr()?);
+        self.expect_sym(Sym::RParen)?;
+        let then = Box::new(self.parse_branch_expr()?);
+        self.eat_sym(Sym::Semi);
+        let els = if self.eat_kw(Kw::Else) {
+            Some(Box::new(self.parse_branch_expr()?))
+        } else {
+            None
+        };
+        Ok(Expr::If { cond, then, els })
+    }
+
+    /// A single branch of a value `if`: a `{ … }` block, a chained `else if`, or a
+    /// plain value expression.
+    fn parse_branch_expr(&mut self) -> PResult<Expr> {
+        if self.at_sym(Sym::LBrace) {
+            Ok(Expr::Block(self.parse_block()?))
+        } else if self.at_kw(Kw::If) {
+            self.parse_if_expr()
+        } else {
+            self.parse_expr()
+        }
     }
 
     /// Parse `try <stmt> (catch (name[:Type]) <block>)*`. The structure is captured
@@ -1422,7 +1497,11 @@ impl<'a> Parser<'a> {
             let body = self.parse_block()?;
             catches.push(Catch { name, ty, body });
         }
-        Ok(Stmt::Try { body, catches, line })
+        Ok(Stmt::Try {
+            body,
+            catches,
+            line,
+        })
     }
 
     fn parse_for(&mut self) -> PResult<Stmt> {
@@ -1440,7 +1519,13 @@ impl<'a> Parser<'a> {
         let iter = self.parse_iterable()?;
         self.expect_sym(Sym::RParen)?;
         let body = Box::new(self.parse_stmt()?);
-        Ok(Stmt::For { var, value_var, iter, body, line })
+        Ok(Stmt::For {
+            var,
+            value_var,
+            iter,
+            body,
+            line,
+        })
     }
 
     fn parse_iterable(&mut self) -> PResult<Iterable> {
@@ -1564,10 +1649,7 @@ impl<'a> Parser<'a> {
                 return Ok(Expr::Assign {
                     op: None,
                     target: Box::new(lhs.clone()),
-                    value: Box::new(Expr::NullCoalesce(
-                        Box::new(lhs),
-                        Box::new(value),
-                    )),
+                    value: Box::new(Expr::NullCoalesce(Box::new(lhs), Box::new(value))),
                 });
             }
             _ => None,
@@ -1619,10 +1701,15 @@ impl<'a> Parser<'a> {
             if matches!(self.peek(), TokKind::Ident(n) if n == "is") {
                 self.bump();
                 let ty = self.parse_type()?;
-                lhs = Expr::Is { expr: Box::new(lhs), ty };
+                lhs = Expr::Is {
+                    expr: Box::new(lhs),
+                    ty,
+                };
                 continue;
             }
-            let Some((op, prec)) = self.peek_binop() else { break };
+            let Some((op, prec)) = self.peek_binop() else {
+                break;
+            };
             if prec < min_prec {
                 break;
             }
@@ -1834,13 +1921,18 @@ impl<'a> Parser<'a> {
                 Ok(Expr::Super)
             }
             TokKind::Kw(Kw::New) => self.parse_new(),
+            TokKind::Kw(Kw::If) => self.parse_if_expr(),
             TokKind::Kw(Kw::Function) => self.parse_anon_function(),
             TokKind::Kw(Kw::Switch) => {
                 // `switch` in value position (`var x = switch (e) { … }`): same shape
                 // as the statement form, carried as an expression for codegen to
                 // desugar into a hoisted temp + statement switch.
                 let (subject, cases, default) = self.parse_switch_parts()?;
-                Ok(Expr::Switch { subject: Box::new(subject), cases, default })
+                Ok(Expr::Switch {
+                    subject: Box::new(subject),
+                    cases,
+                    default,
+                })
             }
             TokKind::Ident(name) => {
                 // single-parameter lambda `x -> expr`
@@ -1994,18 +2086,31 @@ impl<'a> Parser<'a> {
         self.expect_sym_kw(Kw::For)?;
         self.expect_sym(Sym::LParen)?;
         let var = self.expect_ident()?;
-        self.expect_sym_kw(Kw::In)?;
-        let iter = self.parse_iterable()?;
-        self.expect_sym(Sym::RParen)?;
-        let guard = if self.eat_kw(Kw::If) {
-            self.expect_sym(Sym::LParen)?;
-            let g = self.parse_expr()?;
-            self.expect_sym(Sym::RParen)?;
-            Some(Box::new(g))
+        // `[for (key => value in iter) …]` — the optional key-value binding (this
+        // `=>` precedes `in`, distinct from a `=>` map-comprehension body).
+        let value_var = if self.eat_sym(Sym::FatArrow) {
+            Some(self.expect_ident()?)
         } else {
             None
         };
-        let key_or_val = self.parse_expr()?;
+        self.expect_sym_kw(Kw::In)?;
+        let iter = self.parse_iterable()?;
+        self.expect_sym(Sym::RParen)?;
+        // A leading `if (cond) <body>` with no `else` is a *filter* — the element is
+        // produced only when `cond` holds. With an `else`, the `if` is an ordinary
+        // value expression (every iteration yields a value), so it stays the body.
+        let (guard, key_or_val) = if self.at_kw(Kw::If) {
+            match self.parse_if_expr()? {
+                Expr::If {
+                    cond,
+                    then,
+                    els: None,
+                } => (Some(cond), *then),
+                other => (None, other),
+            }
+        } else {
+            (None, self.parse_expr()?)
+        };
         let body = if self.eat_sym(Sym::FatArrow) {
             let v = self.parse_expr()?;
             ComprBody::KeyValue(Box::new(key_or_val), Box::new(v))
@@ -2015,6 +2120,7 @@ impl<'a> Parser<'a> {
         self.expect_sym(Sym::RBracket)?;
         Ok(Expr::Comprehension {
             var,
+            value_var,
             iter: Box::new(iter),
             guard,
             body,
@@ -2107,7 +2213,11 @@ fn set_access(current: Access, new: Access) -> Access {
 /// `A | B | C` yields all three). Anything else passes through as-is.
 fn flatten_or_pattern(e: Expr) -> Vec<Expr> {
     match e {
-        Expr::Binary { op: BinOp::BitOr, lhs, rhs } => {
+        Expr::Binary {
+            op: BinOp::BitOr,
+            lhs,
+            rhs,
+        } => {
             let mut out = flatten_or_pattern(*lhs);
             out.extend(flatten_or_pattern(*rhs));
             out
@@ -2131,7 +2241,8 @@ mod tests {
 
     #[test]
     fn parses_package_and_imports() {
-        let f = file("package modules;\nimport native.api.Native;\nimport modules.Module;\nclass X {}");
+        let f =
+            file("package modules;\nimport native.api.Native;\nimport modules.Module;\nclass X {}");
         assert_eq!(f.package, vec!["modules"]);
         assert_eq!(f.imports.len(), 2);
         assert_eq!(f.imports[0].path, vec!["native", "api", "Native"]);
@@ -2209,7 +2320,12 @@ mod tests {
             .collect();
         assert_eq!(
             verbatims,
-            vec!["#ifdef DREAMCAST", "#include <dc/fmath.h>", "#else", "#endif"]
+            vec![
+                "#ifdef DREAMCAST",
+                "#include <dc/fmath.h>",
+                "#else",
+                "#endif"
+            ]
         );
         // The DREAMCAST `return` carries the verbatim `untyped` operand.
         match &body[2] {
@@ -2242,14 +2358,27 @@ mod tests {
     #[test]
     fn conditional_compilation_flags_and_boolean_conditions() {
         // Boolean conditions over flags map each flag through `defined(…)`.
-        assert!(parse("package p;\nclass X {\n function f():Void {\n#if !DEBUG\n#end\n }\n}").is_ok());
-        assert!(parse("package p;\nclass X {\n function f():Void {\n#if (A && B)\n#end\n }\n}").is_ok());
+        assert!(
+            parse("package p;\nclass X {\n function f():Void {\n#if !DEBUG\n#end\n }\n}").is_ok()
+        );
+        assert!(
+            parse("package p;\nclass X {\n function f():Void {\n#if (A && B)\n#end\n }\n}").is_ok()
+        );
         // A bare `#elseif FLAG` is supported (→ `#elif defined(FLAG)`)...
-        assert!(parse("package p;\nclass X {\n function f():Void {\n#if A\n#elseif B\n#end\n }\n}").is_ok());
+        assert!(parse(
+            "package p;\nclass X {\n function f():Void {\n#if A\n#elseif B\n#end\n }\n}"
+        )
+        .is_ok());
         // ...as is a boolean `#elseif` condition (→ `#elif defined(B) && …`).
-        assert!(parse("package p;\nclass X {\n function f():Void {\n#if A\n#elseif (B && C)\n#end\n }\n}").is_ok());
+        assert!(parse(
+            "package p;\nclass X {\n function f():Void {\n#if A\n#elseif (B && C)\n#end\n }\n}"
+        )
+        .is_ok());
         // Version comparisons / values have no `defined(…)` mapping — rejected.
-        assert!(parse("package p;\nclass X {\n function f():Void {\n#if (haxe_ver >= 4)\n#end\n }\n}").is_err());
+        assert!(parse(
+            "package p;\nclass X {\n function f():Void {\n#if (haxe_ver >= 4)\n#end\n }\n}"
+        )
+        .is_err());
     }
 
     #[test]
@@ -2304,7 +2433,9 @@ mod tests {
                public function set_x(x:Float) { return this.x = x; }\n\
              }",
         );
-        let Decl::Class(c) = &f.decls[0] else { panic!() };
+        let Decl::Class(c) = &f.decls[0] else {
+            panic!()
+        };
         assert_eq!(c.name, "Vertex");
         assert_eq!(c.extends.as_ref().unwrap().base_name(), Some("Module"));
         assert_eq!(c.fields[0].name, "x");
@@ -2322,18 +2453,33 @@ mod tests {
              @:native typedef Vertex = { x:Float, ?color:UInt32 };\n\
              @:native typedef Cursor = TexturedQuad;",
         );
-        let Decl::Enum(e) = &f.decls[0] else { panic!("{:?}", f.decls[0]) };
+        let Decl::Enum(e) = &f.decls[0] else {
+            panic!("{:?}", f.decls[0])
+        };
         assert_eq!(e.name, "EffectType");
         assert_eq!(e.variants.len(), 2);
         assert!(has_meta(&e.meta, "native"));
-        assert_eq!(e.meta.iter().find(|m| m.name == "include").unwrap().first_arg(), Some("../../src/Native.h"));
+        assert_eq!(
+            e.meta
+                .iter()
+                .find(|m| m.name == "include")
+                .unwrap()
+                .first_arg(),
+            Some("../../src/Native.h")
+        );
 
-        let Decl::Typedef(t) = &f.decls[1] else { panic!() };
-        let TypedefTarget::Struct(fields) = &t.target else { panic!() };
+        let Decl::Typedef(t) = &f.decls[1] else {
+            panic!()
+        };
+        let TypedefTarget::Struct(fields) = &t.target else {
+            panic!()
+        };
         assert_eq!(fields[1].name, "color");
         assert!(fields[1].optional);
 
-        let Decl::Typedef(t2) = &f.decls[2] else { panic!() };
+        let Decl::Typedef(t2) = &f.decls[2] else {
+            panic!()
+        };
         assert!(matches!(t2.target, TypedefTarget::Alias(_)));
     }
 
@@ -2346,7 +2492,9 @@ mod tests {
                public function SetScene(s:Dynamic):Void;\n\
              }",
         );
-        let Decl::Interface(i) = &f.decls[0] else { panic!() };
+        let Decl::Interface(i) = &f.decls[0] else {
+            panic!()
+        };
         assert_eq!(i.methods.len(), 1);
         assert!(has_meta(&i.methods[0].meta, "overload"));
     }
@@ -2367,14 +2515,26 @@ mod tests {
                }\n\
              }",
         );
-        let Decl::Class(c) = &f.decls[0] else { panic!() };
+        let Decl::Class(c) = &f.decls[0] else {
+            panic!()
+        };
         let body = c.methods[0].body.as_ref().unwrap();
         assert!(matches!(body[0], Stmt::Switch { .. }));
-        if let Stmt::Var { init: Some(Expr::NullCoalesce(..)), .. } = &body[1] {
+        if let Stmt::Var {
+            init: Some(Expr::NullCoalesce(..)),
+            ..
+        } = &body[1]
+        {
         } else {
             panic!("expected null-coalesce var, got {:?}", body[1]);
         }
-        assert!(matches!(body[2], Stmt::Var { init: Some(Expr::Comprehension { .. }), .. }));
+        assert!(matches!(
+            body[2],
+            Stmt::Var {
+                init: Some(Expr::Comprehension { .. }),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2387,9 +2547,23 @@ mod tests {
                }\n\
              }",
         );
-        let Decl::Class(c) = &f.decls[0] else { panic!() };
+        let Decl::Class(c) = &f.decls[0] else {
+            panic!()
+        };
         let body = c.methods[0].body.as_ref().unwrap();
-        assert!(matches!(&body[0], Stmt::Var { init: Some(Expr::ObjectLit(_)), .. }));
-        assert!(matches!(&body[1], Stmt::Var { init: Some(Expr::MapLit(_)), .. }));
+        assert!(matches!(
+            &body[0],
+            Stmt::Var {
+                init: Some(Expr::ObjectLit(_)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &body[1],
+            Stmt::Var {
+                init: Some(Expr::MapLit(_)),
+                ..
+            }
+        ));
     }
 }
