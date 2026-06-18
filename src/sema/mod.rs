@@ -379,6 +379,21 @@ impl Program {
         Some(found)
     }
 
+    /// Resolve a type from a bare **C++ leaf name** — the spelling that appears in
+    /// generated container bases. Container element/value `TypeInfo` is recovered
+    /// from the C++ base (`std::vector<jvalue*>` → `jvalue`), but `resolve_type`
+    /// keys on the *Haxe* name, so a `@:native`-renamed type (`@:native("jvalue")
+    /// class JValue`) is missed by its native spelling. Tries the Haxe name first
+    /// (the common case), then falls back to matching a type's `cpp_name()`, so
+    /// member access on a renamed container element still resolves (`vals[i].s`).
+    pub fn resolve_type_by_cpp(&self, bare: &str, ctx_module: usize) -> Option<&TypeInfo> {
+        let owned = [bare.to_string()];
+        if let Some(t) = self.resolve_type(&owned, ctx_module) {
+            return Some(t);
+        }
+        self.types.iter().find(|t| t.proxy_native.is_none() && t.cpp_name() == bare)
+    }
+
     /// The `extern` type a `@proxy("native::Name")` stands for: the (non-proxy)
     /// type whose fully-qualified `@:native` name equals `native`. This is both the
     /// redirect target for a consume proxy and the spelling source for a produce

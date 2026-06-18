@@ -505,6 +505,98 @@ class Summer {
 }
 
 #[test]
+fn signed_unsigned_comparisons_cast_to_size_t() {
+    // `for (i in 0...arr.length)` compares an `int` counter against `.size()`
+    // (size_t); MSVC warns (C4018) on the mixed signed/unsigned comparison. C++
+    // already converts the signed side to size_t, so the lowering makes that cast
+    // explicit — in the loop header and in any body comparison against `.length` —
+    // while leaving signed/signed comparisons (`i < n`) untouched.
+    let src = "\
+class Keys {
+  public var objectKeys:Array<String>;
+  public function new() { objectKeys = []; }
+  public function scan():Void {
+    for (i in 0...this.objectKeys.length) {
+      if (i < this.objectKeys.length) {
+        trace(this.objectKeys[i]);
+      }
+      var n:Int = 5;
+      if (i < n) trace(\"low\");
+    }
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_c4018_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Keys.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Keys"))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The loop header casts the counter against `.size()`.
+    assert!(
+        out.contains("(size_t)") && out.contains("< this->objectKeys.size(); ++"),
+        "loop header compares the counter as size_t:\n{out}"
+    );
+    // A body comparison against `.length` is also cast.
+    assert!(
+        out.contains(") < this->objectKeys.size()"),
+        "body comparison against .length is cast to size_t:\n{out}"
+    );
+    // A signed/signed comparison (`i < n`) keeps its plain operands — no spurious cast.
+    assert!(out.contains(" < n)"), "the `i < n` comparison is not cast:\n{out}");
+}
+
+#[test]
+fn if_expression_comprehension_body_lowers_to_a_hoisted_temp() {
+    // An array comprehension whose body is an `if`/`else if`/`else` — each branch a
+    // block ending in a value. The `if` is a *value* expression (it has an `else`),
+    // so it desugars like a value `switch`: a hoisted temp the branches assign, then
+    // the temp is pushed. The element type is the branch value's type (`int`), not
+    // the surrounding array type.
+    let out = gen_one(
+        "class M {\n  public function new() {}\n  public function f(nums:Array<Int>):Array<Int> {\n    return [\n      for (n in nums)\n        if (n < 0) { -1; }\n        else if (n == 0) { var z = 0; z; }\n        else { var p = n * 2; p; }\n    ];\n  }\n}\n",
+        "M",
+    );
+    // Container is a vector of the branch value type, not the array type.
+    assert!(out.contains("std::vector<int >"), "element type is the branch value type:\n{out}");
+    assert!(!out.contains("std::vector<std::vector"), "the array type must not become the element type:\n{out}");
+    // The if-expression is hoisted to a temp the branches assign, then pushed.
+    assert!(out.contains("int _ifx"), "value `if` hoists a temp:\n{out}");
+    assert!(out.contains(".push_back(_ifx"), "the temp is the produced element:\n{out}");
+}
+
+#[test]
+fn comprehension_if_without_else_stays_a_filter() {
+    // A leading `if` with no `else` is a filter: the element is produced only when
+    // the condition holds (it is *not* a value `if`).
+    let out = gen_one(
+        "class M {\n  public function new() {}\n  public function f(nums:Array<Int>):Array<Int> {\n    return [for (n in nums) if (n > 0) n];\n  }\n}\n",
+        "M",
+    );
+    assert!(out.contains("if (n > 0) {"), "the filter guards the push:\n{out}");
+    assert!(out.contains(".push_back(n)"), "only the kept element is pushed:\n{out}");
+    assert!(!out.contains("_ifx"), "a no-else filter is not a value if-expression:\n{out}");
+}
+
+#[test]
+fn value_if_expression_in_assignment_position() {
+    // `var s = if (c) a else b` is a value `if`, desugared to a hoisted temp.
+    let out = gen_one(
+        "class M {\n  public function new() {}\n  public function f(flag:Bool):String {\n    var s = if (flag) \"yes\" else \"no\";\n    return s;\n  }\n}\n",
+        "M",
+    );
+    assert!(out.contains("std::string _ifx"), "the value `if` hoists a typed temp:\n{out}");
+    assert!(out.contains("if (flag) {") && out.contains("} else {"), "desugars to a statement if:\n{out}");
+    assert!(out.contains("std::string s = _ifx"), "the assignment reads the temp:\n{out}");
+}
+
+#[test]
 fn trace_lowers_to_printf_with_file_and_line_and_no_trace_strips_it() {
     // `trace(...)` prints `file:line: ` followed by the comma-separated args via a
     // single printf (reusing the interpolation type→spec mapping). `--no-trace`
@@ -1464,7 +1556,7 @@ class M {
     let out = generate_source(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("std::map<std::string, int>::iterator"), "map iterator type:\n{out}");
+    assert!(out.contains("std::map<std::string, int>::const_iterator"), "map iterator type:\n{out}");
     assert!(out.contains(".begin();") && out.contains(".end();"), "iterator bounds:\n{out}");
     // `for (v in m)` binds the value only.
     assert!(out.contains("int v = ") && out.contains("->second;"), "value binding:\n{out}");
@@ -1473,6 +1565,61 @@ class M {
     assert!(out.contains("int val = ") && out.contains("->second;"), "key/value value binding:\n{out}");
     // The map must NOT be iterated with the index path.
     assert!(!out.contains("m.size()") && !out.contains("m[_i"), "map must not use index iteration:\n{out}");
+}
+
+#[test]
+fn array_key_value_iteration_binds_the_index() {
+    // `for (index => value in array)` is valid Haxe — the key is the Int index.
+    // Exercised in both statement and comprehension position.
+    let src = "\
+class A {
+  public function new() {}
+  public function run(xs:Array<String>):Void {
+    for (i => s in xs) { trace(i); }
+  }
+  public function idx(xs:Array<String>):Array<Int> {
+    return [for (i => s in xs) i];
+  }
+}
+";
+    let out = gen_one(src, "A");
+    // Statement form: an index loop binding the Int key and the element value.
+    assert!(out.contains("int i = (int)"), "Array key bound as Int index:\n{out}");
+    assert!(out.contains("std::string s = "), "Array element value bound:\n{out}");
+    // Comprehension form: same bindings, pushing the key.
+    assert!(out.contains(".push_back(i)"), "comprehension yields the index key:\n{out}");
+    // It must use index iteration, never the map iterator path.
+    assert!(!out.contains("::const_iterator"), "Array iteration is not a map iterator:\n{out}");
+}
+
+#[test]
+fn member_access_on_a_native_renamed_container_element_resolves() {
+    // A container element whose type is `@:native`-renamed is spelled by its C++
+    // name in the vector base (`std::vector<val*>`). Recovering the element's
+    // `TypeInfo` to resolve `vals[i].s` must match that native name, not only the
+    // Haxe name — otherwise `.s` is untyped and the map value degrades to `void*`.
+    let src = "\
+@:native(\"val\")
+class Val {
+  public var s:String;
+  public var keys:Array<String>;
+  public var vals:Array<Val>;
+  public function new() { this.s = \"\"; this.keys = []; this.vals = []; }
+}
+abstract Holder(Val) {
+  public function new() { this = new Val(); }
+  public function toMap():Map<String,String> {
+    return [for (i => k in this.keys) k => this.vals[i].s];
+  }
+}
+";
+    let out = gen_one(src, "Holder");
+    // The field `s` resolves to `std::string`, so the map value type is concrete.
+    assert!(
+        out.contains("std::map<std::string, std::string >"),
+        "native-renamed element field resolves (no void* fallback):\n{out}"
+    );
+    assert!(!out.contains("void*"), "no void* value type:\n{out}");
 }
 
 #[test]
@@ -2667,4 +2814,27 @@ function helper(n:Int):Int { return n + 1; }
     assert!(head.contains("int helper(int n)"), "a plain function stays a free function:\n{head}");
     // The export lives at global scope, the free function inside the namespace.
     assert!(!head.contains("HATCHET_EXPORT int HATCHET_CALL helper"), "plain fn is not exported:\n{head}");
+}
+
+#[test]
+fn empty_array_return_is_a_default_constructed_vector() {
+    // `return []` for a by-value `Array<T>` (`std::vector<...>`) must
+    // default-construct the container — you cannot `return NULL` from a function
+    // returning a vector by value. A `Null<Array<T>>` (pointer) still returns NULL.
+    let src = "\
+class Thing { public function new() {} }
+class Probe {
+  public function new() {}
+  public function ints():Array<Int> { return []; }
+  public function things():Array<Thing> { return []; }
+  public function maybe():Null<Array<Int>> { return []; }
+}
+";
+    let out = gen_one(src, "Probe");
+    assert!(out.contains("return std::vector<int>();"), "empty Array<Int> → default vector:\n{out}");
+    assert!(
+        out.contains("return std::vector<Thing*>();"),
+        "empty Array<Thing> → default vector:\n{out}"
+    );
+    assert!(out.contains("return NULL;"), "empty Null<Array<Int>> (pointer) still returns NULL:\n{out}");
 }

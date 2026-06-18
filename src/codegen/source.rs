@@ -264,6 +264,11 @@ struct Ty {
     /// `true` when this type came from a `Null<T>` (a nullable value type lowered
     /// to a pointer); drives the nullable-handling lint warnings.
     nullable: bool,
+    /// `true` when the C++ value is an unsigned size (`.length` → `.size()` /
+    /// `.length()`, all `size_t`). A signed/unsigned comparison against such a
+    /// value warns under MSVC (C4018); the comparison lowering makes the implicit
+    /// `int → size_t` conversion explicit with a `(size_t)` cast to silence it.
+    unsigned: bool,
     /// When set, this local aliases a `Map.get(k)` result, which is `Null<V>`.
     /// A value type `V` has no C++ null, so the local is bound to a map *iterator*:
     /// a null check lowers to the existence check (`it == map.end()`) and any
@@ -735,6 +740,40 @@ fn assign_last_to(body: &[Stmt], tmp: &str) -> Vec<Stmt> {
     out
 }
 
+/// The trailing value expression of a value-`if` branch: the last expression of a
+/// `{ … }` block, the first branch's value of a nested `if`, or a bare value
+/// expression. `None` for a branch that ends in control flow or is empty.
+fn branch_value_expr(e: &Expr) -> Option<&Expr> {
+    match e {
+        Expr::Block(stmts) => case_value_expr(stmts),
+        Expr::If { then, .. } => branch_value_expr(then),
+        other => Some(other),
+    }
+}
+
+/// Rewrite a value-`if` branch into a statement whose trailing value assigns to
+/// `tmp`. A block keeps its statements (the last assigning to `tmp`); a nested
+/// `if` recurses into its own branches; a bare value becomes `tmp = value`.
+fn branch_assign_to(e: &Expr, tmp: &str) -> Stmt {
+    match e {
+        Expr::Block(stmts) => Stmt::Block(assign_last_to(stmts, tmp)),
+        Expr::If { cond, then, els } => Stmt::If {
+            cond: (**cond).clone(),
+            then: Box::new(branch_assign_to(then, tmp)),
+            els: els.as_ref().map(|e| Box::new(branch_assign_to(e, tmp))),
+            line: 0,
+        },
+        other => Stmt::Expr(
+            Expr::Assign {
+                op: None,
+                target: Box::new(Expr::Ident(tmp.to_string())),
+                value: Box::new(other.clone()),
+            },
+            0,
+        ),
+    }
+}
+
 fn is_value_new(ty: &Type) -> bool {
     matches!(
         ty,
@@ -845,6 +884,14 @@ fn float_ty() -> Ty {
 
 fn int_ty() -> Ty {
     Ty { base: "int".into(), ..Default::default() }
+}
+
+/// A Haxe `Int`-typed value backed by an unsigned C++ `size_t` (`.length` →
+/// `.size()`/`.length()`). Modelled as `int` for member lookup and arithmetic, but
+/// flagged `unsigned` so a comparison against a signed `int` gets the explicit
+/// `(size_t)` cast that silences MSVC's C4018.
+fn size_ty() -> Ty {
+    Ty { base: "int".into(), unsigned: true, ..Default::default() }
 }
 
 fn bool_ty() -> Ty {
@@ -985,6 +1032,25 @@ fn binop_result_ty(op: BinOp, lhs: Ty) -> Ty {
         Eq | Ne | Lt | Gt | Le | Ge | And | Or => Ty { base: "bool".into(), ..Default::default() },
         UShr => int_ty(),
         _ => lhs,
+    }
+}
+
+/// Whether an operand is a plain signed C++ `int` — the side of a mixed
+/// signed/unsigned comparison that MSVC implicitly converts to `size_t` (C4018).
+fn is_signed_int(ty: &Ty) -> bool {
+    !ty.is_ptr && !ty.unsigned && ty.base == "int"
+}
+
+/// Make a mixed signed/unsigned comparison explicit. C++ already converts the
+/// signed operand to the unsigned type before comparing, so wrapping that operand
+/// in `(size_t)` is behaviour-preserving — it just silences MSVC's C4018. Casts
+/// whichever side is a signed `int` when the other is an unsigned size
+/// (`.length`/`.size()`); a no-op when neither or both sides are unsigned.
+fn cast_signed_for_unsigned_cmp(l: &mut String, lty: &Ty, r: &mut String, rty: &Ty) {
+    if lty.unsigned && is_signed_int(rty) {
+        *r = format!("(size_t)({r})");
+    } else if rty.unsigned && is_signed_int(lty) {
+        *l = format!("(size_t)({l})");
     }
 }
 

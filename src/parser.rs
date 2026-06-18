@@ -1401,6 +1401,37 @@ impl<'a> Parser<'a> {
         Ok(Stmt::If { cond, then, els, line })
     }
 
+    /// An `if`/`else` reached in expression position (`var x = if (c) a else b`, a
+    /// `return if (…) …`, or an array-comprehension body). Each branch is a block
+    /// (`{ … }`), a nested `if`, or a plain value expression; codegen desugars the
+    /// whole thing to a hoisted temporary like a value `switch`.
+    fn parse_if_expr(&mut self) -> PResult<Expr> {
+        self.expect_sym_kw(Kw::If)?;
+        self.expect_sym(Sym::LParen)?;
+        let cond = Box::new(self.parse_expr()?);
+        self.expect_sym(Sym::RParen)?;
+        let then = Box::new(self.parse_branch_expr()?);
+        self.eat_sym(Sym::Semi);
+        let els = if self.eat_kw(Kw::Else) {
+            Some(Box::new(self.parse_branch_expr()?))
+        } else {
+            None
+        };
+        Ok(Expr::If { cond, then, els })
+    }
+
+    /// A single branch of a value `if`: a `{ … }` block, a chained `else if`, or a
+    /// plain value expression.
+    fn parse_branch_expr(&mut self) -> PResult<Expr> {
+        if self.at_sym(Sym::LBrace) {
+            Ok(Expr::Block(self.parse_block()?))
+        } else if self.at_kw(Kw::If) {
+            self.parse_if_expr()
+        } else {
+            self.parse_expr()
+        }
+    }
+
     /// Parse `try <stmt> (catch (name[:Type]) <block>)*`. The structure is captured
     /// so the validation pass can flag it as unsupported with a location (Hatchet
     /// does not transpile exception handling yet).
@@ -1834,6 +1865,7 @@ impl<'a> Parser<'a> {
                 Ok(Expr::Super)
             }
             TokKind::Kw(Kw::New) => self.parse_new(),
+            TokKind::Kw(Kw::If) => self.parse_if_expr(),
             TokKind::Kw(Kw::Function) => self.parse_anon_function(),
             TokKind::Kw(Kw::Switch) => {
                 // `switch` in value position (`var x = switch (e) { … }`): same shape
@@ -1994,18 +2026,27 @@ impl<'a> Parser<'a> {
         self.expect_sym_kw(Kw::For)?;
         self.expect_sym(Sym::LParen)?;
         let var = self.expect_ident()?;
-        self.expect_sym_kw(Kw::In)?;
-        let iter = self.parse_iterable()?;
-        self.expect_sym(Sym::RParen)?;
-        let guard = if self.eat_kw(Kw::If) {
-            self.expect_sym(Sym::LParen)?;
-            let g = self.parse_expr()?;
-            self.expect_sym(Sym::RParen)?;
-            Some(Box::new(g))
+        // `[for (key => value in iter) …]` — the optional key-value binding (this
+        // `=>` precedes `in`, distinct from a `=>` map-comprehension body).
+        let value_var = if self.eat_sym(Sym::FatArrow) {
+            Some(self.expect_ident()?)
         } else {
             None
         };
-        let key_or_val = self.parse_expr()?;
+        self.expect_sym_kw(Kw::In)?;
+        let iter = self.parse_iterable()?;
+        self.expect_sym(Sym::RParen)?;
+        // A leading `if (cond) <body>` with no `else` is a *filter* — the element is
+        // produced only when `cond` holds. With an `else`, the `if` is an ordinary
+        // value expression (every iteration yields a value), so it stays the body.
+        let (guard, key_or_val) = if self.at_kw(Kw::If) {
+            match self.parse_if_expr()? {
+                Expr::If { cond, then, els: None } => (Some(cond), *then),
+                other => (None, other),
+            }
+        } else {
+            (None, self.parse_expr()?)
+        };
         let body = if self.eat_sym(Sym::FatArrow) {
             let v = self.parse_expr()?;
             ComprBody::KeyValue(Box::new(key_or_val), Box::new(v))
@@ -2015,6 +2056,7 @@ impl<'a> Parser<'a> {
         self.expect_sym(Sym::RBracket)?;
         Ok(Expr::Comprehension {
             var,
+            value_var,
             iter: Box::new(iter),
             guard,
             body,

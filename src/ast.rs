@@ -128,9 +128,13 @@ pub enum Expr {
     MapLit(Vec<(Expr, Expr)>),
     ObjectLit(Vec<(String, Expr)>),
 
-    /// `[for (v in iter) body]` (array) or with `=>` body (map).
+    /// `[for (v in iter) body]` (array) or with `=>` body (map). `value_var` is
+    /// the optional second binding of key-value iteration (`for (k => v in iter)`):
+    /// then `var` is the key (an `Int` index over an Array, the key type over a
+    /// Map) and `value_var` is the element/value.
     Comprehension {
         var: String,
+        value_var: Option<String>,
         iter: Box<Iterable>,
         guard: Option<Box<Expr>>,
         body: ComprBody,
@@ -156,6 +160,18 @@ pub enum Expr {
     /// same shape as the statement form; codegen desugars it to a hoisted temporary
     /// plus a statement `switch` whose arms assign their trailing value to the temp.
     Switch { subject: Box<Expr>, cases: Vec<Case>, default: Option<Vec<Stmt>> },
+
+    /// An `if`/`else` used in value position (`var x = if (c) a else b`, or an
+    /// `if`-expression as an array-comprehension body). Each branch is a block or a
+    /// nested value `if`; codegen desugars it like a value `switch` — a hoisted
+    /// temporary plus a statement `if` whose branches assign their trailing value.
+    If { cond: Box<Expr>, then: Box<Expr>, els: Option<Box<Expr>> },
+
+    /// A brace-delimited block used in value position. Its value is the trailing
+    /// expression statement (`{ … ; v }` → `v`). Codegen hoists the statements and
+    /// assigns the trailing value to a temporary.
+    Block(Vec<Stmt>),
+
     /// Parenthesised expression (grouping preserved for fidelity).
     Paren(Box<Expr>),
 

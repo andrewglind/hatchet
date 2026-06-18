@@ -79,9 +79,10 @@ impl<'a> BodyGen<'a> {
     pub(super) fn elem_member_ty(&self, vec: &Ty) -> Ty {
         let e = self.element_ty(vec);
         if e.info.is_none() && !e.base.is_empty() {
-            // Recover info from the element's bare name for struct expansion.
-            let bare = e.base.rsplit("::").next().unwrap_or(&e.base).to_string();
-            if let Some(info) = self.prog.resolve_type(&[bare], self.mi).cloned() {
+            // Recover info from the element's bare name for struct expansion
+            // (via the C++ leaf name, so a `@:native`-renamed type resolves too).
+            let bare = e.base.rsplit("::").next().unwrap_or(&e.base);
+            if let Some(info) = self.prog.resolve_type_by_cpp(bare, self.mi).cloned() {
                 return Ty { info: Some(info), ..e };
             }
         }

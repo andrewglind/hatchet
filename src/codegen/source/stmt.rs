@@ -197,7 +197,7 @@ impl<'a> BodyGen<'a> {
                     self.finish_return(out, ind, r);
                 } else if let Expr::ArrayLit(elems) = e {
                     if elems.is_empty() {
-                        let r = self.return_null_value();
+                        let r = self.return_empty_container();
                         self.finish_return(out, ind, r);
                     } else {
                         let val_ty = self.return_value_ty();
@@ -207,6 +207,12 @@ impl<'a> BodyGen<'a> {
                         let r = self.wrap_ret(tmp);
                         self.finish_return(out, ind, r);
                     }
+                } else if matches!(e, Expr::MapLit(pairs) if pairs.is_empty()) {
+                    // An empty map literal `return {}`/`return [...]` for a
+                    // by-value `std::map<...>` return must default-construct the
+                    // container, not `return NULL` (which won't compile).
+                    let r = self.return_empty_container();
+                    self.finish_return(out, ind, r);
                 } else {
                     // The return type is the contextual (expected) type of the
                     // returned expression — so a value-position `switch`/etc. in
@@ -415,11 +421,14 @@ impl<'a> BodyGen<'a> {
         match iter {
             Iterable::Range(start, end) => {
                 let (s, _) = self.gen_expr(start);
-                let (e, _) = self.gen_expr(end);
+                let (e, ety) = self.gen_expr(end);
                 self.flush(out);
                 self.define_local(var, Ty { base: "int".into(), ..Default::default() });
                 let lv = self.loop_var(var);
-                let _ = writeln!(out, "{t}for (int {lv} = {s}; {lv} < {e}; ++{lv}) {{");
+                // `0...arr.length` compares an `int` counter against `size()` (size_t);
+                // cast the counter to silence MSVC's C4018, as the body comparisons do.
+                let lcmp = if ety.unsigned { format!("(size_t){lv}") } else { lv.clone() };
+                let _ = writeln!(out, "{t}for (int {lv} = {s}; {lcmp} < {e}; ++{lv}) {{");
                 self.gen_block_inner(body, ind + 1, out);
                 self.emit_owned_deletes(out, ind + 1);
                 let _ = writeln!(out, "{t}}}");
@@ -438,9 +447,13 @@ impl<'a> BodyGen<'a> {
                     let vty = self.map_value_ty(&cty);
                     let kspell = self.decl_spelling(&kty);
                     let vspell = self.decl_spelling(&vty);
+                    // `const_iterator`: a Map parameter is passed by `const&`, so
+                    // `begin()` yields a `const_iterator`; the bindings only read
+                    // (copy) the key/value, so this is always sufficient (and
+                    // converts cleanly from a non-const local map too).
                     let _ = writeln!(
                         out,
-                        "{t}for ({}::iterator {it} = {access}.begin(); {it} != {access}.end(); ++{it}) {{",
+                        "{t}for ({}::const_iterator {it} = {access}.begin(); {it} != {access}.end(); ++{it}) {{",
                         cty.base
                     );
                     if let Some(vv) = value_var {
@@ -457,18 +470,23 @@ impl<'a> BodyGen<'a> {
                     let _ = writeln!(out, "{t}}}");
                 } else if is_container_ty(&cty) {
                     // for (item in array) → index loop with element binding.
-                    if value_var.is_some() {
-                        self.err("`for (key => value in ...)` is only valid over a Map".into());
-                    }
+                    // for (index => item in array) → the key is the Int index.
                     let idx = self.fresh("i");
                     let elem_ty = self.element_ty(&cty);
                     let elem_spell = self.decl_spelling(&elem_ty);
-                    self.define_local(var, elem_ty);
                     let _ = writeln!(
                         out,
                         "{t}for (size_t {idx} = 0; {idx} < {access}.size(); ++{idx}) {{"
                     );
-                    let _ = writeln!(out, "{t}\t{elem_spell} {var} = {access}[{idx}];");
+                    if let Some(vv) = value_var {
+                        self.define_local(var, int_ty());
+                        self.define_local(vv, elem_ty);
+                        let _ = writeln!(out, "{t}\tint {var} = (int){idx};");
+                        let _ = writeln!(out, "{t}\t{elem_spell} {vv} = {access}[{idx}];");
+                    } else {
+                        self.define_local(var, elem_ty);
+                        let _ = writeln!(out, "{t}\t{elem_spell} {var} = {access}[{idx}];");
+                    }
                     self.gen_block_inner(body, ind + 1, out);
                     self.emit_owned_deletes(out, ind + 1);
                     let _ = writeln!(out, "{t}}}");
@@ -491,6 +509,7 @@ impl<'a> BodyGen<'a> {
     pub(super) fn gen_comprehension(
         &mut self,
         var: &str,
+        value_var: Option<&str>,
         iter: &Iterable,
         guard: Option<&Expr>,
         body: &ComprBody,
@@ -505,11 +524,12 @@ impl<'a> BodyGen<'a> {
         let (header, close): (String, String) = match iter {
             Iterable::Range(start, end) => {
                 let (s, _) = self.gen_expr(start);
-                let (e, _) = self.gen_expr(end);
+                let (e, ety) = self.gen_expr(end);
                 self.define_local(var, int_ty());
                 let lv = self.loop_var(var);
+                let lcmp = if ety.unsigned { format!("(size_t){lv}") } else { lv.clone() };
                 (
-                    format!("{t}for (int {lv} = {s}; {lv} < {e}; ++{lv}) {{\n"),
+                    format!("{t}for (int {lv} = {s}; {lcmp} < {e}; ++{lv}) {{\n"),
                     format!("{t}}}\n"),
                 )
             }
@@ -517,24 +537,60 @@ impl<'a> BodyGen<'a> {
                 let (c, cty) = self.gen_expr(coll);
                 // A nullable container is a pointer — dereference it to iterate.
                 let access = if cty.is_ptr { format!("(*{c})") } else { c };
-                let idx = self.fresh("i");
-                let elem = self.element_ty(&cty);
-                let espell = self.decl_spelling(&elem);
-                self.define_local(var, elem);
-                (
-                    format!(
-                        "{t}for (size_t {idx} = 0; {idx} < {access}.size(); ++{idx}) {{\n{t}\t{espell} {var} = {access}[{idx}];\n"
-                    ),
-                    format!("{t}}}\n"),
-                )
+                if rcode_is_map(&cty) {
+                    // Map iteration via a std::map iterator. `for (k => v in m)`
+                    // binds both; `for (v in m)` binds the value (Haxe iterates a
+                    // map's values, not its keys).
+                    let it = self.fresh("it");
+                    let (kty, vty) = self.map_kv_ty(&cty);
+                    let kspell = self.decl_spelling(&kty);
+                    let vspell = self.decl_spelling(&vty);
+                    let mut hdr = format!(
+                        "{t}for ({}::const_iterator {it} = {access}.begin(); {it} != {access}.end(); ++{it}) {{\n",
+                        cty.base
+                    );
+                    if let Some(vv) = value_var {
+                        self.define_local(var, kty);
+                        self.define_local(vv, vty);
+                        let _ = write!(hdr, "{t}\t{kspell} {var} = {it}->first;\n{t}\t{vspell} {vv} = {it}->second;\n");
+                    } else {
+                        self.define_local(var, vty);
+                        let _ = write!(hdr, "{t}\t{vspell} {var} = {it}->second;\n");
+                    }
+                    (hdr, format!("{t}}}\n"))
+                } else {
+                    let idx = self.fresh("i");
+                    let elem = self.element_ty(&cty);
+                    let espell = self.decl_spelling(&elem);
+                    let mut hdr =
+                        format!("{t}for (size_t {idx} = 0; {idx} < {access}.size(); ++{idx}) {{\n");
+                    if let Some(vv) = value_var {
+                        // `for (index => value in array)`: the key is the Int index.
+                        self.define_local(var, int_ty());
+                        self.define_local(vv, elem);
+                        let _ = write!(hdr, "{t}\tint {var} = (int){idx};\n{t}\t{espell} {vv} = {access}[{idx}];\n");
+                    } else {
+                        self.define_local(var, elem);
+                        let _ = write!(hdr, "{t}\t{espell} {var} = {access}[{idx}];\n");
+                    }
+                    (hdr, format!("{t}}}\n"))
+                }
             }
         };
+
+        // The contextual sink (`return`/`var x:Array<T> = …`) is the *whole*
+        // container; each produced element's expected type is the element type, so
+        // narrow it for the body (an `if`/`switch`-expression body unifies its
+        // branches to this, rather than mistaking the array type for the element's).
+        let elem_hint = self.expected.take().map(|v| self.elem_member_ty(&v));
 
         // Generate the body (capturing any hoisted prelude so it lands in-loop).
         let saved = std::mem::take(&mut self.prelude);
         let (push_line, container) = match body {
             ComprBody::Value(e) => {
+                self.expected = elem_hint.clone();
                 let (bcode, bty) = self.gen_expr(e);
+                self.expected = None;
                 let inner = if bty.base.is_empty() { "int".to_string() } else { self.decl_spelling(&bty) };
                 (format!("{t}\t{tmp}.push_back({bcode});\n"), format!("std::vector<{inner} >"))
             }
@@ -1009,6 +1065,78 @@ impl<'a> BodyGen<'a> {
         let mut buf = String::new();
         self.gen_switch(subject, &cases2, default2.as_deref(), ind, &mut buf);
         // `gen_switch` flushes its own prelude into `buf`; nothing should remain.
+        let leftover = std::mem::replace(&mut self.prelude, saved);
+        let t = "\t".repeat(ind);
+        self.prelude.push_str(&format!("{t}{spell} {tmp};\n"));
+        self.prelude.push_str(&leftover);
+        self.prelude.push_str(&buf);
+        (tmp, ty)
+    }
+
+    /// A value-position `if`/`else`, desugared like a value `switch`: a hoisted
+    /// temporary, then a statement `if` whose branches assign their trailing value
+    /// to it. `else if` chains and `{ … }` blocks nest naturally.
+    pub(super) fn gen_if_expr(
+        &mut self,
+        cond: &Expr,
+        then: &Expr,
+        els: Option<&Expr>,
+    ) -> (String, Ty) {
+        let tmp = self.fresh("ifx");
+        // The temp's type is the contextual expected type when present (the common
+        // type the branches unify to), else inferred from the first branch's value.
+        let ty = match &self.expected {
+            Some(t) if !t.base.is_empty() => t.clone(),
+            _ => self.if_expr_ty(then, els),
+        };
+        let spell = self.decl_spelling(&ty);
+        let stmt = Stmt::If {
+            cond: cond.clone(),
+            then: Box::new(branch_assign_to(then, &tmp)),
+            els: els.map(|e| Box::new(branch_assign_to(e, &tmp))),
+            line: self.current_line,
+        };
+        // Build the statement `if` in an isolated prelude context (mirrors
+        // `gen_switch_expr`) so its flushing does not reorder pending prelude.
+        let saved = std::mem::take(&mut self.prelude);
+        let ind = self.prelude_ind;
+        let mut buf = String::new();
+        self.gen_stmt(&stmt, ind, &mut buf);
+        let leftover = std::mem::replace(&mut self.prelude, saved);
+        let t = "\t".repeat(ind);
+        self.prelude.push_str(&format!("{t}{spell} {tmp};\n"));
+        self.prelude.push_str(&leftover);
+        self.prelude.push_str(&buf);
+        (tmp, ty)
+    }
+
+    /// The result type of a value-position `if`: the type of the first branch's
+    /// trailing value expression, inferred without emitting.
+    fn if_expr_ty(&mut self, then: &Expr, els: Option<&Expr>) -> Ty {
+        let value = branch_value_expr(then).or_else(|| els.and_then(branch_value_expr)).cloned();
+        match value {
+            Some(e) => self.dry_ty(&e),
+            None => Ty::default(),
+        }
+    }
+
+    /// A value-position `{ … }` block: hoist its statements, the trailing value
+    /// assigned to a temporary that the expression evaluates to.
+    pub(super) fn gen_block_expr(&mut self, stmts: &[Stmt]) -> (String, Ty) {
+        let tmp = self.fresh("blk");
+        let ty = match &self.expected {
+            Some(t) if !t.base.is_empty() => t.clone(),
+            _ => match case_value_expr(stmts) {
+                Some(e) => self.dry_ty(&e.clone()),
+                None => Ty::default(),
+            },
+        };
+        let spell = self.decl_spelling(&ty);
+        let body = Stmt::Block(assign_last_to(stmts, &tmp));
+        let saved = std::mem::take(&mut self.prelude);
+        let ind = self.prelude_ind;
+        let mut buf = String::new();
+        self.gen_stmt(&body, ind, &mut buf);
         let leftover = std::mem::replace(&mut self.prelude, saved);
         let t = "\t".repeat(ind);
         self.prelude.push_str(&format!("{t}{spell} {tmp};\n"));

@@ -68,8 +68,8 @@ impl<'a> BodyGen<'a> {
                 let v = v.trim();
                 let is_ptr = v.ends_with('*');
                 let base = v.trim_end_matches('*').trim().to_string();
-                let bare = base.rsplit("::").next().unwrap_or(&base).to_string();
-                let info = self.prog.resolve_type(&[bare], self.mi).cloned();
+                let bare = base.rsplit("::").next().unwrap_or(&base);
+                let info = self.prog.resolve_type_by_cpp(bare, self.mi).cloned();
                 return (key, Ty { base, is_ptr, info, ..Default::default() });
             }
         }
@@ -214,7 +214,7 @@ impl<'a> BodyGen<'a> {
             }
             _ => None,
         };
-        Ty { base, is_ptr, info, nullable: false, iter: None }
+        Ty { base, is_ptr, info, nullable: false, unsigned: false, iter: None }
     }
 
     /// The `Ty` of a callee parameter, folding in optionality. `param_decl`
@@ -271,6 +271,21 @@ impl<'a> BodyGen<'a> {
         }
     }
 
+    /// The C++ for `return []`/`return {}` (an empty array/map literal) given the
+    /// method's return type. A pointer return (`Null<Array<T>>` → `T*`) yields
+    /// `NULL`; a by-value container (`std::vector<...>`/`std::map<...>`, which
+    /// carry no `TypeInfo`) yields a default-constructed empty container — you
+    /// cannot `return NULL` from a function returning a container by value.
+    pub(super) fn return_empty_container(&self) -> String {
+        if self.current_ret.is_ptr {
+            "NULL".to_string()
+        } else if !self.current_ret.base.is_empty() {
+            format!("{}()", self.return_value_ty().base)
+        } else {
+            "NULL".to_string()
+        }
+    }
+
     pub(super) fn element_ty(&self, container: &Ty) -> Ty {
         // crude: strip one std::vector<...>/std::map<...> level
         let b = &container.base;
@@ -279,9 +294,10 @@ impl<'a> BodyGen<'a> {
             let is_ptr = inner.ends_with('*');
             let base = inner.trim_end_matches('*').trim().to_string();
             // Recover the user/native type so member access on the loop variable
-            // still resolves (`for (tile in tiles) tile.GetExtents()`).
-            let bare = base.rsplit("::").next().unwrap_or(&base).to_string();
-            let info = self.prog.resolve_type(&[bare], self.mi).cloned();
+            // still resolves (`for (tile in tiles) tile.GetExtents()`). Resolve via
+            // the C++ leaf name so a `@:native`-renamed element type is found too.
+            let bare = base.rsplit("::").next().unwrap_or(&base);
+            let info = self.prog.resolve_type_by_cpp(bare, self.mi).cloned();
             return Ty { base, is_ptr, info, ..Default::default() };
         }
         Ty::default()

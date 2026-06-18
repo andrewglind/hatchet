@@ -1064,6 +1064,18 @@ impl<'a> UnsupportedWalker<'a> {
                     }
                 }
             }
+            Expr::If { cond, then, els } => {
+                self.expr(cond);
+                self.expr(then);
+                if let Some(e) = els {
+                    self.expr(e);
+                }
+            }
+            Expr::Block(stmts) => {
+                for s in stmts {
+                    self.stmt(s);
+                }
+            }
             Expr::Int(_)
             | Expr::Float(_)
             | Expr::Str { .. }
@@ -1422,6 +1434,18 @@ impl Collector {
                         self.expr(k, ctx);
                         self.expr(val, ctx);
                     }
+                }
+            }
+            Expr::If { cond, then, els } => {
+                self.expr(cond, ctx);
+                self.expr(then, ctx);
+                if let Some(e) = els {
+                    self.expr(e, ctx);
+                }
+            }
+            Expr::Block(stmts) => {
+                for s in stmts {
+                    self.stmt(s, ctx);
                 }
             }
             // Leaves with no nested expressions or types.
