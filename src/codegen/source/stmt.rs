@@ -555,7 +555,7 @@ impl<'a> BodyGen<'a> {
                         let _ = write!(hdr, "{t}\t{kspell} {var} = {it}->first;\n{t}\t{vspell} {vv} = {it}->second;\n");
                     } else {
                         self.define_local(var, vty);
-                        let _ = write!(hdr, "{t}\t{vspell} {var} = {it}->second;\n");
+                        let _ = writeln!(hdr, "{t}\t{vspell} {var} = {it}->second;");
                     }
                     (hdr, format!("{t}}}\n"))
                 } else {
@@ -571,7 +571,7 @@ impl<'a> BodyGen<'a> {
                         let _ = write!(hdr, "{t}\tint {var} = (int){idx};\n{t}\t{espell} {vv} = {access}[{idx}];\n");
                     } else {
                         self.define_local(var, elem);
-                        let _ = write!(hdr, "{t}\t{espell} {var} = {access}[{idx}];\n");
+                        let _ = writeln!(hdr, "{t}\t{espell} {var} = {access}[{idx}];");
                     }
                     (hdr, format!("{t}}}\n"))
                 }
