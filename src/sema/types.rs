@@ -29,6 +29,8 @@ pub fn map_primitive(name: &str) -> Option<&'static str> {
         // `StringBuf` lowers to a `std::string` accumulator: `new StringBuf()` →
         // `std::string()`, `add`/`addChar` → `+=`, `toString()` → the string itself.
         "StringBuf" => "std::string",
+        // hxcpp's `cpp.StdString` interop type is a `std::string`.
+        "StdString" => "std::string",
         "UInt8" => "uint8_t",
         "UInt16" => "uint16_t",
         "UInt32" => "uint32_t",

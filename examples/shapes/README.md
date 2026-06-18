@@ -1,6 +1,6 @@
 # `shapes` — a self-contained Hatchet example
 
-A small, **standalone** Haxe project (no native `@:native` engine stub) that
+A small, **standalone** Haxe project (no native `@:native` stub) that
 transpiles cleanly to C++98 and compiles under both `g++ -std=c++98` and
 Visual C++ 6.0. It exists so Hatchet's output can be exercised end to end — and
 checked for VC6 compatibility offline.

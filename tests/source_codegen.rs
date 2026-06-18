@@ -8,7 +8,13 @@ use hatchet::sema::Program;
 
 /// Transpile a single synthetic `.hx` source and return class `stem`'s generated `.cpp`.
 fn gen_one(src: &str, stem: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("hatchet_t_{stem}_{}", std::process::id()));
+    // Unique per call: two tests may share a `stem`, and tests run in parallel, so
+    // keying the scratch dir on the stem alone lets them race in one directory.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir =
+        std::env::temp_dir().join(format!("hatchet_t_{stem}_{}_{uniq}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(format!("{stem}.hx")), src).unwrap();
     let prog = Program::from_src_dir(&dir).expect("build program");
@@ -20,6 +26,25 @@ fn gen_one(src: &str, stem: &str) -> String {
     let out = generate_source(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     out
+}
+
+/// Transpile a single synthetic `.hx` source and return module `stem`'s `.h`.
+fn gen_header(src: &str, stem: &str) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("hatchet_h_{stem}_{}_{uniq}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{stem}.hx")), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some(stem))
+        .unwrap();
+    let head = hatchet::codegen::generate_header(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    head
 }
 
 #[test]
@@ -140,6 +165,51 @@ class C {
     assert!(out.contains("int n = this->props->GetOr(std::string(\"b\"), 5)"), "Int overload → int:\n{out}");
     assert!(out.contains("bool f = this->props->GetOr(std::string(\"c\"), false)"), "Bool overload → bool:\n{out}");
     assert!(!out.contains("void*"), "Dynamic no longer erases to void*:\n{out}");
+}
+
+#[test]
+fn overload_matching_accepts_dotted_cpp_param_types() {
+    // Regression: an `@:overload` parameter typed `cpp.StdString` / `cpp.Float32`
+    // (a dotted name) must match a `std::string` / `float` argument — the dotted
+    // name has to be split into path segments so the leaf maps through the
+    // primitive/`cpp.*` mapper (otherwise the whole `"cpp.StdString"` is the base
+    // and never equals `"std::string"`, so no overload matches).
+    let src = "\
+@:native(\"Props\") @:include(\"props.h\") @:structAccess
+extern class IProps {
+  @:overload(function(k:cpp.StdString, d:Int):Int {})
+  @:overload(function(k:cpp.StdString, d:cpp.Float32):cpp.Float32 {})
+  public function GetOr(k:cpp.StdString, d:Dynamic):Dynamic;
+}
+class C {
+  var props:cpp.Pointer<IProps>;
+  public function new() {}
+  public function run():Void {
+    var n = this.props.GetOr(\"a\", 5);
+    var f = this.props.GetOr(\"b\", cast(1.5, cpp.Float32));
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_overload_dotted_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("P.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("P"))
+        .unwrap();
+    let (out, _warnings, errors) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !errors.iter().any(|(_, msg)| msg.contains("overload")),
+        "cpp.StdString param must match a std::string arg (no overload mismatch): {:?}",
+        errors
+    );
+    assert!(out.contains("int n = this->props->GetOr("), "Int overload return type resolves:\n{out}");
+    // A typed `cast(_, cpp.Float32)` arg selects the float overload (not the first).
+    assert!(out.contains("float f = this->props->GetOr("), "typed cast selects the cpp.Float32 overload:\n{out}");
 }
 
 #[test]
@@ -307,15 +377,13 @@ fn bare_enum_constant_is_qualified_in_expression_position() {
 
 #[test]
 fn final_constant_references_are_namespace_qualified() {
-    // A `@:native final` (provided by the C++ engine, not emitted) is referenced
-    // with its native namespace (`native::MAX_CHARS`). A public `final` is a
-    // `static const` inside its namespace, so a reference from a *different*
-    // namespace — here a global-scope `extern "C"` export — is qualified too
+    // A public `final` is a `static const` inside its module's namespace, so a
+    // reference from another namespace is qualified (`native::MAX_CHARS`), and a
+    // global-scope `@:abi` export qualifies a same-module ref too
     // (`game::SCENE_ID`), while a reference from within the same namespace stays
     // bare.
     let native = "\
 package native;
-@:native @:include(\"engine.h\")
 final MAX_CHARS:Int = 100;
 ";
     let scenes = "\
@@ -325,11 +393,11 @@ final SCENE_ID:Int = 7;
 
 class Scene {
   public function new() {}
-  public function cap():Int { return MAX_CHARS; }        // native const → native::
+  public function cap():Int { return MAX_CHARS; }        // other ns → native::
   public function id():Int { return SCENE_ID; }          // same ns → bare
 }
 
-extern inline function Pick(n:Int):Int {
+@:abi function Pick(n:Int):Int {
   switch (n) {
     case SCENE_ID: return 1;                              // global scope → game::
     default: return 0;
@@ -1990,4 +2058,613 @@ class MutWarn {
         expect.len(),
         "reads/copies/fields/locals/shadowing must not warn: {warnings:?}"
     );
+}
+
+#[test]
+fn string_escapes_translate_to_cpp_not_double_escaped() {
+    // The lexer keeps escape sequences uninterpreted (Haxe `\n` is stored as
+    // backslash + 'n'); codegen must re-emit them as the matching C++ escape,
+    // not double the backslash (which made `\n` a literal backslash-n and
+    // `"\"".code` the backslash's code instead of the quote's). Octal-normalises
+    // numeric byte escapes so they can never absorb a following digit.
+    let src = "\
+class Esc {
+  public function new() {}
+  public function nl():String { return \"a\\nb\"; }
+  public function quote():Int { return \"\\\"\".code; }
+  public function tab():Int { return \"\\t\".code; }
+  public function backslash():Int { return \"\\\\\".code; }
+  public function hex():String { return \"\\x41\\x42\"; }
+}
+";
+    let out = gen_one(src, "Esc");
+    assert!(out.contains("return \"a\\nb\";"), "`\\n` stays a single C++ escape:\n{out}");
+    assert!(
+        out.contains("((int)(unsigned char)(\"\\\"\")[0])"),
+        "`\"\\\"\".code` compares against the quote (34), not the backslash:\n{out}"
+    );
+    assert!(
+        out.contains("((int)(unsigned char)(\"\\t\")[0])"),
+        "`\\t.code` is the tab escape:\n{out}"
+    );
+    assert!(
+        out.contains("((int)(unsigned char)(\"\\\\\")[0])"),
+        "`\\\\.code` is a single backslash:\n{out}"
+    );
+    // \x41\x42 → octal \101\102 ("AB"), byte-exact and non-greedy.
+    assert!(out.contains("\\101\\102"), "hex byte escapes normalise to octal:\n{out}");
+}
+
+#[test]
+fn sink_parameter_transfers_ownership_no_double_free() {
+    // `@sink` on a parameter: a `new` passed there is emitted inline (the
+    // callee consumes it), and an owned local handed there transfers out — so
+    // the caller never frees what the callee retained (the use-after-free that
+    // an un-annotated retaining method would otherwise cause).
+    let src = "\
+class Node {
+  public var kids:Array<Node>;
+  public function new() { kids = []; }
+  public function adopt(@sink child:Node):Void {
+    kids.push(child);
+  }
+}
+class Tree {
+  public var root:Node;
+  public function new() { root = new Node(); }
+  public function grow():Void {
+    root.adopt(new Node());          // new at @sink position -> inline, no free
+    var extra = new Node();
+    root.adopt(extra);               // owned local -> ownership transferred
+  }
+}
+";
+    let out = gen_one(src, "Tree");
+    assert!(
+        out.contains("root->adopt(new Node())"),
+        "a `new` at a `@sink` position is emitted inline (no hoist/free):\n{out}"
+    );
+    assert!(
+        !out.contains("delete _v") && !out.contains("delete extra"),
+        "neither the inline new nor the transferred local is freed by the caller:\n{out}"
+    );
+}
+
+#[test]
+fn sink_on_value_parameter_is_warned() {
+    // `@sink` is meaningless on a by-value parameter — flag it as a no-op.
+    let src = "\
+class W {
+  public function new() {}
+  public function take(@sink n:Int):Void {}
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_sinkwarn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("W.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("W"))
+        .unwrap();
+    let (_, warnings, _) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        warnings.iter().any(|(_, w)| w.contains("`@sink` on parameter `n` has no effect")),
+        "expected a no-op `@sink` warning, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn abstract_value_type_nests_as_field_and_vector() {
+    // An `abstract Name(U)` is a value type that — unlike `@:stackOnly` — nests
+    // freely: `new` is value construction (no heap), a field and an `Array<T>` are
+    // by value, member access is `.`, and nothing is ever freed (no ownership).
+    let src = "\
+typedef Vec2Data = { var x:Float; var y:Float; }
+abstract Vec2(Vec2Data) {
+  public function new(x:Float, y:Float) { this = { x: x, y: y }; }
+  public function lenSq():Float { return this.x * this.x + this.y * this.y; }
+}
+class Use {
+  public var here:Vec2;
+  public function new() { here = new Vec2(0.0, 0.0); }
+  public function run():Float {
+    var v = new Vec2(3.0, 4.0);
+    var pts:Array<Vec2> = [];
+    pts.push(new Vec2(1.0, 2.0));
+    return v.lenSq() + pts[0].lenSq();
+  }
+}
+";
+    let head = {
+        let dir = std::env::temp_dir().join(format!("hatchet_so_h_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Use.hx"), src).unwrap();
+        let prog = Program::from_src_dir(&dir).expect("build program");
+        let idx = prog.modules.iter().position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Use")).unwrap();
+        let h = hatchet::codegen::generate_header(&prog, idx).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        h
+    };
+    // value field, and a non-virtual destructor (no vtable → flat value layout)
+    assert!(head.contains("Vec2 here;"), "value field is by value, not a pointer:\n{head}");
+    assert!(head.contains("\t~Vec2() {}"), "value class destructor is non-virtual:\n{head}");
+    assert!(!head.contains("virtual ~Vec2"), "no virtual destructor on a value class:\n{head}");
+
+    let out = gen_one(src, "Use");
+    assert!(out.contains("Vec2 v = Vec2(3.0, 4.0)"), "`new` is value construction, not heap:\n{out}");
+    assert!(out.contains("std::vector<Vec2>"), "Array<Vec2> is a value vector:\n{out}");
+    assert!(out.contains("pts.push_back(Vec2(1.0, 2.0))"), "pushed value, no heap:\n{out}");
+    assert!(out.contains("this->here = Vec2(0.0, 0.0)"), "value field init, no `new`:\n{out}");
+    assert!(!out.contains("new Vec2") && !out.contains("delete"), "no heap or frees for a value class:\n{out}");
+}
+
+#[test]
+fn switch_case_on_final_constants_is_supported() {
+    // A `case` whose pattern is a `final` constant (not a literal or enum member)
+    // is a constant pattern — it lowers to the constant as a C++ case label, not
+    // a Haxe capture variable. Regression guard for the switch-pattern validator.
+    let src = "\
+final ALIENBEACH_SCENE_ID:Int = 0;
+final POINTS_SCENE_ID:Int = 1;
+class Factory {
+  public function new() {}
+  public function make(sceneId:Int):Int {
+    switch sceneId {
+      case ALIENBEACH_SCENE_ID: return 10;
+      case POINTS_SCENE_ID: return 20;
+      default: return -1;
+    }
+  }
+}
+";
+    let out = gen_one(src, "Factory");
+    assert!(out.contains("case ALIENBEACH_SCENE_ID:"), "final constant is a valid case label:\n{out}");
+    assert!(out.contains("case POINTS_SCENE_ID:"), "final constant is a valid case label:\n{out}");
+}
+
+#[test]
+fn value_position_switch_uses_the_expected_type_not_the_first_arm() {
+    // `return switch …` whose arms are different subclasses (+ null) must hoist
+    // the temporary as the *return type* (the common base), not the first arm's
+    // subclass — otherwise assigning a sibling subclass to it is nonsense C++.
+    let src = "\
+class Scene { public function new() {} }
+class AlienBeach extends Scene { public function new() { super(); } }
+class Points extends Scene { public function new() { super(); } }
+class Factory {
+  public function new() {}
+  public function make(id:Int):Scene {
+    return switch id {
+      case 0: new AlienBeach();
+      case 1: new Points();
+      default: null;
+    }
+  }
+}
+";
+    let out = gen_one(src, "Factory");
+    assert!(out.contains("Scene* _swx"), "temp is the base/return type, not the first arm:\n{out}");
+    assert!(!out.contains("AlienBeach* _swx"), "temp must not be typed as the first arm's subclass:\n{out}");
+    assert!(out.contains("_swx1 = new Points()"), "a sibling subclass assigns to the base temp:\n{out}");
+}
+
+#[test]
+fn abstract_newtype_lowers_to_a_value_class() {
+    // `abstract Name(U)` → a value class wrapping U in a synthetic `__this`
+    // field; `this` inside methods is the underlying value (`this->__this`);
+    // `new` is value construction (no heap); non-virtual destructor.
+    let src = "\
+abstract Meters(Float) {
+  public function new(v:Float) { this = v; }
+  public function doubled():Float { return this * 2.0; }
+}
+class Use {
+  public function new() {}
+  public function go():Float { var m = new Meters(3.5); return m.doubled(); }
+}
+";
+    let head = {
+        let dir = std::env::temp_dir().join(format!("hatchet_abs_h_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Use.hx"), src).unwrap();
+        let prog = Program::from_src_dir(&dir).expect("build program");
+        let idx = prog.modules.iter().position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Use")).unwrap();
+        let h = hatchet::codegen::generate_header(&prog, idx).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        h
+    };
+    assert!(head.contains("double __this;"), "underlying wrapped in __this:\n{head}");
+    assert!(head.contains("\t~Meters() {}"), "value class: non-virtual destructor:\n{head}");
+
+    let out = gen_one(src, "Use");
+    assert!(out.contains("this->__this = v;"), "`this = v` writes the underlying:\n{out}");
+    assert!(out.contains("return this->__this * 2.0;"), "`this` reads the underlying:\n{out}");
+    assert!(out.contains("Meters m = Meters(3.5)"), "`new` is value construction:\n{out}");
+}
+
+#[test]
+fn static_abstract_method_call_uses_scope_resolution() {
+    // `Type.staticMethod(args)` on a user value class → `Type::staticMethod(args)`
+    // (scope resolution), not member access (`.`).
+    let src = "\
+typedef Cents = { var n:Int; }
+abstract Money(Cents) {
+  public function new(n:Int) { this = { n: n }; }
+  public static function zero():Money { return new Money(0); }
+}
+class Use {
+  public function new() {}
+  public function go():Money { return Money.zero(); }
+}
+";
+    let out = gen_one(src, "Use");
+    assert!(out.contains("Money::zero()"), "static call uses scope resolution:\n{out}");
+    assert!(!out.contains("Money.zero()"), "no member-access dot for a static call:\n{out}");
+}
+
+#[test]
+fn cyclic_value_types_define_forwarders_out_of_line() {
+    // A `@:op([])` forwarder that returns a *later*-defined sibling value class
+    // (the sibling is incomplete in the class body) must be declared in-class and
+    // defined out-of-line (`inline`) after both classes — how a hand-written
+    // header breaks a `jobject`/`proxy` cycle. The self-returning operator stays
+    // inline (a member body is a complete-class context).
+    let src = "\
+typedef ViewData = { var n:Int; }
+typedef BagData = { var v:View; }
+abstract Bag(BagData) {
+  public function new(v:View) { this = { v: v }; }
+  @:op([]) public function at(i:Int):View { return this.v; }
+}
+abstract View(ViewData) {
+  public function new(n:Int) { this = { n: n }; }
+  @:to public function toInt():Int { return this.n; }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_cycle_h_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Cyc.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Cyc"))
+        .unwrap();
+    let head = hatchet::codegen::generate_header(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(head.contains("class View;"), "later sibling is forward-declared:\n{head}");
+    assert!(
+        head.contains("View operator[](int i);"),
+        "the cyclic forwarder is declared in-class:\n{head}"
+    );
+    assert!(
+        head.contains("inline View Bag::operator[](int i) { return at(i); }"),
+        "...and defined out-of-line after both classes:\n{head}"
+    );
+    // `View`'s own `@:to` (return type Int) is complete in-class → stays inline.
+    assert!(
+        head.contains("operator int() { return toInt(); }"),
+        "a non-deferred conversion stays inline:\n{head}"
+    );
+}
+
+#[test]
+fn native_meta_renames_an_emitted_class() {
+    // `@:native("name")` only renames the emitted C++ symbol — the type is still
+    // emitted (definition, ctor/dtor, method qualifiers, and uses all use `name`).
+    let src = "\
+typedef PtData = { var x:Int; }
+@:native(\"pt\") abstract Point(PtData) {
+  public function new(x:Int) { this = { x: x }; }
+  public function gx():Int { return this.x; }
+}
+class Use {
+  public var p:Point;
+  public function new() { p = new Point(1); }
+}
+";
+    let head = gen_header(src, "Use");
+    assert!(head.contains("class pt {"), "renamed class definition:\n{head}");
+    assert!(head.contains("pt(int x);"), "renamed constructor:\n{head}");
+    assert!(head.contains("pt p;"), "uses of the type are renamed:\n{head}");
+    assert!(!head.contains("Point"), "the Haxe name must not leak:\n{head}");
+
+    let out = gen_one(src, "Use");
+    assert!(out.contains("pt::pt(int x)"), "ctor definition qualifier renamed:\n{out}");
+    assert!(out.contains("int pt::gx()"), "method definition qualifier renamed:\n{out}");
+}
+
+#[test]
+fn extern_type_is_not_emitted_but_its_include_is_pulled() {
+    // `extern class` — implementation in hand-written C++; Hatchet emits no
+    // definition, but a module using it still pulls the `@:include`.
+    let src = "\
+@:include(\"engine.h\")
+extern class Engine {
+  public function ping():Int;
+}
+class User {
+  public var e:Engine;
+  public function new() {}
+  public function go():Int { return e.ping(); }
+}
+";
+    let head = gen_header(src, "User");
+    assert!(!head.contains("class Engine"), "extern class must not be emitted:\n{head}");
+    assert!(head.contains("#include \"engine.h\""), "its @:include is pulled:\n{head}");
+    assert!(head.contains("class User"), "the non-extern class is emitted:\n{head}");
+    assert!(head.contains("Engine* e;"), "the extern type is referenced (by pointer):\n{head}");
+}
+
+#[test]
+fn cpp_pointer_and_stdstring_lower_to_pointer_and_std_string() {
+    // hxcpp interop shims used to bind external engine handles: `cpp.Pointer<T>`
+    // lowers to `T*` (the inner type's spelling, incl. any `@:native` rename),
+    // and `cpp.StdString` to `std::string`.
+    let src = "\
+@:include(\"engine.h\") @:native(\"eng::IEngine\") @:structAccess
+extern class IEngine {
+  public function go():Int;
+}
+class User {
+  public var engine:cpp.Pointer<IEngine>;
+  public var name:cpp.StdString;
+  public function new() {}
+  public function rename(n:cpp.StdString):Void { this.name = n; }
+}
+";
+    let head = gen_header(src, "User");
+    assert!(
+        head.contains("eng::IEngine* engine;"),
+        "cpp.Pointer<IEngine> → eng::IEngine* (inner @:native rename applied):\n{head}"
+    );
+    assert!(head.contains("std::string name;"), "cpp.StdString → std::string:\n{head}");
+
+    let out = gen_one(src, "User");
+    assert!(
+        out.contains("std::string& n") || out.contains("std::string n"),
+        "cpp.StdString parameter lowers to std::string:\n{out}"
+    );
+}
+
+#[test]
+fn cpp_pointer_return_carries_inner_info_for_chained_calls() {
+    // Regression: a `cpp.Pointer<T>` result must carry `T`'s `TypeInfo` so a
+    // *chained* call resolves (`GetRenderer()->Push(...)`), and an anon literal
+    // argument lowers to the callee's struct parameter type — not `void`.
+    let src = "\
+@:include(\"e.h\") @:native(\"e::Effect\") @:structAccess
+typedef Effect = { kind:Int };
+@:include(\"e.h\") @:native(\"e::IRenderer\") @:structAccess
+extern class IRenderer { public function Push(eff:Effect):Void; }
+@:include(\"e.h\") @:native(\"e::IEngine\") @:structAccess
+extern class IEngine { public function GetRenderer():cpp.Pointer<IRenderer>; }
+class User {
+  var engine:cpp.Pointer<IEngine>;
+  public function new() {}
+  public function go():Void { engine.GetRenderer().Push({ kind: 1 }); }
+}
+";
+    let out = gen_one(src, "User");
+    assert!(!out.contains("void _anon"), "anon arg must not fall back to void:\n{out}");
+    assert!(out.contains("e::Effect _anon"), "anon arg lowers to the struct param type:\n{out}");
+    assert!(
+        out.contains("engine->GetRenderer()->Push("),
+        "chained call resolves and dispatches via `->`:\n{out}"
+    );
+}
+
+/// Run the pre-codegen validation pass over a single synthetic source and return
+/// the error messages (the `@proxy` misuse checks live here, not in codegen).
+fn validation_errors(src: &str, stem: &str) -> Vec<String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("hatchet_v_{stem}_{}_{uniq}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{stem}.hx")), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some(stem))
+        .unwrap();
+    let errs = hatchet::sema::validate::unsupported_construct_errors(&prog, idx);
+    let _ = std::fs::remove_dir_all(&dir);
+    errs.into_iter().map(|d| d.message).collect()
+}
+
+#[test]
+fn consume_proxy_abstract_is_not_emitted_and_lowers_to_its_native_extern() {
+    // `@proxy("native")` on an `abstract Name(cpp.Pointer<T>)` is extern↔Haxe glue:
+    // never emitted, and every reference transpiles *as* the named native extern —
+    // so a field is `T*` and calls pass straight through (`->`) to the engine,
+    // bypassing the proxy's stub bodies entirely.
+    let src = "\
+@:include(\"engine.h\") @:native(\"eng::IRenderer\") @:structAccess
+extern class IRenderer { public function W():Int; }
+@:include(\"engine.h\") @:native(\"eng::IEngine\") @:structAccess
+extern class IEngine { public function GetRenderer():cpp.Pointer<IRenderer>; }
+
+@proxy(\"eng::IEngine\")
+abstract Engine(cpp.Pointer<IEngine>) {
+  public function GetRenderer():Renderer { return null; }
+}
+@proxy(\"eng::IRenderer\")
+abstract Renderer(cpp.Pointer<IRenderer>) {
+  public function W():Int { return 0; }
+}
+
+class User {
+  var engine:Engine;
+  public function new(engine:Engine) { this.engine = engine; }
+  public function go():Int { return engine.GetRenderer().W(); }
+}
+";
+    let head = gen_header(src, "User");
+    assert!(!head.contains("class Engine"), "proxy is not emitted:\n{head}");
+    assert!(!head.contains("class Renderer"), "proxy is not emitted:\n{head}");
+    assert!(head.contains("eng::IEngine* engine;"), "proxy field → native extern pointer:\n{head}");
+
+    let out = gen_one(src, "User");
+    assert!(
+        out.contains("engine->GetRenderer()->W()"),
+        "calls pass straight through the extern with `->`:\n{out}"
+    );
+}
+
+#[test]
+fn produce_proxy_abstract_class_is_a_native_base_subclasses_derive_from() {
+    // `@proxy("native")` on an `abstract class` is the produced-base form: the base
+    // is never emitted, but a subclass `extends` it as the native base
+    // (`: public mucus::IScene`) and its `super(...)` routes to the native ctor.
+    let src = "\
+@:include(\"mucus.h\") @:native(\"mucus::IScene\") @:structAccess
+extern class IScene {}
+
+@proxy(\"mucus::IScene\")
+abstract class Scene {
+  private var id:Int;
+  public function new(id:Int) {}
+  public abstract function OnLoad():Void;
+}
+
+class Title extends Scene {
+  public function new() { super(7); }
+  public function OnLoad():Void {}
+}
+";
+    let head = gen_header(src, "Title");
+    assert!(!head.contains("class Scene"), "produce-proxy base is not emitted:\n{head}");
+    assert!(
+        head.contains(": public mucus::IScene"),
+        "subclass derives from the native base:\n{head}"
+    );
+
+    let out = gen_one(src, "Title");
+    assert!(
+        out.contains("mucus::IScene(7)"),
+        "super(...) routes to the native base constructor:\n{out}"
+    );
+}
+
+#[test]
+fn proxy_without_argument_is_an_error() {
+    let src = "\
+@:native(\"mucus::IScene\") extern class IScene {}
+@proxy
+abstract class Scene { public function new() {} }
+";
+    let errs = validation_errors(src, "Scene");
+    assert!(
+        errs.iter().any(|e| e.contains("@proxy") && e.contains("requires the fully-qualified")),
+        "a `@proxy` with no argument must error, got: {errs:?}"
+    );
+}
+
+#[test]
+fn proxy_on_non_abstract_declaration_is_an_error() {
+    let src = "\
+@:native(\"mucus::IScene\") extern class IScene {}
+@proxy(\"mucus::IScene\")
+class Scene { public function new() {} }
+";
+    let errs = validation_errors(src, "Scene");
+    assert!(
+        errs.iter().any(|e| e.contains("@proxy") && e.contains("only valid on an `abstract`")),
+        "a `@proxy` on a normal class must error, got: {errs:?}"
+    );
+}
+
+#[test]
+fn proxy_naming_an_undeclared_native_is_an_error() {
+    let src = "\
+@proxy(\"mucus::IScene\")
+abstract class Scene { public function new() {} }
+";
+    let errs = validation_errors(src, "Scene");
+    assert!(
+        errs.iter().any(|e| e.contains("no matching `extern`")),
+        "a `@proxy` naming an undeclared native type must error, got: {errs:?}"
+    );
+}
+
+#[test]
+fn free_function_tail_return_frees_owned_local_once() {
+    // A top-level free `function` whose body ends in a `return` must free its owned
+    // heap local exactly once — before the `return` — not again at the closing
+    // brace. The tail-return emitter already frees owned locals, so an unguarded
+    // closing-brace delete is unreachable dead code AND a spurious second free.
+    let src = "\
+class Worker {
+  public function new() {}
+  public function run():Int { return 42; }
+}
+
+function go():Int {
+  var w = new Worker();
+  return w.run();
+}
+";
+    let out = gen_one(src, "M");
+    let deletes = out.matches("delete w;").count();
+    assert_eq!(deletes, 1, "owned local freed exactly once (no dead double-delete):\n{out}");
+}
+
+#[test]
+fn extern_module_final_is_not_emitted_but_references_resolve() {
+    // An `extern final` constant is provided by hand-written C++ — Hatchet emits
+    // no `static const` definition for it (in the header or the cpp), but a
+    // cross-namespace reference still resolves to its namespace-qualified name.
+    let eng = "\
+package eng;
+@:include(\"engine.h\") @:native(\"LIMIT\")
+extern inline final LIMIT:Int = 99;
+";
+    let game = "\
+package game;
+import eng.Engine;
+class User {
+  public function new() {}
+  public function cap():Int { return LIMIT; }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_externfinal_{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("eng")).unwrap();
+    std::fs::create_dir_all(dir.join("game")).unwrap();
+    std::fs::write(dir.join("eng").join("Engine.hx"), eng).unwrap();
+    std::fs::write(dir.join("game").join("Game.hx"), game).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Game"))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!out.contains("99"), "no definition for the extern const is emitted:\n{out}");
+    assert!(out.contains("eng::LIMIT"), "cross-namespace reference is qualified:\n{out}");
+}
+
+#[test]
+fn abi_meta_exports_a_c_abi_function_and_plain_does_not() {
+    // `@:abi` is the C-ABI export (the export/calling-convention macros at
+    // global scope); a plain `function` stays a namespace free function.
+    let src = "\
+@:abi function pick(n:Int):Int { return n; }
+function helper(n:Int):Int { return n + 1; }
+";
+    let head = gen_header(src, "Api");
+    assert!(
+        head.contains("HATCHET_EXPORT int HATCHET_CALL pick(int n)"),
+        "@:abi → a macro-wrapped global export:\n{head}"
+    );
+    assert!(head.contains("int helper(int n)"), "a plain function stays a free function:\n{head}");
+    // The export lives at global scope, the free function inside the namespace.
+    assert!(!head.contains("HATCHET_EXPORT int HATCHET_CALL helper"), "plain fn is not exported:\n{head}");
 }

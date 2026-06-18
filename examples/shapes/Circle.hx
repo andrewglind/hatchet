@@ -18,7 +18,7 @@ class Circle extends Shape {
 	}
 
 	public function area():Float {
-		return 3.14159 * radius * radius;
+		return Math.PI * radius * radius;
 	}
 
 	public function kind():ShapeKind {

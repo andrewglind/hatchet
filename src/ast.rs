@@ -79,8 +79,6 @@ pub struct StructField {
 pub enum Access {
     Public,
     Private,
-    /// `@:protected` (or `@:protected private`).
-    Protected,
     /// No explicit modifier — Haxe instance default is private.
     Default,
 }
@@ -307,6 +305,13 @@ pub struct Param {
     /// can flag it as `Unsupported` (varargs have no C++98 lowering here) instead
     /// of dying with a parse error.
     pub rest: bool,
+    /// Parameter metadata. Currently only `@sink` is meaningful: it marks a
+    /// parameter the callee *consumes* (takes ownership of), so a `new` passed at
+    /// this position is emitted inline (the receiver frees it) rather than freed
+    /// by the caller. The consuming-parameter counterpart to an owning `@owned`
+    /// field: `@owned` says "this object frees this member when it dies"; `@sink`
+    /// says "ownership transfers to the callee at this call".
+    pub meta: Vec<Meta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -364,6 +369,11 @@ pub struct Class {
     pub is_extern: bool,
     pub is_final: bool,
     pub is_abstract: bool,
+    /// When `Some(U)`, this class was synthesized from a Haxe `abstract Name(U)`
+    /// newtype: it is a **value type** wrapping `U` in a synthetic `__this` field,
+    /// and inside its methods `this` refers to that underlying value (`U`), not
+    /// the C++ `this` pointer. `None` for an ordinary class.
+    pub abstract_underlying: Option<Type>,
     pub meta: Vec<Meta>,
     pub fields: Vec<Field>,
     pub methods: Vec<Function>,
@@ -376,6 +386,9 @@ pub struct Interface {
     /// Source line (1-based) of the `interface` keyword, for diagnostics. `0`
     /// when synthesized rather than parsed.
     pub line: usize,
+    /// `extern interface` — implementation provided by hand-written C++; Hatchet
+    /// emits no definition for it (only type-checks and references it).
+    pub is_extern: bool,
     /// Generic parameters (`interface I<T>`). Hatchet has no template lowering, so
     /// a non-empty list is flagged as `Unsupported` by the validation pass.
     pub type_params: Vec<String>,
@@ -399,6 +412,9 @@ pub struct EnumVariant {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Enum {
     pub name: String,
+    /// `extern enum` — implementation provided by hand-written C++; Hatchet emits
+    /// no definition for it (only type-checks and references it).
+    pub is_extern: bool,
     pub meta: Vec<Meta>,
     pub variants: Vec<EnumVariant>,
     /// The underlying type of an `enum abstract X(T)` (`None` for a plain `enum`).
@@ -436,6 +452,10 @@ pub struct GlobalVar {
     pub ty: Option<Type>,
     pub init: Option<Expr>,
     pub is_final: bool,
+    /// `extern` — the constant is provided by hand-written C++ (e.g. a native
+    /// `static const`), so its definition is not emitted; references still
+    /// resolve to its (`@:native`/namespace-qualified) name.
+    pub is_extern: bool,
     pub access: Access,
     pub meta: Vec<Meta>,
 }

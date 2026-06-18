@@ -39,6 +39,19 @@ struct HeaderGen<'a> {
     ns: Vec<String>,
 }
 
+/// A C++ operator / conversion / converting-constructor forwarder built for an
+/// `abstract` method, in three forms: the `inline` body (`Foo operator[](int k) {
+/// return get(k); }`) used in-class when the forwarder's value types are all
+/// complete there; and the `decl` + out-of-line `def` pair used when a by-value
+/// return/parameter names a *later*-defined sibling class (incomplete in the
+/// class body), so the definition must follow both class definitions — exactly
+/// what a hand-written header does to break a `jobject`/`proxy` cycle.
+struct Forwarder {
+    inline: String,
+    decl: String,
+    def: String,
+}
+
 impl<'a> HeaderGen<'a> {
     fn build(&self) -> String {
         let m = &self.prog.modules[self.mi];
@@ -70,10 +83,28 @@ impl<'a> HeaderGen<'a> {
         // there is no `#define` form; native (`@:native`) finals come from the C++
         // engine and are not emitted.
         let mut ns_body = String::new();
+
+        // Forward declarations for classes/interfaces referenced *before* their
+        // own definition in this module (mutually-recursive types). Hatchet
+        // classes are reference types — every cross-class member/param/return is a
+        // pointer, which only needs a forward declaration — so this resolves all
+        // such cycles. Targeted: only the names actually referenced ahead of
+        // their definition, and never `@:native` types (whose real definition
+        // lives in the hand-written engine header). C++98 forbids forward-
+        // declaring an enum, so only class-kinded types are declared here.
+        let fwds = self.forward_decls();
+        if !fwds.is_empty() {
+            for name in &fwds {
+                let _ = writeln!(ns_body, "{}class {name};", tabs(base));
+            }
+            ns_body.push('\n');
+        }
+
         let mut emitted_const = false;
         for decl in &m.file.decls {
             if let Decl::Global(g) = decl {
-                if g.is_final && g.access != Access::Private && !has_meta(&g.meta, "native") {
+                // `extern` finals are provided by hand-written C++ — not emitted.
+                if g.is_final && !g.is_extern && g.access != Access::Private {
                     if let Some(text) = crate::codegen::source::render_final_const(self.prog, self.mi, g) {
                         ns_body.push_str(&text);
                         emitted_const = true;
@@ -85,12 +116,20 @@ impl<'a> HeaderGen<'a> {
             ns_body.push('\n');
         }
         let mut first = true;
+        // Out-of-line `inline` forwarder definitions (a class returning a sibling
+        // defined later) accumulate here and are emitted after every class, so
+        // both ends of a cyclic value-type pair are complete by then.
+        let mut deferred_defs = String::new();
         for decl in &m.file.decls {
             let chunk = match decl {
-                Decl::Enum(e) if !has_meta(&e.meta, "native") => Some(self.emit_enum(e, base)),
+                Decl::Enum(e) if !e.is_extern => Some(self.emit_enum(e, base)),
                 Decl::Typedef(t) if self.emit_typedef_wanted(t) => self.emit_typedef(t, base),
-                Decl::Interface(i) if !has_meta(&i.meta, "native") => Some(self.emit_interface(i, base)),
-                Decl::Class(c) if !has_meta(&c.meta, "native") => Some(self.emit_class(c, base)),
+                Decl::Interface(i) if !i.is_extern => Some(self.emit_interface(i, base)),
+                Decl::Class(c) if !c.is_extern && !has_meta(&c.meta, "proxy") => {
+                    let (text, deferred) = self.emit_class(c, base);
+                    deferred_defs.push_str(&deferred);
+                    Some(text)
+                }
                 _ => None,
             };
             if let Some(text) = chunk {
@@ -101,6 +140,10 @@ impl<'a> HeaderGen<'a> {
                 ns_body.push_str(&text);
             }
         }
+        if !deferred_defs.is_empty() {
+            ns_body.push('\n');
+            ns_body.push_str(&deferred_defs);
+        }
 
         // Free-function declarations come **after** the type definitions above, since
         // their signatures may reference those types (`function makeVec():Vec2`).
@@ -108,7 +151,7 @@ impl<'a> HeaderGen<'a> {
         let mut emitted_fn = false;
         for decl in &m.file.decls {
             if let Decl::Global(g) = decl {
-                if g.access != Access::Private && !has_meta(&g.meta, "native") {
+                if g.access != Access::Private {
                     if let Some(sig) = self.free_fn_decl(g) {
                         if !emitted_fn && !first {
                             ns_body.push('\n');
@@ -133,16 +176,14 @@ impl<'a> HeaderGen<'a> {
             }
         }
 
-        // `extern inline` functions become `extern "C"` exports at **global scope**
+        // `@:abi` functions become `extern "C"` exports at **global scope**
         // (an `extern "C"` symbol cannot be namespaced), declared with the portable
         // export/calling-convention macros.
         let mut extern_decls = String::new();
         for decl in &m.file.decls {
             if let Decl::Function(f) = decl {
-                if !has_meta(&f.meta, "native") {
-                    if let Some(sig) = self.extern_fn_decl(f) {
-                        let _ = writeln!(extern_decls, "{sig};");
-                    }
+                if let Some(sig) = self.extern_fn_decl(f) {
+                    let _ = writeln!(extern_decls, "{sig};");
                 }
             }
         }
@@ -169,12 +210,12 @@ impl<'a> HeaderGen<'a> {
         out
     }
 
-    /// Global-scope declaration for an `extern inline` function:
+    /// Global-scope declaration for a `@:abi` function:
     /// `<P>_EXPORT <ret> <P>_CALL name(params)` (no trailing `;`). Emitted outside
     /// any namespace, so every referenced type is fully qualified (empty namespace
-    /// context). Returns `None` for non-`extern` functions.
+    /// context). Returns `None` for non-`@:abi` functions.
     fn extern_fn_decl(&self, f: &Function) -> Option<String> {
-        if !f.modifiers.is_extern {
+        if !has_meta(&f.meta, "abi") {
             return None;
         }
         let name = f.name.as_ref()?;
@@ -190,6 +231,88 @@ impl<'a> HeaderGen<'a> {
             .collect::<Vec<_>>()
             .join(", ");
         Some(format!("{prefix}_EXPORT {ret} {prefix}_CALL {name}({params})"))
+    }
+
+    // ---- forward declarations ------------------------------------------
+
+    /// Class/interface (and ADT value-class) names this module must forward-
+    /// declare: those referenced by an *earlier*-emitted type in the module's
+    /// header, so a pointer/param/return to a not-yet-defined sibling resolves.
+    /// Returned in definition order. Excludes `@:native` types.
+    /// The type declarations this header actually emits, in emission order — the
+    /// same set and order as the body emit loop (enums, struct/alias typedefs,
+    /// interfaces, classes). Typedefs are included so a struct typedef referencing
+    /// a later class is recognised as a referrer.
+    fn emitted_type_decls(&self) -> Vec<&'a Decl> {
+        self.prog.modules[self.mi]
+            .file
+            .decls
+            .iter()
+            .filter(|d| match d {
+                Decl::Enum(e) => !e.is_extern,
+                Decl::Typedef(t) => self.emit_typedef_wanted(t),
+                Decl::Interface(i) => !i.is_extern,
+                Decl::Class(c) => !c.is_extern && !has_meta(&c.meta, "proxy"),
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Forward-declarable / definition-order targets: class/interface/ADT-enum
+    /// (the only things both forward-declarable in C++98 and emitted by Hatchet
+    /// itself), keyed to their emission index.
+    fn type_def_order(&self) -> std::collections::HashMap<String, usize> {
+        let mut def_order = std::collections::HashMap::new();
+        for (i, d) in self.emitted_type_decls().iter().enumerate() {
+            let name = match d {
+                Decl::Class(c) => Some(&c.name),
+                Decl::Interface(it) => Some(&it.name),
+                // An ADT enum lowers to a value *class*, so it too can be a target.
+                Decl::Enum(e) if e.is_adt() => Some(&e.name),
+                _ => None,
+            };
+            if let Some(n) = name {
+                def_order.insert(n.clone(), i);
+            }
+        }
+        def_order
+    }
+
+    /// The C++ name a locally-declared type is **emitted** under: its `@:native`
+    /// rename if present, else its Haxe name. (`@:native` now only renames; it no
+    /// longer suppresses emission — that is `extern`.)
+    fn cpp_def_name(&self, haxe_name: &str) -> String {
+        self.prog
+            .resolve_type(std::slice::from_ref(&haxe_name.to_string()), self.mi)
+            .map(|t| t.cpp_name().to_string())
+            .unwrap_or_else(|| haxe_name.to_string())
+    }
+
+    fn forward_decls(&self) -> Vec<String> {
+        let emitted = self.emitted_type_decls();
+        let def_order = self.type_def_order();
+
+        // A target referenced by an earlier-emitted declaration needs a forward
+        // decl. Hatchet classes are reference types (cross-class members are
+        // pointers) and a recursive value tree reaches itself through a container
+        // (`std::vector<Foo>`), so a forward declaration always suffices.
+        let mut needed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (here, d) in emitted.iter().enumerate() {
+            for r in header_type_refs(d) {
+                if let Some(&def) = def_order.get(&r) {
+                    if def > here {
+                        needed.insert(r);
+                    }
+                }
+            }
+        }
+
+        // Return in definition order (stable, readable) rather than alphabetical,
+        // mapped to the C++ name each type is emitted under (its `@:native` rename,
+        // if any), since that is what the forward declaration must name.
+        let mut out: Vec<String> = needed.into_iter().collect();
+        out.sort_by_key(|n| def_order.get(n).copied().unwrap_or(0));
+        out.into_iter().map(|n| self.cpp_def_name(&n)).collect()
     }
 
     // ---- enums ---------------------------------------------------------
@@ -355,6 +478,8 @@ impl<'a> HeaderGen<'a> {
     // ---- typedefs ------------------------------------------------------
 
     fn emit_typedef_wanted(&self, t: &Typedef) -> bool {
+        // A `@:native` typedef names an existing engine struct (external) — not
+        // emitted; nor are the `UInt*` shims.
         !has_meta(&t.meta, "native") && !crate::sema::types::is_uint_shim(&t.name)
     }
 
@@ -409,8 +534,15 @@ impl<'a> HeaderGen<'a> {
 
     // ---- classes -------------------------------------------------------
 
-    fn emit_class(&self, c: &Class, ind: usize) -> String {
+    /// Returns `(class_text, deferred_defs)` — the second holds any out-of-line
+    /// `inline` forwarder definitions whose by-value types are incomplete in the
+    /// class body (a sibling defined later); the caller emits them after all
+    /// classes.
+    fn emit_class(&self, c: &Class, ind: usize) -> (String, String) {
         let t = tabs(ind);
+        let mut deferred = String::new();
+        // The C++ name this class is emitted under (its `@:native` rename, if any).
+        let cpp = self.cpp_def_name(&c.name);
 
         // Fields whose value can be null (matched by an optional constructor
         // parameter of the same name) are stored as pointers when struct-typed.
@@ -457,20 +589,29 @@ impl<'a> HeaderGen<'a> {
         };
 
         let mut public = String::new();
+        // Hatchet never emits C++ `private`: Haxe `private` is accessible from
+        // subclasses (and Haxe has no "private even from subclasses" concept), so
+        // a hidden member maps to C++ `protected` — otherwise a subclass reaching
+        // an inherited member would compile in Haxe but be rejected by C++.
         let mut protected = String::new();
-        let mut private = String::new();
 
         // constructor + (inline, empty) destructor
         if let Some(ctor) = &c.ctor {
             let params = self.params(&ctor.params);
-            let _ = writeln!(public, "{t}\t{}({params});", c.name);
+            let _ = writeln!(public, "{t}\t{}({params});", cpp);
         }
         // Destructor: empty by default, or freeing the pointers this class owns.
+        // A `@:stackOnly` value class is non-polymorphic and owns no heap, so its
+        // destructor is **non-virtual** — a vtable pointer would bloat `sizeof`
+        // and break the flat value layout that makes `std::vector<Foo>` and
+        // recursive-by-value composition work.
+        let is_value = has_meta(&c.meta, "stackOnly") || c.abstract_underlying.is_some();
+        let virt_dtor = if is_value { "" } else { "virtual " };
         let deletes = ownership::owned_deletes(self.prog, self.mi, &self.ns, c);
         if deletes.is_empty() {
-            let _ = writeln!(public, "{t}\tvirtual ~{}() {{}}", c.name);
+            let _ = writeln!(public, "{t}\t{virt_dtor}~{}() {{}}", cpp);
         } else {
-            let _ = writeln!(public, "{t}\tvirtual ~{}() {{", c.name);
+            let _ = writeln!(public, "{t}\t{virt_dtor}~{}() {{", cpp);
             for d in &deletes {
                 let _ = writeln!(public, "{t}\t\t{d}");
             }
@@ -516,9 +657,40 @@ impl<'a> HeaderGen<'a> {
                 format!("{t}\t{virt}{stat}{sig};\n")
             };
             match m.access {
-                Access::Protected => protected.push_str(&line),
-                Access::Private => private.push_str(&line),
+                Access::Private => protected.push_str(&line),
                 _ => public.push_str(&line),
+            }
+            // `@:op(...)` on an abstract method → an additive C++ operator that
+            // forwards to the named method (so the value reads as `a[k]` / `a + b`
+            // *and* `a.method(...)`). The named method above is still emitted.
+            // A forwarder whose by-value type is a later sibling is declared here
+            // and defined out-of-line (see `forwarder_deferred`).
+            if let Some(fwd) = self.op_forwarder(c, m) {
+                if self.forwarder_deferred(c, m.ret.as_ref()) {
+                    public.push_str(&format!("{t}\t{}\n", fwd.decl));
+                    let _ = writeln!(deferred, "{t}{}", fwd.def);
+                } else {
+                    public.push_str(&format!("{t}\t{}\n", fwd.inline));
+                }
+            }
+            // `@:to` → an implicit conversion operator; `@:from` → a converting
+            // constructor. Both forward to the named (instance/static) method.
+            if let Some(fwd) = self.to_forwarder(c, m) {
+                if self.forwarder_deferred(c, m.ret.as_ref()) {
+                    public.push_str(&format!("{t}\t{}\n", fwd.decl));
+                    let _ = writeln!(deferred, "{t}{}", fwd.def);
+                } else {
+                    public.push_str(&format!("{t}\t{}\n", fwd.inline));
+                }
+            }
+            if let Some(fwd) = self.converting_ctor(c, m) {
+                let src = m.params.first().and_then(|p| p.ty.as_ref());
+                if self.forwarder_deferred(c, src) {
+                    public.push_str(&format!("{t}\t{}\n", fwd.decl));
+                    let _ = writeln!(deferred, "{t}{}", fwd.def);
+                } else {
+                    public.push_str(&format!("{t}\t{}\n", fwd.inline));
+                }
             }
         }
 
@@ -529,11 +701,12 @@ impl<'a> HeaderGen<'a> {
             }
         }
 
-        // fields, grouped by access. A property's backing field is private when
-        // its writes are restricted (`null`/`never`) or routed (`set`) — the C++
-        // compiler then enforces the Haxe access rule — or when a custom getter
-        // backs it. A write-open property (`(null, default)`/`(never, default)`)
-        // stays a directly-writable field in its declared access group.
+        // fields, grouped by access. A property's backing field is hidden
+        // (`protected`) when its writes are restricted (`null`/`never`) or routed
+        // (`set`) — the C++ compiler then enforces the Haxe access rule — or when
+        // a custom getter backs it. A write-open property (`(null, default)`/
+        // `(never, default)`) stays a directly-writable field in its declared
+        // access group.
         for f in &c.fields {
             // Haxe physicality: a `(get, never)` property without `@:isVar` is
             // purely computed — it has no backing field at all (`(get, null)`
@@ -545,15 +718,14 @@ impl<'a> HeaderGen<'a> {
                 continue;
             }
             let line = format!("{t}\t{} {};\n", self.field_type(c, f, &nullable), f.name);
-            let private_backing =
+            let hidden_backing =
                 has_accessor(f) && (f.set != PropAccess::Default || f.get == PropAccess::Get);
-            if private_backing {
-                private.push_str(&line); // backing field
+            if hidden_backing {
+                protected.push_str(&line); // backing field
             } else {
                 match f.access {
                     Access::Public => public.push_str(&line),
-                    Access::Protected => protected.push_str(&line),
-                    _ => private.push_str(&line),
+                    _ => protected.push_str(&line),
                 }
             }
         }
@@ -571,19 +743,15 @@ impl<'a> HeaderGen<'a> {
                 s.push('\n');
             }
         }
-        let _ = writeln!(s, "{t}class {decl_mod}{}{base} {{", c.name);
+        let _ = writeln!(s, "{t}class {decl_mod}{}{base} {{", cpp);
         let _ = writeln!(s, "{t}public:");
         s.push_str(&public);
         if !protected.is_empty() {
             let _ = writeln!(s, "{t}protected:");
             s.push_str(&protected);
         }
-        if !private.is_empty() {
-            let _ = writeln!(s, "{t}private:");
-            s.push_str(&private);
-        }
         let _ = writeln!(s, "{t}}};");
-        s
+        (s, deferred)
     }
 
     fn emit_accessors(&self, _c: &Class, f: &Field, nullable: &BTreeSet<String>, ind: usize) -> String {
@@ -607,16 +775,94 @@ impl<'a> HeaderGen<'a> {
         s
     }
 
-    // ---- signatures & types --------------------------------------------
+    /// Whether a forwarder whose by-value return / parameter type is `ty` must be
+    /// defined out-of-line: `ty` names a sibling class defined *later* in this
+    /// module, which is incomplete inside `c`'s body (a by-value return/param then
+    /// needs the full definition, which a forward decl can't supply). The class's
+    /// own type is fine — a member body is a complete-class context.
+    fn forwarder_deferred(&self, c: &Class, ty: Option<&Type>) -> bool {
+        let order = self.type_def_order();
+        let Some(&here) = order.get(&c.name) else { return false };
+        let Some(t) = ty else { return false };
+        let mut names = Vec::new();
+        type_names_in(t, &mut names);
+        names.iter().any(|n| order.get(n).is_some_and(|&def| def > here))
+    }
 
-    fn method_signature(&self, m: &Function, _interface: bool) -> String {
-        let mut ret = match &m.ret {
+    /// If `m` carries `@:op(...)`, the C++ operator that forwards to it (e.g.
+    /// `Proxy operator[](int k) { return get(k); }`), else `None`. The operator's
+    /// return/parameter types mirror the method's; unsupported op forms (the 2-arg
+    /// `[]` write, `a.b`, `a()`, postfix) yield `None` here and are flagged by the
+    /// validation pass.
+    fn op_forwarder(&self, c: &Class, m: &Function) -> Option<Forwarder> {
+        let name = m.name.as_ref()?;
+        let arg = m.meta.iter().find(|me| me.name == "op").and_then(|me| me.first_arg())?;
+        let token = cpp_operator(arg, m.params.len())?;
+        let ret = match &m.ret {
             Some(ty) => self.prog.map_type_use(ty, self.mi, &self.ns),
             None => "void".to_string(),
         };
-        if has_meta(&m.meta, "readOnly") {
-            ret = format!("const {ret}");
+        let params = self.params(&m.params);
+        let arg_names = m
+            .params
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = format!("return {name}({arg_names});");
+        let cpp = self.cpp_def_name(&c.name);
+        Some(Forwarder {
+            inline: format!("{ret} operator{token}({params}) {{ {body} }}"),
+            decl: format!("{ret} operator{token}({params});"),
+            def: format!("inline {ret} {cpp}::operator{token}({params}) {{ {body} }}"),
+        })
+    }
+
+    /// If `m` carries `@:to`, an implicit C++ conversion operator forwarding to
+    /// it: `operator T() { return toX(); }` (non-`const`, so it may call the
+    /// non-const named method). Expects a 0-parameter instance method.
+    fn to_forwarder(&self, c: &Class, m: &Function) -> Option<Forwarder> {
+        let name = m.name.as_ref()?;
+        if !has_meta(&m.meta, "to") || m.modifiers.is_static || !m.params.is_empty() {
+            return None;
         }
+        let target = self.prog.map_type_use(m.ret.as_ref()?, self.mi, &self.ns);
+        let cpp = self.cpp_def_name(&c.name);
+        Some(Forwarder {
+            inline: format!("operator {target}() {{ return {name}(); }}"),
+            decl: format!("operator {target}();"),
+            def: format!("inline {cpp}::operator {target}() {{ return {name}(); }}"),
+        })
+    }
+
+    /// If `m` carries `@:from` (a static, single-parameter factory returning the
+    /// abstract), a *converting constructor* forwarding to it, so the source type
+    /// implicitly converts to the abstract: `Foo(Src s) { *this = fromX(s); }`.
+    fn converting_ctor(&self, c: &Class, m: &Function) -> Option<Forwarder> {
+        let name = m.name.as_ref()?;
+        if !has_meta(&m.meta, "from") || !m.modifiers.is_static || m.params.len() != 1 {
+            return None;
+        }
+        let p = &m.params[0];
+        let decl = param_decl(self.prog, self.mi, &self.ns, p);
+        // strip any ` = default` (a converting ctor parameter has none)
+        let decl = decl.split(" = ").next().unwrap_or(&decl);
+        let cn = self.cpp_def_name(&c.name);
+        let body = format!("*this = {name}({});", p.name);
+        Some(Forwarder {
+            inline: format!("{cn}({decl}) {{ {body} }}"),
+            decl: format!("{cn}({decl});"),
+            def: format!("inline {cn}::{cn}({decl}) {{ {body} }}"),
+        })
+    }
+
+    // ---- signatures & types --------------------------------------------
+
+    fn method_signature(&self, m: &Function, _interface: bool) -> String {
+        let ret = match &m.ret {
+            Some(ty) => self.prog.map_type_use(ty, self.mi, &self.ns),
+            None => "void".to_string(),
+        };
         let name = m.name.clone().unwrap_or_else(|| "new".to_string());
         let params = self.params(&m.params);
         format!("{ret} {name}({params})")
@@ -624,10 +870,11 @@ impl<'a> HeaderGen<'a> {
 
     /// Declaration (`ret name(params)`) for a public top-level free function.
     /// Header declaration for a plain module-level `function name(...) {...}`:
-    /// `ret name(params)`. Skips `extern`/`@:native` (handled elsewhere) and the
-    /// bodyless / `macro` forms. Defaults are kept on the declaration.
+    /// `ret name(params)`. Skips a `@:abi` function (declared as a global
+    /// `extern "C"` export instead) and the bodyless / `macro` forms. Defaults are
+    /// kept on the declaration.
     fn plain_fn_decl(&self, f: &Function) -> Option<String> {
-        if f.modifiers.is_extern || f.modifiers.is_macro || has_meta(&f.meta, "native") {
+        if f.modifiers.is_macro || has_meta(&f.meta, "abi") {
             return None;
         }
         f.body.as_ref()?;
@@ -940,6 +1187,129 @@ fn has_accessor(f: &Field) -> bool {
     f.get != PropAccess::Default || f.set != PropAccess::Default
 }
 
+/// The named types a class/interface/ADT-enum mentions in the parts that appear
+/// in its **header** definition — base list, field types, and method signatures
+/// (params + returns), plus enum-variant payloads. Bodies are excluded (they
+/// live in the `.cpp`, which sees every full definition). Used to decide which
+/// sibling types must be forward-declared. Returns the final path segment of
+/// each named type (e.g. `Proxy` for `pack.Proxy`).
+/// The final path segment of every named type mentioned by `t` (recursing into
+/// type parameters, anonymous-struct fields, and function types). E.g. for
+/// `Array<pack.Proxy>` → `["Array", "Proxy"]`.
+fn type_names_in(t: &Type, out: &mut Vec<String>) {
+    match t {
+        Type::Named { path, params, .. } => {
+            if let Some(n) = path.last() {
+                out.push(n.clone());
+            }
+            for p in params {
+                type_names_in(p, out);
+            }
+        }
+        Type::Anon(fields) => {
+            for f in fields {
+                type_names_in(&f.ty, out);
+            }
+        }
+        Type::Func { params, ret } => {
+            for p in params {
+                type_names_in(p, out);
+            }
+            type_names_in(ret, out);
+        }
+    }
+}
+
+fn header_type_refs(d: &Decl) -> Vec<String> {
+    let mut out = Vec::new();
+    fn ty(t: &Type, out: &mut Vec<String>) {
+        match t {
+            Type::Named { path, params, .. } => {
+                if let Some(n) = path.last() {
+                    out.push(n.clone());
+                }
+                for p in params {
+                    ty(p, out);
+                }
+            }
+            Type::Anon(fields) => {
+                for f in fields {
+                    ty(&f.ty, out);
+                }
+            }
+            Type::Func { params, ret } => {
+                for p in params {
+                    ty(p, out);
+                }
+                ty(ret, out);
+            }
+        }
+    }
+    fn sig(f: &Function, out: &mut Vec<String>) {
+        for p in &f.params {
+            if let Some(t) = &p.ty {
+                ty(t, out);
+            }
+        }
+        if let Some(t) = &f.ret {
+            ty(t, out);
+        }
+    }
+    match d {
+        Decl::Class(c) => {
+            if let Some(b) = &c.extends {
+                ty(b, &mut out);
+            }
+            for i in &c.implements {
+                ty(i, &mut out);
+            }
+            for f in &c.fields {
+                if let Some(t) = &f.ty {
+                    ty(t, &mut out);
+                }
+            }
+            for m in c.methods.iter().chain(c.ctor.iter()) {
+                sig(m, &mut out);
+            }
+        }
+        Decl::Interface(i) => {
+            for b in &i.extends {
+                ty(b, &mut out);
+            }
+            for f in &i.fields {
+                if let Some(t) = &f.ty {
+                    ty(t, &mut out);
+                }
+            }
+            for m in &i.methods {
+                sig(m, &mut out);
+            }
+        }
+        Decl::Enum(e) => {
+            for v in &e.variants {
+                for p in &v.params {
+                    if let Some(t) = &p.ty {
+                        ty(t, &mut out);
+                    }
+                }
+            }
+        }
+        // A struct/alias typedef references types too — e.g. an `abstract`'s
+        // underlying record (`typedef FooData = { … Array<Foo> … }`) names the
+        // very class it backs, which is emitted *after* it.
+        Decl::Typedef(td) => match &td.target {
+            TypedefTarget::Alias(t) => ty(t, &mut out),
+            TypedefTarget::Struct(fields) => {
+                for f in fields {
+                    ty(&f.ty, &mut out);
+                }
+            }
+        },
+        _ => {}
+    }
+    out
+}
+
 /// Whether codegen synthesizes a trivial `GetX` for this property: reads are
 /// open (`default`) but the backing field is private because writes are
 /// restricted (`null`/`never`) or routed (`set`). A custom `(get, …)` accessor
@@ -947,6 +1317,35 @@ fn has_accessor(f: &Field) -> bool {
 /// (`(null, …)`/`(never, …)`) has no external reads to serve.
 fn generated_getter(f: &Field) -> bool {
     f.get == PropAccess::Default && f.set != PropAccess::Default
+}
+
+/// Map a `@:op(...)` argument to the C++ operator token to emit (so the caller
+/// writes `operator<token>`), given the method's parameter count. Supports:
+/// `[]` read (1 param) → subscript; binary `A op B` (1 param); prefix unary
+/// `op A` (0 params). Returns `None` for forms with no C++98 operator mapping —
+/// the 2-arg `[]` write, postfix, `a.b` field access, `a()` call — which the
+/// validation pass flags instead.
+pub(crate) fn cpp_operator(arg: &str, n_params: usize) -> Option<String> {
+    let a = arg.trim();
+    // Array read: `@:op([])` with one parameter (the index). The two-parameter
+    // write form has no C++ `operator[]` equivalent (it must return a reference).
+    if a == "[]" {
+        return (n_params == 1).then(|| "[]".to_string());
+    }
+    // The operator symbol is whatever remains after dropping the `A`/`B` operand
+    // placeholders and whitespace (`A << B` → `<<`, `-A` → `-`).
+    let sym: String = a
+        .chars()
+        .filter(|c| !c.is_alphanumeric() && *c != '_' && !c.is_whitespace())
+        .collect();
+    const BINARY: &[&str] = &[
+        "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=", "&", "|", "^", "<<", ">>",
+        "&&", "||",
+    ];
+    const UNARY: &[&str] = &["-", "!", "~"];
+    let ok = (n_params == 1 && BINARY.contains(&sym.as_str()))
+        || (n_params == 0 && UNARY.contains(&sym.as_str()));
+    ok.then_some(sym)
 }
 
 /// Whether a `set`-access property has a user-written `set_x` (real Haxe

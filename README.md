@@ -6,6 +6,14 @@ older Unix toolchains. It is a *transpiler*, not a compiler: it emits C++ source
 target, and it never produces a custom C++ runtime. Supported Haxe constructs map to an equivalent,
 hand-writable C++ idiom. Hatchet implements a focused subset of Haxe 4.x; it is **not** a drop-in for hxcpp.
 
+> **hxcpp compatibility is compile-time only.** A guiding principle of Hatchet is that the Haxe you
+> write always *compiles* under hxcpp (Haxe's official C++ backend), so the source stays valid,
+> portable Haxe you can keep editing and type-checking with normal Haxe tooling. Hatchet makes **no
+> guarantee that the hxcpp build runs** or behaves identically — the supported, authoritative runtime
+> is the **C++98 that Hatchet emits**. The two targets can diverge at runtime (most notably value vs.
+> reference semantics: a Hatchet value class / `abstract` is a flat value, while under hxcpp the same
+> type may be a heap object). Validate behaviour on the transpiled C++98, never on an hxcpp build.
+
 ## Motivation
 
 hxcpp (Haxe's official C++ backend) cannot target C++ revisions older than C++11, which has
@@ -20,7 +28,7 @@ Hatchet is a working transpiler with a real lexer, recursive-descent parser, typ
 A bundled [standalone example](examples/shapes) is transpiled, compiled under `g++ -std=c++98`, run,
 and output-checked by the test suite (see *Validation*), and the generated output has been **built
 with Visual C++ 6.0 and run on Windows 98** — the primary target — closing the loop from Haxe source
-to a running legacy binary. Hatchet has additionally been validated against a larger, real C++ game engine.
+to a running legacy binary. Hatchet has additionally been validated against a larger, real-world C++ codebase.
 
 Supported today, end to end:
 
@@ -35,11 +43,52 @@ Supported today, end to end:
   sibling-referencing bit-flag expressions like `AB = A | B`; a `String`/`Float` backing becomes a
   namespace of typed `static const` constants, `namespace X_ { static const std::string A = "…"; }`,
   with the type mapping straight to its underlying C++ type), typedef structs and aliases, the
-  fixed-width `UInt8/16/32` shims, and `@:native` interop wiring (which emits no code of its own,
-  only the includes it contributes).
-- **Members & access** — property accessors: every pair of `default`/`null`/`never` (pure access
-  control — lowered to direct field access, with C++ `private` approximating the Haxe rule, e.g.
-  `(default,null)`'s backing field is private behind a generated `GetX`); **custom accessors with
+  fixed-width `UInt8/16/32` shims, and `extern` interop wiring (which emits no code of its own,
+  only the includes it contributes). **Mutually-recursive classes** in one module need no manual
+  ordering: Hatchet emits a **targeted forward declaration** (`class B;`) for any class/interface/ADT
+  it defines that is referenced before its own definition — and only those, never `extern` types.
+  (A forward declaration uses the type's emitted name, so a `@:native`-renamed type is declared under
+  its renamed name.)
+  Since Hatchet classes are reference types (every cross-class member/param/return is a pointer), a
+  forward declaration is always sufficient, so cyclic type graphs "just work".
+- **Value classes** — a class can be emitted as a C++ **value type** rather than a reference type:
+  `new Foo(a)` becomes a stack value `Foo(a)` (no heap), a field/`Array<Foo>` is held by value
+  (`Foo`/`std::vector<Foo>`), member access is `.`, the destructor is non-virtual (no vtable — a flat
+  value layout), and the ownership analysis never touches it (nothing to free). This gives a **value
+  object with methods** — the hand-written-C++ idiom of a small struct-with-behaviour — letting
+  value-heavy code (vectors, JSON-style trees) transliterate by value instead of being reimplemented
+  on the heap. A value type can't do C++ polymorphism, so inheritance is rejected (slicing), as is a
+  field holding the class itself by value (an incomplete type — use an `Array<Self>`); `Null<Foo>`
+  still boxes to `Foo*`, as for any value type. Two tags select a value class: the real hxcpp
+  **`@:stackOnly`** metadata makes one that also obeys hxcpp's stack-residence rule — it may *not* be
+  nested as a field or element (Hatchet flags that, steering to an `abstract`) — suiting genuine
+  stack-only locals while staying portable to hxcpp; and an **`abstract Name(U)`** newtype (next
+  bullet) is a value type that **nests freely**, the portable way to get a value object with methods,
+  operators, and conversions. See the **Metadata** section for the full `@:` vs `@` split.
+- **Abstract types (`abstract Name(U)`)** — Haxe's newtype: a **value type with methods** over an
+  underlying type `U`, lowered to a value class that wraps `U` in a synthetic `__this` field. Inside
+  its methods Haxe `this` *is* the underlying value (so `this = v` and `this.field` operate on `U`),
+  and `new Name(...)` is value construction. This is the portable, idiomatic way to get a value
+  object with operators and conversions, and the nestable value type (a field, an `Array<Name>`, or a
+  recursive-by-value tree through a container). Supported member metadata:
+  - **`@:op(...)`** operator overloading, emitted as a C++ operator that forwards to the named
+    method (so the value reads as `v[k]` / `a + b` *and* `v.method(...)`, with C++ doing the
+    operator resolution): `@:op([])` (one-arg read) → `operator[]`, `@:op(A op B)` → the binary
+    `operator op`, and prefix unary `@:op(-A)` / `!A` / `~A`. Forms with no C++98 mapping — the
+    two-arg `@:op([])` write, `@:op(a.b)`, `@:op(a())`, postfix — are flagged as unsupported.
+  - **`@:to`** → an implicit C++ conversion operator (`@:to function toStr():String` →
+    `operator std::string()`), and **`@:from`** (a static factory) → a converting constructor, so the
+    source type implicitly converts to the abstract.
+
+  Generic abstracts and `@:multiType` are not supported; an `abstract`'s value-class nature means the
+  usual value-class caveats (no polymorphism; nests freely; `Null<Name>` boxes to `Name*`).
+- **Members & access** — a Haxe `private` member maps to C++ **`protected`**, not `private`: Haxe
+  `private` is accessible from subclasses (and Haxe has no "private even from subclasses" concept),
+  so emitting C++ `private` would reject an inherited-member access that Haxe accepts. Hatchet
+  therefore never emits C++ `private` — hidden members are `protected` (still closed to outside code,
+  open to subclasses, matching Haxe). Property accessors: every pair of `default`/`null`/`never`
+  (pure access control — lowered to direct field access, the backing field hidden as `protected`
+  behind a generated `GetX` for `(default,null)`); **custom accessors with
   real Haxe routing** — a user-written `get_x`/`set_x` is emitted as a real method and **every
   access routes through it**, external and internal alike, except inside the property's own
   accessors (Haxe's recursion rule): reads become `get_x()`, writes become `set_x(v)` —
@@ -55,9 +104,9 @@ Supported today, end to end:
   callers never also free), and a setter that `return`s the field reads to the escape analysis as
   the value being handed out — the field then leans borrowed (leak over double-free, the standard
   bias; `@owned` opts the destructor in). `(get, default)` and `dynamic` access remain flagged as
-  unsupported. Also `@:protected`, `@:readOnly` (const-return), `@:decl` (DLL-export
+  unsupported. Also `@:decl` (DLL-export
   class), `@:overload(...)` (a call is resolved to the matching C++ overload by argument type, else a
-  hard error), `extern inline` (`extern "C"` export via a portable macro), `abstract class` and
+  hard error), `@:abi` (`extern "C"` export via a portable macro), `abstract class` and
   `abstract function` (an abstract method becomes a pure virtual `virtual T f() = 0;`, declared and
   never defined), and the base-from-member `Holder` idiom for constructors whose `super(...)` is not
   the first statement.
@@ -149,7 +198,16 @@ Supported today, end to end:
   warns when a tag looks unsound (e.g. an `@owned` field that is also handed out); auto-inferring an
   injected pointer's ownership would need interprocedural call-site analysis and is a future improvement.
   A `new` passed to a constructor parameter the class owns is emitted **inline** — the constructed object
-  frees it — rather than hoisted into a scope-owned local that would double-free it. **On exception
+  frees it — rather than hoisted into a scope-owned local that would double-free it. A **method/function
+  parameter** can be marked **`@sink`** — **`function setKey(key, @sink val:JValue)`** — a *consuming*
+  parameter that takes ownership across the call (distinct from `@owned`, which says a *field* frees its
+  member when the object dies; `@sink` says ownership *transfers in* at this call): a `new` handed to a
+  `@sink` position is emitted inline, and an owned local handed there has its scope-close free dropped,
+  so the value is freed once (by the receiver) rather than dangled by the caller. This is the explicit
+  answer to a retaining method (`store(x)` that keeps `x`), which an intraprocedural analysis cannot
+  otherwise see; `@sink` on a by-value parameter (where there is nothing to consume) is flagged as a
+  no-op. A `new` pushed into a container that **escapes** the scope — a class-owned field container, or
+  a local container that is returned/stored — likewise comes to rest there and is not freed locally. **On exception
   unwind** (a `throw` inside a `try`), the scope-close frees do not run, so owned objects created in
   the `try` before the throw **leak** — a deliberate extension of the conservative bias (never a
   double-free/use-after-free); free them in the `catch` if it matters. (Exceptions must be enabled on
@@ -209,8 +267,121 @@ The idiomatic Hatchet patterns, in preference order:
 - **Return the result** instead of mutating an argument: `function doubled(xs:Array<Int>):Array<Int>`.
 - **Mutate a local copy** when a working copy is genuinely what you want.
 
+Conversely, when value semantics are what you *want* — small objects copied freely, composed by
+value, no heap — an **`abstract Name(U)`** (see *Declarations* above) is the deliberate tool:
+it carries methods like any class but behaves like a `struct`, matching the value-object idiom of
+hand-written C++.
+
 A future evolution may pass mutated container parameters by non-const reference (restoring Haxe
 semantics at the parameter boundary); until then, the lint is the contract.
+
+## Metadata
+
+Hatchet reacts to two kinds of metadata, kept deliberately separate. (Internally Hatchet matches
+metadata by **name** and ignores the `@:`/`@` prefix, but the prefix matters to *other* Haxe
+targets, so write each tag in the form shown.)
+
+**Haxe / hxcpp compiler metadata Hatchet honours (`@:…`)** — real metadata whose meaning Hatchet
+matches, so the same source stays valid and keeps compiling under hxcpp:
+
+| Tag | Effect in Hatchet |
+|-----|-------------------|
+| `@:native("a::b::Name")` | Rename the emitted C++ symbol (and namespace) — the type/function is still Hatchet's to emit, just under that name. Orthogonal to `extern` |
+| `@:include("p.h")` / `@:include("<h>")` | Emit an `#include` (quoted for a project header, angle-bracketed verbatim for a system one) |
+| `@:cppFileCode('…')` | Inject verbatim C++ at that point in a body (also real hxcpp) |
+| `@:overload(function(...){})` | Resolve a call to the matching C++ overload by argument type, else a hard error |
+| `@:isVar` | Force a physical backing field for a property (so `(get,never)` keeps storage) |
+| `@:decl` | Export a class from a DLL via the portable export macro |
+| `@:abi` | (on a module-level function) export it across a C ABI: emitted as an `extern "C"` global at file scope with the portable export/calling-convention macros (`HATCHET_EXPORT`/`HATCHET_CALL`) |
+| `@:op(...)` | (on an `abstract` method) operator overloading → a C++ operator forwarding to the method: `@:op([])` read → `operator[]`, `@:op(A op B)` → binary `operator op`, prefix unary `@:op(-A)` |
+| `@:to` / `@:from` | (on an `abstract` method) `@:to` → an implicit conversion operator; `@:from` (static) → a converting constructor |
+| `@:stackOnly` | A **value class** that also obeys hxcpp's stack-residence rule — may **not** be nested as a field/element (flagged, steering to an `abstract`). Portable; use for genuine stack-only value types |
+
+**Interop — the `extern` keyword.** A type whose implementation lives in hand-written C++ is declared
+**`extern`** (`extern class` / `extern interface` / `extern enum`, all valid Haxe): Hatchet emits no
+definition for it, only type-checks and references it, and pulls its `@:include` into anything that
+uses it. This is separate from `@:native`, which *only renames* — combine them to bind to a specific
+C++ name (`extern @:native("jobject") class JObject`). A typedef cannot be `extern` in Haxe, so a
+`@:native typedef` naming a native struct is the way to declare an external *value* struct (the one
+case where `@:native` still implies "external").
+
+**Hatchet directives (user metadata, `@…`)** — Hatchet's own. The guiding rule: a user-metadata tag
+exists **only for a C++ reality Haxe genuinely cannot express** — now that value-types-with-methods
+are `abstract` newtypes, that comes down to two things: **manual memory ownership**, and **zero-cost
+extern interop glue** (`@proxy`). Anything Haxe *can* say — operators, casts, value types via
+`abstract`, external types via `extern`, the C-ABI export via `@:abi`, access levels — is expressed in
+real Haxe, not invented here. Because these are plain user metadata, every other Haxe target ignores
+them, so the source stays portable.
+
+| Tag | Effect |
+|-----|--------|
+| `@owned` | A field the owning object frees in its destructor (a scalar via `delete`, a container element-by-element) |
+| `@sink` | A *consuming* parameter — the callee takes ownership of what is passed (caller does not free); the call-site counterpart to an owning field |
+| `@delete` | Free a marked local (`@delete var x = …`) at scope close |
+| `@proxy("native::Name")` | Binds a Haxe type to a native C++ class it is never emitted for — either a transparent handle you call through, or a base you subclass. See [Interop via `@proxy`](#interop-via-proxy) below. |
+
+**Portability note.** Both paths *compile* under hxcpp and Hatchet (the compile-time guarantee); only
+their **runtime** representation can differ, and Hatchet's emitted C++98 is the authoritative runtime
+(see the note at the top of this README). The reference-semantic path — plain `class` plus
+`@owned`/`@sink`/`@delete` — even behaves the same under both (hxcpp's GC ignores the ownership tags;
+Hatchet's analysis uses them). The value-semantic path — `abstract Name(U)` and `@:stackOnly` — is a
+flat value type under Hatchet, but under hxcpp its representation depends on the underlying (an
+anonymous-structure underlying is a heap object there), so copy-vs-share behaviour can diverge.
+Validate such behaviour on the transpiled C++98.
+
+### Interop via `@proxy`
+
+A native C++ class can be *consumed* (you hold a handle and call its methods) or *produced* (you write
+a subclass of it). hxcpp does the first directly, but it **cannot** make a Haxe class subclass a
+non-hxcpp C++ base — a managed, garbage-collected object can't also *be* a foreign C++ object (the same
+reason JNI never lets a Java class `extends` a native one). `@proxy` covers both: a glue type that is
+**never emitted**, identified by a mandatory fully-qualified native class name that must match a
+declared `extern`.
+
+**Consume** — `@proxy(...) abstract Name(cpp.Pointer<T>)`. Transparent glue: every reference transpiles
+*as* the native type, so calls pass straight through. The stub bodies exist only so hxcpp type-checks.
+
+```haxe
+@:include("native.h") @:native("ns::INative") @:structAccess
+extern class INative { public function Run():Int; }
+
+@proxy("ns::INative")
+abstract Handle(cpp.Pointer<INative>) {
+  public function Run():Int { return 0; }   // stub — Hatchet dispatches to the extern
+}
+// a field `h:Handle` lowers to `ns::INative* h`, and `h.Run()` to `h->Run()`
+```
+
+**Produce** — `@proxy(...) abstract class Name`. A base your code subclasses: the proxy itself is not
+emitted, but `extends Name` becomes `: public ns::IBase` and a `super(...)` call routes to the native
+constructor. This is the only way to subclass a native C++ base.
+
+```haxe
+@:include("native.h") @:native("ns::IBase") @:structAccess
+extern class IBase {}
+
+@proxy("ns::IBase")
+abstract class Base {
+  public function new(id:Int) {}
+  public abstract function OnTick():Void;
+}
+
+class Thing extends Base {             // -> class Thing : public ns::IBase
+  public function new() { super(7); }  // ->   : ns::IBase(7)
+  public function OnTick():Void {}
+}
+```
+
+Rules — each a hard error otherwise:
+
+- the fully-qualified native class name is a **mandatory** string argument (`@proxy("ns::IBase")`);
+- it must name a type declared `extern` with a matching `@:native` (that `extern` also supplies the
+  `@:include` pulled into emitted subclasses);
+- it applies only to an `abstract` newtype (consume) or an `abstract class` (produce).
+
+For a produce proxy, keep the Haxe member surface within what the native base actually exposes to
+subclasses (C++ `protected`/`public`): a field that is `private` in the native base would type-check
+under hxcpp but be rejected by the C++ compiler in an emitted subclass.
 
 ## Requirements
 
@@ -236,14 +407,14 @@ hatchet --src path/to/project --out path/to/output --force
 
 # A glob works too (expanded by Hatchet itself, so quote it on shells that would
 # otherwise expand it). Mix files, dirs, and globs freely:
-hatchet --src modules/*.hx --out path/to/output --force
+hatchet --src src/*.hx --out path/to/output --force
 
 # Transpile a single file — pass its dependencies too (superclasses, native stubs),
 # since the listed sources are the entire resolution scope:
-hatchet --src game/Scene.hx modules/Module.hx --out out
+hatchet --src src/Button.hx src/Widget.hx --out out
 
 # Preview on stdout, or validate without writing anything:
-hatchet --src game/Scene.hx modules/Module.hx --stdout
+hatchet --src src/Button.hx src/Widget.hx --stdout
 hatchet --src . --dry-run
 
 # Run interactively (prompts for a source and a target dir) when --src is omitted:
@@ -251,9 +422,9 @@ hatchet
 ```
 
 `--src` accepts any mix of **single `.hx` files, directories (crawled recursively for `.hx`), and
-globs** (`*`, `?`, `**` — e.g. `modules/*.hx` or `src/**/*.hx`). Globs are expanded by Hatchet itself,
+globs** (`*`, `?`, `**` — e.g. `src/*.hx` or `src/**/*.hx`). Globs are expanded by Hatchet itself,
 so quoting them to bypass shell expansion works. The full expanded set is also the **entire resolution
-scope**, so a file's dependencies (superclasses, native `@:native` stubs) must be reachable in it —
+scope**, so a file's dependencies (superclasses, `extern` stubs) must be reachable in it —
 crawl the project root to pull everything in. Each file's **project root** — the base for the output
 layout and relative includes — is inferred from its `package` declaration (the file's directory minus
 its package path).
@@ -261,12 +432,12 @@ its package path).
 | Flag | Description |
 |------|-------------|
 | `--src, -s <PATH>...` | Haxe sources to transpile — any mix of `.hx` files, directories (crawled recursively), and globs (`*`/`?`/`**`); prompted if omitted. Also the full resolution scope |
-| `--out, -o <DIR>` | Output directory (defaults to the inferred project root; ignored with `--dry-run`/`--stdout`). Generated files mirror the source package layout; includes that point at external dependencies (a native engine, a sibling project) are re-pointed at the dependency's real location when needed, so `--out` resolves from any directory |
+| `--out, -o <DIR>` | Output directory (defaults to the inferred project root; ignored with `--dry-run`/`--stdout`). Generated files mirror the source package layout; includes that point at external dependencies (a native library, a sibling project) are re-pointed at the dependency's real location when needed, so `--out` resolves from any directory |
 | `--force` | Overwrite existing generated files (ignored with `--dry-run`) |
 | `--dry-run` | Transpile and report info/warnings/errors only — write nothing. Takes precedence over `--stdout`/`-o`/`--force` |
 | `--stdout` | Write generated C++ to stdout instead of files (status goes to stderr) |
 | `--stdafx <NAME>` | Stem of the prelude source/header (default `StdAfx` → `StdAfx.h`; e.g. `MyGame` → `MyGame.h`) |
-| `--export-macro <PREFIX>` | Prefix for the portable DLL-export macros wrapped around `extern inline` functions (default `HATCHET` → `HATCHET_EXPORT`/`HATCHET_CALL`/`HATCHET_CLASS`) |
+| `--export-macro <PREFIX>` | Prefix for the portable DLL-export macros wrapped around `@:abi` functions (default `HATCHET` → `HATCHET_EXPORT`/`HATCHET_CALL`/`HATCHET_CLASS`) |
 | `--depth <N>` | Max expression-nesting depth at which a buried `Null<T>` call is auto-extracted into a freed local instead of warned about (default `1`; e.g. `2` auto-extracts `if (GetEdge(e) == null)`) |
 | `--no-traces` | Strip all `trace(...)` calls from the generated C++ (lowered to no-ops, arguments not evaluated), mirroring hxcpp's `-D no-traces` |
 
@@ -302,7 +473,7 @@ pointer). Errors are collected across all files and reported together; modules t
 cleanly are still written, and the run exits non-zero:
 
 ```text
-error: Scene.hx:14: unresolved type `IEngine` in parameter `engine` of `new` — is it declared and within the --src scope?
+error: Widget.hx:14: unresolved type `Button` in parameter `b` of `new` — is it declared and within the --src scope?
 
 Generated 6 file(s); 1 module(s) skipped due to errors.
 hatchet: 1 error(s); 1 module(s) were not generated
@@ -327,16 +498,17 @@ template lowering, so each is flagged rather than emitted with `T` as a bare unk
 **`(get, default)` properties and `dynamic`
 access** (every other accessor pair is lowered — see *Members & access* above — and a stray
 `get_x`/`set_x` whose field does not declare the matching access kind is flagged rather than
-silently dropped); and ordinary **`abstract` types** (the
-`abstract X(T)` newtype form — distinct
-from `enum abstract`, which *is* supported, and from an `abstract class`, also supported). These are
-parsed but not transpiled, so they are reported with a clean diagnostic rather than a parse error.
+silently dropped); **generic / `@:multiType` abstracts** (a plain `abstract X(T)` newtype *is*
+supported — see *Declarations* — but a type-parameterized or multitype one is not); and **`@:op`
+forms with no C++98 operator** (the two-arg `@:op([])` write, `@:op(a.b)`, `@:op(a())`, postfix).
+These are parsed but not transpiled, so they are reported with a clean diagnostic rather than a
+parse error.
 Relatedly, a `for` loop over anything other than a range,
 an `Array`, or a `Map` (a custom `Iterator`/`Iterable`) is a hard error rather than a guess.
 
 ## Standalone projects and the prelude
 
-Hatchet transpiles a **standalone** project — plain Haxe with no `@:native` API stub —
+Hatchet transpiles a **standalone** project — plain Haxe with no `extern` interop layer —
 with no special setup: cross-file types resolve, a type used without an explicit `import` (legal for
 same-package Haxe) still has its header pulled in, and the **standard-library prelude is generated
 automatically**. Hatchet owns that prelude — it knows which headers its supported idioms need
@@ -367,19 +539,28 @@ cargo test                 # whole suite; the compile gate is skipped if no C++ 
 HATCHET_GXX=/path/to/g++ cargo test   # point it at a specific compiler
 ```
 
-Hatchet was also developed against a larger private Haxe game engine whose output is built on real
+Beyond the in-repo gate, [**anachrjsonistic**](https://github.com/andrewglind/anachrjsonistic) — a small,
+standalone C++98 JSON library — has been re-implemented in Haxe and transpiled with Hatchet. It is the
+end-to-end exercise for `abstract` types: the library's read cursor (a class with an `operator[]` and a
+spread of implicit conversion operators) is expressed as a Haxe `abstract` whose `@:op([])` and `@:to`
+methods lower to exactly those C++ operators, and its object/cursor pair reproduces the by-value type
+cycle a hand-written JSON header has to break. The same Haxe source compiles **both** under hxcpp and,
+via Hatchet, under `g++ -std=c++98` — and the transpiled library parses and reads values identically to
+the original C++.
+
+Hatchet was also developed against a larger private Haxe codebase whose output is built on real
 Visual C++ 6.0 / Windows 98 hardware; that project is the author's offline validation harness and is
 not part of the shipped test suite.
 
 ### The native boundary contract
 
-For `@:native` types — those whose implementation is provided by hand-written C++ — Hatchet **stays
-faithful to the Haxe names and never reads the C++ header**. It emits exactly what the Haxe code says
-(`x.data = …` for a Haxe field `data`), and it does not rewrite names to match a presumed native
-struct. If a Haxe `@:native` stub and its C++ definition disagree, the generated C++ simply fails to
-compile and the developer reconciles the two. This is the intended division of labour, not a
-transpiler limitation: the transpiler describes intent in Haxe terms, and the C++ compiler is the
-backstop that enforces agreement with the native side.
+For `extern` types — those whose implementation is provided by hand-written C++ — Hatchet **stays
+faithful to the Haxe names (as renamed by any `@:native`) and never reads the C++ header**. It emits
+exactly what the Haxe code says (`x.data = …` for a Haxe field `data`), and it does not rewrite names
+to match a presumed native struct. If an `extern` stub and its C++ definition disagree, the generated
+C++ simply fails to compile and the developer reconciles the two. This is the intended division of
+labour, not a transpiler limitation: the transpiler describes intent in Haxe terms, and the C++
+compiler is the backstop that enforces agreement with the native side.
 
 ## License
 

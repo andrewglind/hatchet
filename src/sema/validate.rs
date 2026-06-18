@@ -107,15 +107,39 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
     // other bare identifier in a pattern is a Haxe capture variable, which has no
     // lowering (it would be emitted as a bare C++ `case` label).
     let mut enums: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // `final` constants (module-level finals and static final fields), program-
+    // wide. A bare identifier in a `case` that names one is a *constant* pattern
+    // (it lowers to the namespaced const, a valid C++ case label), not a Haxe
+    // capture variable.
+    let mut finals: BTreeSet<String> = BTreeSet::new();
     for module in &prog.modules {
         for d in &module.file.decls {
-            if let Decl::Enum(e) = d {
-                enums.insert(e.name.clone(), e.variants.iter().map(|v| v.name.clone()).collect());
+            match d {
+                Decl::Enum(e) => {
+                    enums.insert(e.name.clone(), e.variants.iter().map(|v| v.name.clone()).collect());
+                }
+                Decl::Global(g) if g.is_final => {
+                    finals.insert(g.name.clone());
+                }
+                Decl::Class(c) => {
+                    for f in &c.fields {
+                        if f.is_static && f.is_final {
+                            finals.insert(f.name.clone());
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
     {
-        let mut w = UnsupportedWalker { file: file.clone(), line: 0, enums: &enums, out: &mut out };
+        let mut w = UnsupportedWalker {
+            file: file.clone(),
+            line: 0,
+            enums: &enums,
+            finals: &finals,
+            out: &mut out,
+        };
         for d in &m.file.decls {
             w.decl(d);
         }
@@ -137,6 +161,21 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
     for d in &m.file.decls {
         flag_properties(d, &file, &mut out);
     }
+    // `@:stackOnly` value classes: a value type cannot do C++ polymorphism
+    // (slicing through a base) or contain itself by value, so flag those shapes
+    // ahead of a confusing C++ error.
+    for d in &m.file.decls {
+        flag_stack_only(d, &file, &mut out);
+    }
+    // `@:op(...)` forms with no C++98 operator mapping (the 2-arg `[]` write,
+    // `a.b` field access, `a()` call, postfix `A++`) — flag rather than silently
+    // emit only the named method without the requested operator.
+    for d in &m.file.decls {
+        flag_unsupported_ops(d, &file, &mut out);
+    }
+    // `@:stackOnly` types may not be nested (hxcpp's stack-residence rule) — flag
+    // them used as field/element types, steering to an `abstract`.
+    flag_stack_restricted_nesting(prog, mi, &file, &mut out);
     // `using` static extensions rewrite `a.f(b)` into `Module.f(a, b)` at the call
     // site, chosen by `a`'s type. Hatchet has no such call-site rewriting, so a
     // `using` would be silently ignored — flag it rather than drop it.
@@ -214,7 +253,57 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
     for d in &m.file.decls {
         flag_rest_params(d, &file, &mut out);
     }
+    // `@proxy("native::Name")` interop glue — argument mandatory, only on an
+    // `abstract`/`abstract class`, and must name a declared `extern`.
+    for d in &m.file.decls {
+        flag_proxy(prog, d, &file, &mut out);
+    }
     out
+}
+
+/// Validate `@proxy("native::Name")` usage: the fully-qualified native C++
+/// class name is a mandatory string argument, it applies only to an `abstract`
+/// newtype or an `abstract class`, and it must name a type declared `extern` with
+/// a matching `@:native`. Each rule is a hard error rather than a silent mis-emit.
+fn flag_proxy(prog: &Program, d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
+    let (meta, line, kind_label): (&[Meta], usize, &str) = match d {
+        Decl::Class(c) => (&c.meta, c.line, "a class"),
+        Decl::Interface(i) => (&i.meta, i.line, "an interface"),
+        Decl::Enum(e) => (&e.meta, 0, "an enum"),
+        Decl::Typedef(t) => (&t.meta, 0, "a typedef"),
+        Decl::Global(g) => (&g.meta, 0, "a variable"),
+        _ => return,
+    };
+    let Some(m) = meta.iter().find(|m| m.name == "proxy") else { return };
+    // Only an `abstract Name(T)` newtype or an `abstract class` may be a proxy.
+    let abstract_form =
+        matches!(d, Decl::Class(c) if c.abstract_underlying.is_some() || c.is_abstract);
+    if !abstract_form {
+        out.push(Diagnostic::error(
+            file.to_string(),
+            line,
+            format!("`@proxy` is only valid on an `abstract` or `abstract class` (found on {kind_label})"),
+        ));
+        return;
+    }
+    // The fully-qualified native class name is mandatory.
+    let native = m.first_arg().unwrap_or("").trim();
+    if native.is_empty() {
+        out.push(Diagnostic::error(
+            file.to_string(),
+            line,
+            "`@proxy` requires the fully-qualified native C++ class name as a string argument, e.g. `@proxy(\"mucus::IScene\")`".to_string(),
+        ));
+        return;
+    }
+    // The native type must be declared as an `extern` with a matching `@:native`.
+    if prog.resolve_proxy_target(native).is_none() {
+        out.push(Diagnostic::error(
+            file.to_string(),
+            line,
+            format!("`@proxy(\"{native}\")` names a native type with no matching `extern` declaration (expected an `extern class` with `@:native(\"{native}\")`)"),
+        ));
+    }
 }
 
 /// Flag every rest parameter (`...vals`) declared in `d` as unsupported.
@@ -311,6 +400,128 @@ fn flag_macro_functions(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
 
 /// Flag every generic (type-parameterized) class, interface, method, or function
 /// declared in `d` as unsupported — Hatchet has no C++98 template lowering.
+/// Flag `@:stackOnly` (value-class) shapes C++ value semantics can't express:
+/// inheritance/`extends` (slicing — a value can't dispatch through a base), and
+/// a field that contains the class itself **by value** (an incomplete type; only
+/// a container of it, `Array<Self>`, is laid out as `std::vector<Self>`).
+/// Flag `@:op(...)` methods whose operator form has no C++98 mapping (so codegen
+/// would emit the named method but not the requested operator).
+fn flag_unsupported_ops(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
+    let Decl::Class(c) = d else { return };
+    for m in &c.methods {
+        let Some(arg) = m.meta.iter().find(|me| me.name == "op").and_then(|me| me.first_arg())
+        else {
+            continue;
+        };
+        if crate::codegen::cpp_operator(arg, m.params.len()).is_none() {
+            let who = m.name.clone().unwrap_or_else(|| "new".to_string());
+            out.push(Diagnostic::unsupported(
+                file.to_string(),
+                signature_line(m),
+                format!(
+                    "the `@:op({arg})` form on `{who}` (no C++98 operator mapping — supported: `[]` read, binary `A op B`, and prefix unary)"
+                ),
+            ));
+        }
+    }
+}
+
+fn flag_stack_only(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
+    let Decl::Class(c) = d else { return };
+    if !has_meta(&c.meta, "stackOnly") {
+        return;
+    }
+    // These two constraints are plain C++ facts about value types.
+    if c.extends.is_some() || !c.implements.is_empty() {
+        out.push(Diagnostic::unsupported(
+            file.to_string(),
+            c.line,
+            format!(
+                "inheritance on the value class `{}` (a value type cannot dispatch polymorphically — C++ object slicing)",
+                c.name
+            ),
+        ));
+    }
+    for f in &c.fields {
+        // a *direct* field of the class's own type is an incomplete-type member;
+        // through a container it is fine (`std::vector<Self>`).
+        if matches!(&f.ty, Some(Type::Named { path, params, .. })
+            if params.is_empty() && path.last().map(|s| s.as_str()) == Some(c.name.as_str()))
+        {
+            out.push(Diagnostic::unsupported(
+                file.to_string(),
+                type_line(f.ty.as_ref().unwrap()),
+                format!(
+                    "the by-value self-field `{}` on value class `{}` (a value type cannot contain itself; hold it in an `Array<{}>` or make the class a reference type)",
+                    f.name, c.name, c.name
+                ),
+            ));
+        }
+    }
+}
+
+/// Flag a `@:stackOnly` type used where it cannot live on the stack — as a field
+/// type, or as a container element type — because hxcpp forbids exactly this
+/// (stack-residence). The fix is an `abstract Name(U)` newtype, which is a value
+/// type that nests freely. Runs per module over its own declarations; the
+/// referenced type resolves cross-module.
+fn flag_stack_restricted_nesting(prog: &Program, mi: usize, file: &str, out: &mut Vec<Diagnostic>) {
+    // Does `ty` (directly, or as a container element) name a `@:stackOnly` type?
+    fn restricted_use<'a>(prog: &Program, mi: usize, ty: &'a Type) -> Option<&'a Type> {
+        let Type::Named { path, params, .. } = ty else { return None };
+        let name = path.last().map(|s| s.as_str()).unwrap_or("");
+        // `Array<T>`/`Map<K,V>` — recurse into the element/value types.
+        if container_template(name).is_some() {
+            return params.iter().find_map(|p| restricted_use(prog, mi, p));
+        }
+        if params.is_empty() && prog.is_stack_restricted(path, mi) {
+            return Some(ty);
+        }
+        None
+    }
+    let mut report = |ty: &Type, ctx: &str, name: &str| {
+        out.push(Diagnostic::unsupported(
+            file.to_string(),
+            type_line(ty),
+            format!(
+                "the `@:stackOnly` type `{name}` used {ctx} — hxcpp forbids a stack-only type from living off the stack; use an `abstract` newtype for a nestable value type",
+                name = name,
+            ),
+        ));
+    };
+    let m = &prog.modules[mi];
+    for d in &m.file.decls {
+        let fields: Vec<&Field> = match d {
+            Decl::Class(c) => c.fields.iter().collect(),
+            Decl::Interface(i) => i.fields.iter().collect(),
+            _ => Vec::new(),
+        };
+        for f in fields {
+            if let Some(t) = &f.ty {
+                if let Some(bad) = restricted_use(prog, mi, t) {
+                    let n = match bad {
+                        Type::Named { path, .. } => path.last().cloned().unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    report(bad, &format!("as the type of field `{}`", f.name), &n);
+                }
+            }
+        }
+        // typedef struct fields too
+        if let Decl::Typedef(Typedef { target: TypedefTarget::Struct(sfields), name: tn, .. }) = d {
+            for sf in sfields {
+                if let Some(bad) = restricted_use(prog, mi, &sf.ty) {
+                    let n = match bad {
+                        Type::Named { path, .. } => path.last().cloned().unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    report(bad, &format!("as the type of field `{}` in typedef `{tn}`", sf.name), &n);
+                }
+            }
+        }
+    }
+}
+
 fn flag_generics(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
     fn flag_fn(f: &Function, label: &str, file: &str, fallback: usize, out: &mut Vec<Diagnostic>) {
         if f.type_params.is_empty() {
@@ -487,6 +698,9 @@ struct UnsupportedWalker<'a> {
     line: usize,
     /// Enum name → member names, program-wide (see `unsupported_construct_errors`).
     enums: &'a BTreeMap<String, BTreeSet<String>>,
+    /// `final` constant names, program-wide — valid bare-identifier `case`
+    /// patterns (they lower to a namespaced const, a real C++ case label).
+    finals: &'a BTreeSet<String>,
     out: &'a mut Vec<Diagnostic>,
 }
 
@@ -527,17 +741,22 @@ impl<'a> UnsupportedWalker<'a> {
                 matches!(&**expr, Expr::Int(_) | Expr::Float(_))
             }
             Expr::Paren(inner) => self.pattern_supported(inner),
-            // A bare identifier is a constant pattern only when it names a known
-            // enum member; in Haxe anything else is a capture variable.
-            Expr::Ident(name) => self.enums.values().any(|vs| vs.contains(name)),
-            // `EnumType.Member` (possibly package-qualified: `pack.EnumType.Member`).
+            // A bare identifier is a constant pattern when it names a known enum
+            // member or a `final` constant (both lower to a valid C++ case
+            // label); anything else is a Haxe capture variable.
+            Expr::Ident(name) => {
+                self.finals.contains(name) || self.enums.values().any(|vs| vs.contains(name))
+            }
+            // `EnumType.Member` (possibly package-qualified: `pack.EnumType.Member`),
+            // or a qualified `final` constant (`pack.CONST` / `Class.CONST`).
             Expr::Field(recv, member) => {
                 let ty = match &**recv {
                     Expr::Ident(t) => Some(t.as_str()),
                     Expr::Field(_, t) => Some(t.as_str()),
                     _ => None,
                 };
-                ty.and_then(|t| self.enums.get(t)).is_some_and(|vs| vs.contains(member))
+                self.finals.contains(member)
+                    || ty.and_then(|t| self.enums.get(t)).is_some_and(|vs| vs.contains(member))
             }
             _ => false,
         }
@@ -892,6 +1111,8 @@ impl Collector {
                 let known = map_primitive(name).is_some()
                     || container_template(name).is_some()
                     || name == "Null"
+                    // `cpp.Pointer<T>` lowers to `T*`; its param is still checked below.
+                    || name == "Pointer"
                     || matches!(name, "Dynamic" | "Any")
                     || self.type_params.contains(name);
                 if !known {
