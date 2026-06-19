@@ -37,7 +37,12 @@ pub struct Diagnostic {
 impl Diagnostic {
     /// A developer-facing error (wrong/incomplete input).
     pub fn error(file: impl Into<String>, line: usize, message: impl Into<String>) -> Self {
-        Diagnostic { file: file.into(), line, severity: Severity::Error, message: message.into() }
+        Diagnostic {
+            file: file.into(),
+            line,
+            severity: Severity::Error,
+            message: message.into(),
+        }
     }
 
     /// A not-yet-supported Haxe idiom. `feature` should read as a noun phrase, as

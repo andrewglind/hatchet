@@ -81,7 +81,10 @@ pub(crate) fn analyze<'a>(
         match arg {
             // A pre-super local passed straight to super → lift it to a member.
             Expr::Ident(n) if is_local(n) => {
-                let ty = local_ty.iter().find(|(ln, _)| ln == n).and_then(|(_, t)| t.as_ref());
+                let ty = local_ty
+                    .iter()
+                    .find(|(ln, _)| ln == n)
+                    .and_then(|(_, t)| t.as_ref());
                 let cpp = match ty {
                     Some(t) => prog.map_type_use(t, mi, ns),
                     None => return None, // can't type the member → bail to default path

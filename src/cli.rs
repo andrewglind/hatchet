@@ -16,6 +16,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+use crate::ast::Decl;
 use crate::sema::{Module, Program};
 use crate::{codegen, diag, discover, parser, sema, stdafx};
 
@@ -36,6 +37,14 @@ pub struct Args {
     /// file's project root is inferred from its `package` declaration.
     #[arg(short, long, value_name = "PATH", num_args = 1..)]
     pub src: Vec<PathBuf>,
+
+    /// Resolve-only Haxe input(s): `extern`/`@:native` stub files (or directories /
+    /// globs) brought into scope so the `--src` files' native references resolve and
+    /// their `@:include` headers propagate — but **never transpiled**. The Haxe
+    /// equivalent of passing a C/C++ header for resolution; like `--src`, accepts
+    /// files, directories, or globs, and may be repeated.
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    pub include: Vec<PathBuf>,
 
     /// Output directory for generated .h/.cpp (defaults to the inferred project
     /// root, so files are produced alongside their Haxe sources). Ignored with
@@ -78,6 +87,14 @@ pub struct Args {
     /// / `API_CALL` (defined in the prelude). Defaults to `HATCHET`.
     #[arg(long, default_value = "HATCHET")]
     pub export_macro: String,
+
+    /// Amalgamate all `--src` content into one self-contained header `<NAME>.h`
+    /// (a trailing `.h` is stripped): the prelude is inlined, every class is emitted
+    /// with inline bodies, and no `.cpp` or separate prelude header is produced — a
+    /// drop-in single-header library. Resolve-only `--include` stubs are not folded
+    /// in (only their `@:include`s are hoisted).
+    #[arg(long, value_name = "NAME")]
+    pub header_only: Option<String>,
 }
 
 /// Where generated C++ goes.
@@ -108,8 +125,12 @@ pub struct Config {
     /// Inferred project root (the files' directory minus their package path). Used
     /// as the base for the output layout and relative includes.
     pub root_dir: PathBuf,
-    /// The explicit `.hx` files to transpile — also the entire resolution scope.
+    /// The explicit `.hx` files to transpile. These plus `include_files` form the
+    /// entire resolution scope.
     pub files: Vec<PathBuf>,
+    /// Resolve-only `.hx` files (from `--include`): parsed for their `extern`/
+    /// `@:native` declarations and native `@:include`s, but never transpiled.
+    pub include_files: Vec<PathBuf>,
     /// Output directory (used in `Files` mode only).
     pub out_dir: PathBuf,
     pub force: bool,
@@ -122,6 +143,9 @@ pub struct Config {
     pub stdafx_stem: String,
     /// Prefix for the platform export/calling-convention macros (default `HATCHET`).
     pub export_macro: String,
+    /// When `Some(stem)`, amalgamate all `--src` content into a single self-contained
+    /// `<stem>.h` (the `--header-only` flag, trailing `.h` stripped).
+    pub header_only: Option<String>,
 }
 
 impl Config {
@@ -144,18 +168,33 @@ fn run(args: Args) -> Result<(), String> {
     // must therefore be reachable in that set, or its references will not resolve.
     cfg.info(&format!("Transpiling {} Haxe file(s).", cfg.files.len()));
 
-    // Parse everything, keeping the raw source alongside (StdAfx needs it).
+    // Parse everything, keeping the raw source alongside (StdAfx needs it). The
+    // `--src` files come first, then the resolve-only `--include` files; `module`
+    // order mirrors `units` order, so the trailing `include_files.len()` modules are
+    // exactly the resolve-only ones (marked `is_include` below).
     let mut units = Vec::new();
     let mut sources = Vec::new();
-    for hx in &cfg.files {
-        let src = std::fs::read_to_string(hx).map_err(|e| format!("reading {}: {e}", hx.display()))?;
+    for hx in cfg.files.iter().chain(cfg.include_files.iter()) {
+        let src =
+            std::fs::read_to_string(hx).map_err(|e| format!("reading {}: {e}", hx.display()))?;
         let file = parser::parse(&src).map_err(|e| format!("{}: {e}", hx.display()))?;
         units.push((hx.clone(), file));
         sources.push(src);
     }
 
     let mut prog = Program::build_with(&cfg.root_dir, units, &cfg.stdafx_stem);
+    for m in prog.modules.iter_mut().skip(cfg.files.len()) {
+        m.is_include = true;
+    }
     prog.export_macro = cfg.export_macro.clone();
+    prog.no_trace = cfg.no_traces;
+    prog.extract_depth = cfg.extract_depth;
+    if !cfg.include_files.is_empty() {
+        cfg.info(&format!(
+            "{} resolve-only file(s) from --include.",
+            cfg.include_files.len()
+        ));
+    }
     // When writing files somewhere other than in-place, re-base includes that
     // escape the generated tree (the external engine / sibling projects) onto the
     // real output location, so `--out <anywhere>` resolves rather than only an
@@ -187,89 +226,203 @@ fn run(args: Args) -> Result<(), String> {
     // Modules actually run through codegen (everything but the never-emitted
     // `Main.hx` / `StdAfx.hx`), for a `[i/N] file` progress line per module so a
     // large run visibly makes progress rather than appearing to hang.
-    let total = prog
-        .modules
-        .iter()
-        .filter(|m| !discover::is_main(&m.path) && !m.is_stdafx)
-        .count();
-    let mut processed = 0usize;
-    for (i, m) in prog.modules.iter().enumerate() {
-        // `Main.hx` is the hxcpp entry point and is never transpiled; `StdAfx.hx`
-        // is never emitted directly (the StdAfx pass produces the prelude header
-        // for every directory that gets one).
-        if discover::is_main(&m.path) || m.is_stdafx {
-            continue;
-        }
-        // Announce the module before generating it, so a crash or a slow file is
-        // attributable to the one named here.
-        processed += 1;
-        cfg.info(&format!("[{processed}/{total}] {}", module_rel(m, "hx")));
-
-        // Fail loudly rather than guess: a module that references a type Hatchet
-        // cannot resolve — or uses a construct Hatchet does not yet support — is not
-        // generated (its output would be silently wrong or non-compiling). Clean
-        // modules are still emitted; the run fails at the end.
-        let mut module_errors = sema::validate::unresolved_type_errors(&prog, i);
-        module_errors.extend(sema::validate::unsupported_construct_errors(&prog, i));
-        if !module_errors.is_empty() {
-            errors.extend(module_errors);
-            continue;
-        }
-
-        // Generate the body first: a "do not guess" error found during body
-        // generation (an overloaded call matching no @:overload signature) needs
-        // expression-type inference, so it surfaces here rather than in sema.
-        // Treat it like a sema error — collect it and skip the whole module
-        // (header included) rather than emit a half-written pair.
-        let source = codegen::generate_source_diagnostics(&prog, i, cfg.extract_depth, cfg.no_traces);
-        if let Some((_, _, body_errors)) = &source {
-            if !body_errors.is_empty() {
-                let rel = m.path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                for (line, e) in body_errors {
-                    errors.push(diag::Diagnostic::error(rel, *line, e.clone()));
-                }
+    if cfg.header_only.is_none() {
+        let total = prog
+            .modules
+            .iter()
+            .filter(|m| !discover::is_main(&m.path) && !m.is_stdafx && !m.is_include)
+            .count();
+        let mut processed = 0usize;
+        for (i, m) in prog.modules.iter().enumerate() {
+            // `Main.hx` is the hxcpp entry point and is never transpiled; `StdAfx.hx`
+            // is never emitted directly (the StdAfx pass produces the prelude header
+            // for every directory that gets one); `--include` stubs are resolve-only.
+            if discover::is_main(&m.path) || m.is_stdafx || m.is_include {
                 continue;
             }
-        }
+            // Announce the module before generating it, so a crash or a slow file is
+            // attributable to the one named here.
+            processed += 1;
+            cfg.info(&format!("[{processed}/{total}] {}", module_rel(m, "hx")));
 
-        if let Some(header) = codegen::generate_header(&prog, i) {
-            emit_artifact(&cfg, &out_module_path(&cfg, m, "h"), &module_rel(m, "h"), &header, &mut emitted)?;
-            header_dirs.insert(m.dir.clone(), m.package.clone());
-        }
-        if let Some((source, warnings, _)) = source {
-            emit_artifact(&cfg, &out_module_path(&cfg, m, "cpp"), &module_rel(m, "cpp"), &source, &mut emitted)?;
-            let rel = m.path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            for (line, w) in warnings {
-                if line > 0 {
-                    eprintln!("warning: {rel}:{line}: {w}");
-                } else {
-                    eprintln!("warning: {rel}: {w}");
+            // Fail loudly rather than guess: a module that references a type Hatchet
+            // cannot resolve — or uses a construct Hatchet does not yet support — is not
+            // generated (its output would be silently wrong or non-compiling). Clean
+            // modules are still emitted; the run fails at the end.
+            let mut module_errors = sema::validate::unresolved_type_errors(&prog, i);
+            module_errors.extend(sema::validate::unsupported_construct_errors(&prog, i));
+            if !module_errors.is_empty() {
+                errors.extend(module_errors);
+                continue;
+            }
+
+            // Generate the body first: a "do not guess" error found during body
+            // generation (an overloaded call matching no @:overload signature) needs
+            // expression-type inference, so it surfaces here rather than in sema.
+            // Treat it like a sema error — collect it and skip the whole module
+            // (header included) rather than emit a half-written pair.
+            let source =
+                codegen::generate_source_diagnostics(&prog, i, cfg.extract_depth, cfg.no_traces);
+            if let Some((_, _, body_errors)) = &source {
+                if !body_errors.is_empty() {
+                    let rel = m.path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    for (line, e) in body_errors {
+                        errors.push(diag::Diagnostic::error(rel, *line, e.clone()));
+                    }
+                    continue;
+                }
+            }
+
+            // Honour this module's own `@:headerCode` (verbatim), injected into its
+            // header after the includes — the per-module generalisation of the
+            // prelude's `@:headerCode`, matching hxcpp.
+            let header_opts = codegen::HeaderOpts {
+                header_code: stdafx::extract_header_code(&sources[i])
+                    .map(|h| h.replace("\r\n", "\n").replace('\r', "\n")),
+                ..codegen::HeaderOpts::default()
+            };
+            if let Some((header, _, _)) = codegen::generate_header_with(&prog, i, &header_opts) {
+                emit_artifact(
+                    &cfg,
+                    &out_module_path(&cfg, m, "h"),
+                    &module_rel(m, "h"),
+                    &header,
+                    &mut emitted,
+                )?;
+                header_dirs.insert(m.dir.clone(), m.package.clone());
+            }
+            if let Some((source, warnings, _)) = source {
+                emit_artifact(
+                    &cfg,
+                    &out_module_path(&cfg, m, "cpp"),
+                    &module_rel(m, "cpp"),
+                    &source,
+                    &mut emitted,
+                )?;
+                let rel = m.path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                for (line, w) in warnings {
+                    if line > 0 {
+                        eprintln!("warning: {rel}:{line}: {w}");
+                    } else {
+                        eprintln!("warning: {rel}: {w}");
+                    }
                 }
             }
         }
-    }
 
-    // StdAfx pass: one prelude header per directory that received a header,
-    // merging that directory's prelude-source `@:headerCode` (if any) with Hatchet's
-    // required includes. The file name follows the configured stem.
-    let stdafx_file = format!("{}.h", cfg.stdafx_stem);
-    for (dir, package) in &header_dirs {
-        let header_code = stdafx_src.get(dir).and_then(|&i| {
-            stdafx::extract_header_code(&sources[i]).map(|h| h.replace("\r\n", "\n").replace('\r', "\n"))
-        });
-        let content =
-            stdafx::content_for(&cfg.stdafx_stem, header_code.as_deref(), package, &cfg.export_macro);
-        let mut out_path = cfg.out_dir.clone();
-        for part in dir {
-            out_path.push(part);
+        // StdAfx pass: one prelude header per directory that received a header,
+        // merging that directory's prelude-source `@:headerCode` (if any) with Hatchet's
+        // required includes. The file name follows the configured stem.
+        let stdafx_file = format!("{}.h", cfg.stdafx_stem);
+        for (dir, package) in &header_dirs {
+            let header_code = stdafx_src.get(dir).and_then(|&i| {
+                stdafx::extract_header_code(&sources[i])
+                    .map(|h| h.replace("\r\n", "\n").replace('\r', "\n"))
+            });
+            let content = stdafx::content_for(
+                &cfg.stdafx_stem,
+                header_code.as_deref(),
+                package,
+                &cfg.export_macro,
+            );
+            let mut out_path = cfg.out_dir.clone();
+            for part in dir {
+                out_path.push(part);
+            }
+            out_path.push(&stdafx_file);
+            let label = if dir.is_empty() {
+                stdafx_file.clone()
+            } else {
+                format!("{}/{stdafx_file}", dir.join("/"))
+            };
+            emit_artifact(&cfg, &out_path, &label, &content, &mut emitted)?;
         }
-        out_path.push(&stdafx_file);
-        let label = if dir.is_empty() {
-            stdafx_file.clone()
-        } else {
-            format!("{}/{stdafx_file}", dir.join("/"))
-        };
-        emit_artifact(&cfg, &out_path, &label, &content, &mut emitted)?;
+    } else {
+        // `--header-only <stem>`: amalgamate every `--src` content module into one
+        // self-contained `<stem>.h` (prelude inlined, inline bodies, no `.cpp`/StdAfx).
+        let stem = cfg.header_only.clone().unwrap();
+        let indices: Vec<usize> = prog
+            .modules
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                !discover::is_main(&m.path)
+                    && !m.is_stdafx
+                    && !m.is_include
+                    && prog.generates_header(m)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        cfg.info(&format!(
+            "Amalgamating {} module(s) into {stem}.h.",
+            indices.len()
+        ));
+
+        // Validate each module, and reject constructs that need a `.cpp` to hold
+        // their definition (module-level free functions / `@:abi` exports), which
+        // would otherwise link-fail in a header-only build.
+        for &i in &indices {
+            let m = &prog.modules[i];
+            let rel = m
+                .path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let mut me = sema::validate::unresolved_type_errors(&prog, i);
+            me.extend(sema::validate::unsupported_construct_errors(&prog, i));
+            for d in &m.file.decls {
+                let is_fn = matches!(d, Decl::Function(f) if f.body.is_some() && !f.modifiers.is_macro)
+                    || matches!(d, Decl::Global(g) if codegen::source::is_free_fn_global(g));
+                if is_fn {
+                    me.push(diag::Diagnostic::error(
+                        &rel,
+                        0,
+                        "module-level functions are not yet supported in --header-only mode \
+                         (there is no .cpp to define them)"
+                            .to_string(),
+                    ));
+                }
+            }
+            errors.extend(me);
+        }
+
+        if errors.is_empty() {
+            // The prelude is synthesized, merging any in-scope StdAfx.hx `@:headerCode`.
+            let stdafx_hc = prog
+                .modules
+                .iter()
+                .enumerate()
+                .find(|(_, m)| m.is_stdafx)
+                .and_then(|(i, _)| stdafx::extract_header_code(&sources[i]))
+                .map(|h| h.replace("\r\n", "\n").replace('\r', "\n"));
+            let prelude = stdafx::prelude_body(stdafx_hc.as_deref(), &cfg.export_macro);
+            let mut header_codes: std::collections::BTreeMap<usize, String> =
+                std::collections::BTreeMap::new();
+            for &i in &indices {
+                if let Some(hc) = stdafx::extract_header_code(&sources[i]) {
+                    header_codes.insert(i, hc.replace("\r\n", "\n").replace('\r', "\n"));
+                }
+            }
+            let (content, warnings, body_errors) =
+                codegen::generate_amalgamation(&prog, &stem, &indices, &prelude, &header_codes);
+            let label = format!("{stem}.h");
+            if !body_errors.is_empty() {
+                for (line, e) in body_errors {
+                    errors.push(diag::Diagnostic::error(&label, line, e));
+                }
+            } else {
+                let out_path = cfg.out_dir.join(&label);
+                emit_artifact(&cfg, &out_path, &label, &content, &mut emitted)?;
+                for (line, w) in warnings {
+                    if line > 0 {
+                        eprintln!("warning: {label}:{line}: {w}");
+                    } else {
+                        eprintln!("warning: {label}: {w}");
+                    }
+                }
+            }
+        }
     }
 
     let verb = match cfg.mode {
@@ -289,8 +442,12 @@ fn run(args: Args) -> Result<(), String> {
         eprintln!();
         let n = diag::report(&errors);
         let skipped = errors_module_count(&errors);
-        cfg.info(&format!("\n{verb} {emitted} file(s){location}; {skipped} module(s) skipped due to errors."));
-        return Err(format!("{n} error(s); {skipped} module(s) were not generated"));
+        cfg.info(&format!(
+            "\n{verb} {emitted} file(s){location}; {skipped} module(s) skipped due to errors."
+        ));
+        return Err(format!(
+            "{n} error(s); {skipped} module(s) were not generated"
+        ));
     }
 
     cfg.info(&format!("\n{verb} {emitted} file(s){location}."));
@@ -325,7 +482,11 @@ fn emit_artifact(
 /// A module's generated file path relative to the source tree, e.g.
 /// `modules/Vertex.h` — used as the stdout banner / dry-run label.
 fn module_rel(m: &Module, ext: &str) -> String {
-    let stem = m.path.file_stem().and_then(|s| s.to_str()).unwrap_or("Module");
+    let stem = m
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Module");
     let file = format!("{stem}.{ext}");
     if m.dir.is_empty() {
         file
@@ -440,7 +601,10 @@ fn resolve_config(args: Args) -> Result<Config, String> {
             // Main.hx is the hxcpp entry point and is never transpiled; a crawl or
             // glob may sweep it in, so drop it rather than erroring.
             if discover::is_main(&p) {
-                info(&format!("Skipping {} (Main.hx is never transpiled).", p.display()));
+                info(&format!(
+                    "Skipping {} (Main.hx is never transpiled).",
+                    p.display()
+                ));
                 continue;
             }
             if seen.insert(p.clone()) {
@@ -452,12 +616,30 @@ fn resolve_config(args: Args) -> Result<Config, String> {
         return Err("no transpilable .hx files given".to_string());
     }
 
+    // Resolve-only inputs (`--include`): expanded the same way as `--src`, but kept
+    // separate so they are parsed for resolution yet never transpiled. A path given
+    // to both `--src` and `--include` stays a transpile target (the shared `seen`
+    // set already holds the `--src` files, so it is skipped here).
+    let mut include_files = Vec::new();
+    for arg in &args.include {
+        for p in expand_input(arg)? {
+            let p = canonical(&p)?;
+            if discover::is_main(&p) {
+                continue;
+            }
+            if seen.insert(p.clone()) {
+                include_files.push(p);
+            }
+        }
+    }
+
     // The project root is inferred from each file's `package` declaration — its
     // directory minus its package path. All files must agree on one root (a single
     // project per invocation), which anchors the output layout and relative includes.
     let mut root_dir: Option<PathBuf> = None;
     for f in &files {
-        let src = std::fs::read_to_string(f).map_err(|e| format!("reading {}: {e}", f.display()))?;
+        let src =
+            std::fs::read_to_string(f).map_err(|e| format!("reading {}: {e}", f.display()))?;
         let r = infer_root(f, &crate::scan::package_parts(&src));
         match &root_dir {
             None => root_dir = Some(r),
@@ -472,9 +654,9 @@ fn resolve_config(args: Args) -> Result<Config, String> {
             _ => {}
         }
     }
-    
+
     let root_dir = root_dir.expect("at least one file present");
-    
+
     // The output directory is only meaningful when writing files; it defaults to
     // the inferred project root, so generated files land beside their sources.
     let out_dir = if mode == OutputMode::Files {
@@ -482,7 +664,10 @@ fn resolve_config(args: Args) -> Result<Config, String> {
             Some(p) => p,
             None => {
                 let def = root_dir.display().to_string();
-                PathBuf::from(prompt("Enter the target directory for generated files", Some(&def)))
+                PathBuf::from(prompt(
+                    "Enter the target directory for generated files",
+                    Some(&def),
+                ))
             }
         };
         std::fs::create_dir_all(&out).map_err(|e| format!("creating {}: {e}", out.display()))?;
@@ -493,16 +678,36 @@ fn resolve_config(args: Args) -> Result<Config, String> {
 
     let stdafx_stem = {
         let s = args.stdafx.trim();
-        if s.is_empty() { "StdAfx".to_string() } else { s.to_string() }
+        if s.is_empty() {
+            "StdAfx".to_string()
+        } else {
+            s.to_string()
+        }
     };
     let export_macro = {
         let s = args.export_macro.trim();
-        if s.is_empty() { "HATCHET".to_string() } else { s.to_string() }
+        if s.is_empty() {
+            "HATCHET".to_string()
+        } else {
+            s.to_string()
+        }
     };
+    // The header-only output name: trim and strip a redundant `.h` so `--header-only
+    // Json` and `--header-only Json.h` both yield the stem `Json`.
+    let header_only = args.header_only.as_ref().and_then(|s| {
+        let s = s.trim();
+        let s = s.strip_suffix(".h").unwrap_or(s);
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    });
 
     Ok(Config {
         root_dir,
         files,
+        include_files,
         out_dir,
         force: args.force,
         extract_depth: args.depth.max(1),
@@ -510,6 +715,7 @@ fn resolve_config(args: Args) -> Result<Config, String> {
         mode,
         stdafx_stem,
         export_macro,
+        header_only,
     })
 }
 
@@ -518,7 +724,11 @@ fn resolve_config(args: Args) -> Result<Config, String> {
 /// Output path for a module's generated file (`ext` = "h" or "cpp"), mirroring
 /// the source tree.
 fn out_module_path(cfg: &Config, m: &Module, ext: &str) -> PathBuf {
-    let stem = m.path.file_stem().and_then(|s| s.to_str()).unwrap_or("Module");
+    let stem = m
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Module");
     let mut p = cfg.out_dir.clone();
     for part in &m.dir {
         p.push(part);
@@ -529,7 +739,8 @@ fn out_module_path(cfg: &Config, m: &Module, ext: &str) -> PathBuf {
 
 fn write_file(path: &Path, content: &str, force: bool) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
     }
     if path.exists() && !force {
         return Err(format!(

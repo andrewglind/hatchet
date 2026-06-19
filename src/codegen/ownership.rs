@@ -26,7 +26,8 @@ pub(crate) fn owned_deletes(prog: &Program, mi: usize, ns: &[String], c: &Class)
             continue;
         }
         let Some(ty) = &f.ty else { continue };
-        if let Some(depth) = crate::sema::escape::container_depth_if_pointer_leaf(prog, mi, ns, ty) {
+        if let Some(depth) = crate::sema::escape::container_depth_if_pointer_leaf(prog, mi, ns, ty)
+        {
             emit_container_delete(&f.name, depth, &mut deletes);
         } else if prog.map_type_use(ty, mi, ns).ends_with('*') {
             deletes.push(format!("delete this->{};", f.name));
@@ -95,13 +96,24 @@ fn base_void_forward(prog: &Program, mi: usize, c: &Class) -> Option<Forward> {
     for (i, arg) in super_args.iter().enumerate() {
         let Expr::Ident(pname) = arg else { continue };
         // Subclass parameter of type `Null<T>`?
-        let Some(param) = ctor.params.iter().find(|p| &p.name == pname) else { continue };
-        let Some(inner) = null_inner(&param.ty) else { continue };
+        let Some(param) = ctor.params.iter().find(|p| &p.name == pname) else {
+            continue;
+        };
+        let Some(inner) = null_inner(&param.ty) else {
+            continue;
+        };
         // Base constructor parameter at this position → the field it stores into.
-        let Some(base_param) = base_ctor.params.get(i) else { continue };
-        let Some(field) = base_ctor_field_for(base_ctor, &base_param.name) else { continue };
+        let Some(base_param) = base_ctor.params.get(i) else {
+            continue;
+        };
+        let Some(field) = base_ctor_field_for(base_ctor, &base_param.name) else {
+            continue;
+        };
         if base_field_is_void(base_class, &field) {
-            return Some(Forward { inner, base_field: field });
+            return Some(Forward {
+                inner,
+                base_field: field,
+            });
         }
     }
     None
@@ -123,7 +135,14 @@ fn null_inner(ty: &Option<Type>) -> Option<Type> {
 fn base_ctor_field_for(ctor: &Function, param: &str) -> Option<String> {
     let body = ctor.body.as_ref()?;
     body.iter().find_map(|st| match st {
-        Stmt::Expr(Expr::Assign { op: None, target, value }, _) => {
+        Stmt::Expr(
+            Expr::Assign {
+                op: None,
+                target,
+                value,
+            },
+            _,
+        ) => {
             if let (Expr::Field(recv, field), Expr::Ident(p)) = (&**target, &**value) {
                 if matches!(**recv, Expr::This) && p == param {
                     return Some(field.clone());
@@ -142,7 +161,10 @@ fn base_field_is_void(c: &Class, field: &str) -> bool {
             && match &f.ty {
                 Some(Type::Anon(fields)) => fields.is_empty(),
                 Some(Type::Named { path, .. }) => {
-                    matches!(path.last().map(|s| s.as_str()), Some("Dynamic") | Some("Any"))
+                    matches!(
+                        path.last().map(|s| s.as_str()),
+                        Some("Dynamic") | Some("Any")
+                    )
                 }
                 _ => false,
             }

@@ -21,6 +21,39 @@ pub use source::{generate_source, generate_source_diagnostics};
 /// Generate the header text for the module at `module_index`, or `None` if it
 /// does not produce a header (pure `@:native` interop, `StdAfx`, or empty).
 pub fn generate_header(prog: &Program, module_index: usize) -> Option<String> {
+    generate_header_with(prog, module_index, &HeaderOpts::default()).map(|(s, _, _)| s)
+}
+
+/// Diagnostics raised while generating a header — `(warnings, errors)`, each paired
+/// with its source line. Non-empty only when `inline_bodies` is set (the bodies are
+/// generated here instead of in a `.cpp`); see [`HeaderOpts`].
+pub type HeaderOutput = (String, Vec<(usize, String)>, Vec<(usize, String)>);
+
+/// Knobs for header-only / amalgamated emission. All-default reproduces the normal
+/// per-module header (declarations only, separate prelude `#include`, no inline
+/// bodies), so existing callers are unaffected.
+#[derive(Default, Clone)]
+pub struct HeaderOpts {
+    /// When set, the prelude body is inlined at the top of the header and the
+    /// separate prelude `#include` (`StdAfx.h`) is omitted — a self-contained header.
+    pub inline_prelude: Option<String>,
+    /// Emit each class's constructor/method **bodies** inline (`inline Ret
+    /// Class::m(){…}`) in the header, so no `.cpp` is needed. Diagnostics from body
+    /// generation are returned via [`HeaderOutput`].
+    pub inline_bodies: bool,
+    /// Verbatim `@:headerCode` injected after the `#include`s and before the
+    /// declarations (the per-module generalisation of the prelude's `@:headerCode`).
+    pub header_code: Option<String>,
+    /// Override the include-guard / naming stem (the amalgamation uses the chosen
+    /// `--header-only` name rather than the module's own file stem).
+    pub guard_stem: Option<String>,
+}
+
+pub fn generate_header_with(
+    prog: &Program,
+    module_index: usize,
+    opts: &HeaderOpts,
+) -> Option<HeaderOutput> {
     let m = &prog.modules[module_index];
     if m.is_stdafx || !prog.generates_header(m) {
         return None;
@@ -29,14 +62,322 @@ pub fn generate_header(prog: &Program, module_index: usize) -> Option<String> {
         prog,
         mi: module_index,
         ns: m.package.clone(),
+        opts,
     };
     Some(gen.build())
+}
+
+/// Amalgamate every module in `indices` (the `--src` set, in order) into one
+/// self-contained header (`--header-only <stem>`): a single include guard, the
+/// prelude inlined, native `@:include`s hoisted + de-duplicated, a global forward-
+/// declaration block (so reference-type cross-references between modules resolve
+/// regardless of section order), then each module's section — its `@:headerCode`
+/// followed by its declarations with inline constructor/method bodies. No `.cpp`
+/// and no separate prelude header are produced. `header_codes` maps a module index
+/// to its verbatim `@:headerCode`.
+pub fn generate_amalgamation(
+    prog: &Program,
+    stem: &str,
+    indices: &[usize],
+    prelude_body: &str,
+    header_codes: &std::collections::BTreeMap<usize, String>,
+) -> HeaderOutput {
+    // Declarations only here; the inline bodies are emitted in a separate second
+    // pass (see below), so `inline_bodies` stays off for the per-module sections.
+    let opts = HeaderOpts::default();
+    let guard = format!("{}_H", sanitize(&stem.to_uppercase()));
+    let mut out = String::new();
+    let mut warnings: Vec<(usize, String)> = Vec::new();
+    let mut errors: Vec<(usize, String)> = Vec::new();
+
+    // Order the modules so any type a module needs *complete* — a base class it
+    // extends/implements, or a value (non-pointer) field/underlying — has its
+    // defining module emitted first. Reference-type (pointer) cross-references do not
+    // constrain the order (the forward-declaration block satisfies them).
+    let (order, cycle) = amalgam_order(prog, indices);
+    if let Some(msg) = cycle {
+        errors.push((0, msg));
+    }
+
+    let _ = writeln!(out, "#ifndef {guard}");
+    let _ = writeln!(out, "#define {guard}");
+    out.push('\n');
+
+    // The prelude (shim, standard includes, export macros) inlined once at the top.
+    out.push_str(prelude_body.trim_end());
+    out.push_str("\n\n");
+
+    // Native `@:include`s from every module, de-duplicated, hoisted to the top.
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut inc_block = String::new();
+    for &mi in &order {
+        for inc in prog.native_includes(mi) {
+            if !seen.insert(inc.clone()) {
+                continue;
+            }
+            if inc.starts_with('<') {
+                let _ = writeln!(inc_block, "#include {inc}");
+            } else {
+                let _ = writeln!(inc_block, "#include \"{inc}\"");
+            }
+        }
+    }
+    if !inc_block.is_empty() {
+        out.push_str(&inc_block);
+        out.push('\n');
+    }
+
+    out.push_str(&amalgam_forward_decls(prog, &order));
+
+    // Pass 1 — every module's declarations (its `@:headerCode`, then enums /
+    // typedefs / interfaces / class declarations), with no method bodies yet.
+    for &mi in &order {
+        let m = &prog.modules[mi];
+        if let Some(hc) = header_codes.get(&mi) {
+            out.push_str(hc.trim_matches('\n'));
+            out.push_str("\n\n");
+        }
+        let gen = HeaderGen {
+            prog,
+            mi,
+            ns: m.package.clone(),
+            opts: &opts,
+        };
+        let (sect, _, _) = gen.section();
+        out.push_str(&sect);
+    }
+
+    // Pass 2 — every module's inline constructor/method definitions, emitted after
+    // *all* declarations so a body that uses a value or member of a class from
+    // another module sees that class's complete definition, not just a forward
+    // declaration. (Cross-module reference-type pointers were already satisfied by
+    // the forward-declaration block; this covers by-value use and member access.)
+    for &mi in &order {
+        let m = &prog.modules[mi];
+        let gen = HeaderGen {
+            prog,
+            mi,
+            ns: m.package.clone(),
+            opts: &opts,
+        };
+        let (defs, mut w, mut e) = gen.inline_defs_section();
+        out.push_str(&defs);
+        warnings.append(&mut w);
+        errors.append(&mut e);
+    }
+
+    let _ = writeln!(out, "#endif");
+    (out, warnings, errors)
+}
+
+/// The global forward-declaration block for an amalgamation: every emittable class /
+/// interface / ADT-enum name, grouped under its package namespace. `@:native`-renamed
+/// types are skipped — their real definition lives in a hoisted engine header.
+fn amalgam_forward_decls(prog: &Program, indices: &[usize]) -> String {
+    let mut by_ns: std::collections::BTreeMap<Vec<String>, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for &mi in indices {
+        let m = &prog.modules[mi];
+        let names = by_ns.entry(m.package.clone()).or_default();
+        for d in &m.file.decls {
+            let name = match d {
+                Decl::Class(c)
+                    if !c.is_extern
+                        && !has_meta(&c.meta, "proxy")
+                        && !has_meta(&c.meta, "native") =>
+                {
+                    Some(&c.name)
+                }
+                Decl::Interface(i) if !i.is_extern && !has_meta(&i.meta, "native") => Some(&i.name),
+                Decl::Enum(e) if e.is_adt() && !has_meta(&e.meta, "native") => Some(&e.name),
+                _ => None,
+            };
+            if let Some(n) = name {
+                if !names.contains(n) {
+                    names.push(n.clone());
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    let mut any = false;
+    for (ns, names) in &by_ns {
+        if names.is_empty() {
+            continue;
+        }
+        any = true;
+        let base = ns.len();
+        for part in ns {
+            let _ = writeln!(out, "namespace {part} {{");
+        }
+        for n in names {
+            let _ = writeln!(out, "{}class {n};", tabs(base));
+        }
+        for _ in ns.iter().rev() {
+            let _ = writeln!(out, "}}");
+        }
+    }
+    if any {
+        out.push('\n');
+    }
+    out
+}
+
+/// Order the amalgamated modules so that whenever one module needs a type from
+/// another **complete** — a base class (`extends`/`implements`) or a value
+/// (non-pointer) field / abstract underlying — the defining module comes first.
+/// Reference-type (pointer) cross-references impose no constraint (the global
+/// forward-declaration block covers them). Returns the ordered module indices and,
+/// when a genuine cross-module cycle of complete-type dependencies remains, a
+/// diagnostic message (the leftover modules are appended in source order so the
+/// caller still produces output, but the run fails).
+fn amalgam_order(prog: &Program, indices: &[usize]) -> (Vec<usize>, Option<String>) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // Type name → the module that declares it (only types defined in the amalgamation).
+    let mut defining: BTreeMap<String, usize> = BTreeMap::new();
+    for &mi in indices {
+        for d in &prog.modules[mi].file.decls {
+            if let Some(name) = amalgam_type_name(d) {
+                defining.entry(name).or_insert(mi);
+            }
+        }
+    }
+
+    // mi → the modules it must follow (its complete-type dependencies).
+    let mut deps: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    for &mi in indices {
+        let m = &prog.modules[mi];
+        for d in &m.file.decls {
+            for name in decl_complete_deps(prog, mi, &m.package, d) {
+                if let Some(&dm) = defining.get(&name) {
+                    if dm != mi {
+                        deps.entry(mi).or_default().insert(dm);
+                    }
+                }
+            }
+        }
+    }
+
+    // Stable topological order: repeatedly take the earliest still-unplaced module
+    // whose dependencies are all placed. No such module (with some left) ⇒ a cycle.
+    let mut remaining: Vec<usize> = indices.to_vec();
+    let mut placed: BTreeSet<usize> = BTreeSet::new();
+    let mut ordered: Vec<usize> = Vec::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+        let pos = remaining.iter().position(|mi| {
+            deps.get(mi)
+                .is_none_or(|ds| ds.iter().all(|d| placed.contains(d)))
+        });
+        match pos {
+            Some(p) => {
+                let mi = remaining.remove(p);
+                placed.insert(mi);
+                ordered.push(mi);
+            }
+            None => {
+                let names: Vec<String> = remaining
+                    .iter()
+                    .map(|&mi| {
+                        prog.modules[mi]
+                            .path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("?")
+                            .to_string()
+                    })
+                    .collect();
+                let msg = format!(
+                    "circular cross-module dependency in --header-only between: {} — a base \
+                     class or by-value field forms a cycle across modules; reorder so base / \
+                     value types are defined first, or merge the modules",
+                    names.join(", ")
+                );
+                ordered.append(&mut remaining);
+                return (ordered, Some(msg));
+            }
+        }
+    }
+    (ordered, None)
+}
+
+/// The name a type declaration defines, if it is emitted into the amalgamation
+/// (so it can be the *target* of a complete-type dependency). `extern` / `@proxy`
+/// types live in hand-written C++ and are excluded.
+fn amalgam_type_name(d: &Decl) -> Option<String> {
+    match d {
+        Decl::Class(c) if !c.is_extern && !has_meta(&c.meta, "proxy") => Some(c.name.clone()),
+        Decl::Interface(i) if !i.is_extern => Some(i.name.clone()),
+        Decl::Enum(e) if !e.is_extern => Some(e.name.clone()),
+        Decl::Typedef(t) if !has_meta(&t.meta, "native") => Some(t.name.clone()),
+        _ => None,
+    }
+}
+
+/// The user-type names a declaration needs **complete** at its point of declaration:
+/// base classes (always), and by-value fields / abstract underlying (only when stored
+/// by value — a pointer or container needs just a forward declaration).
+fn decl_complete_deps(prog: &Program, mi: usize, ns: &[String], d: &Decl) -> Vec<String> {
+    let mut out = Vec::new();
+    match d {
+        Decl::Class(c) => {
+            for b in c.extends.iter().chain(c.implements.iter()) {
+                if let Some(n) = b.base_name() {
+                    out.push(n.to_string());
+                }
+            }
+            if let Some(u) = &c.abstract_underlying {
+                if let Some(n) = value_dep_name(prog, mi, ns, u) {
+                    out.push(n);
+                }
+            }
+            for f in &c.fields {
+                if let Some(ty) = &f.ty {
+                    if let Some(n) = value_dep_name(prog, mi, ns, ty) {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+        Decl::Interface(i) => {
+            for b in &i.extends {
+                if let Some(n) = b.base_name() {
+                    out.push(n.to_string());
+                }
+            }
+        }
+        Decl::Typedef(t) => {
+            if let TypedefTarget::Struct(fields) = &t.target {
+                for sf in fields {
+                    if let Some(n) = value_dep_name(prog, mi, ns, &sf.ty) {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// The user-type name `ty` needs complete when it is used **by value** — i.e. it
+/// lowers to a non-pointer, non-container C++ type (a value class, `abstract`,
+/// struct typedef, or enum). A reference type (pointer) or an `Array`/`Map` only
+/// needs a forward declaration of its element, so it returns `None`.
+fn value_dep_name(prog: &Program, mi: usize, ns: &[String], ty: &Type) -> Option<String> {
+    let base = ty.base_name()?;
+    let cpp = prog.map_type_use(ty, mi, ns);
+    if cpp.ends_with('*') || cpp.starts_with("std::") {
+        return None;
+    }
+    Some(base.to_string())
 }
 
 struct HeaderGen<'a> {
     prog: &'a Program,
     mi: usize,
     ns: Vec<String>,
+    opts: &'a HeaderOpts,
 }
 
 /// A C++ operator / conversion / converting-constructor forwarder built for an
@@ -53,16 +394,32 @@ struct Forwarder {
 }
 
 impl<'a> HeaderGen<'a> {
-    fn build(&self) -> String {
+    fn build(&self) -> HeaderOutput {
         let m = &self.prog.modules[self.mi];
-        let stem = m.path.file_stem().and_then(|s| s.to_str()).unwrap_or("Module");
+        let module_stem = m
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Module");
+        let stem = self.opts.guard_stem.as_deref().unwrap_or(module_stem);
         let guard = format!("{}_H", sanitize(&stem.to_uppercase()));
 
         let mut out = String::new();
         let _ = writeln!(out, "#ifndef {guard}");
         let _ = writeln!(out, "#define {guard}");
         out.push('\n');
+        // Header-only emission inlines the prelude (shim, std includes, export
+        // macros) directly here and omits the separate prelude `#include`.
+        if let Some(prelude) = &self.opts.inline_prelude {
+            out.push_str(prelude.trim_end());
+            out.push_str("\n\n");
+        }
+        let stdafx_inc = format!("{}.h", self.prog.stdafx_stem);
         for inc in self.prog.header_includes(self.mi) {
+            // The inlined prelude replaces the `StdAfx.h` include.
+            if self.opts.inline_prelude.is_some() && inc == stdafx_inc {
+                continue;
+            }
             // System headers (`<string>`) are emitted unquoted; project headers
             // are quoted.
             if inc.starts_with('<') {
@@ -72,7 +429,29 @@ impl<'a> HeaderGen<'a> {
             }
         }
         out.push('\n');
+        // Per-module `@:headerCode`, injected verbatim after the includes and before
+        // the declarations (hxcpp semantics).
+        if let Some(hc) = &self.opts.header_code {
+            out.push_str(hc.trim_matches('\n'));
+            out.push_str("\n\n");
+        }
 
+        let (section, warnings, errors) = self.section();
+        out.push_str(&section);
+        let _ = writeln!(out, "#endif");
+        (out, warnings, errors)
+    }
+
+    /// The namespace-wrapped body of the header: forward declarations, public
+    /// `final` constants, the type declarations (with inline constructor/method
+    /// bodies when `inline_bodies` is set), the free-function declarations, then any
+    /// global-scope `@:abi` `extern "C"` declarations. `build` wraps this in the
+    /// guard + includes for a standalone per-module header; the header-only
+    /// amalgamation concatenates one `section` per module under a single guard.
+    fn section(&self) -> HeaderOutput {
+        let mut warnings: Vec<(usize, String)> = Vec::new();
+        let mut errors: Vec<(usize, String)> = Vec::new();
+        let m = &self.prog.modules[self.mi];
         let base = self.ns.len();
 
         // The namespace body: public `final` constants → `static const` definitions
@@ -105,7 +484,9 @@ impl<'a> HeaderGen<'a> {
             if let Decl::Global(g) = decl {
                 // `extern` finals are provided by hand-written C++ — not emitted.
                 if g.is_final && !g.is_extern && g.access != Access::Private {
-                    if let Some(text) = crate::codegen::source::render_final_const(self.prog, self.mi, g) {
+                    if let Some(text) =
+                        crate::codegen::source::render_final_const(self.prog, self.mi, g)
+                    {
                         ns_body.push_str(&text);
                         emitted_const = true;
                     }
@@ -128,6 +509,15 @@ impl<'a> HeaderGen<'a> {
                 Decl::Class(c) if !c.is_extern && !has_meta(&c.meta, "proxy") => {
                     let (text, deferred) = self.emit_class(c, base);
                     deferred_defs.push_str(&deferred);
+                    // Header-only: the constructor/method bodies are emitted inline
+                    // here (after every class declaration) instead of in a `.cpp`.
+                    if self.opts.inline_bodies {
+                        let (defs, mut w, mut e) =
+                            crate::codegen::source::inline_class_defs(self.prog, self.mi, c);
+                        deferred_defs.push_str(&defs);
+                        warnings.append(&mut w);
+                        errors.append(&mut e);
+                    }
                     Some(text)
                 }
                 _ => None,
@@ -190,24 +580,62 @@ impl<'a> HeaderGen<'a> {
 
         // Only wrap a namespace when there is something to put in it; a file whose
         // sole output is an `extern "C"` export has no namespace block at all.
+        let mut sect = String::new();
         if !ns_body.trim().is_empty() {
+            for part in &self.ns {
+                let _ = writeln!(sect, "namespace {part} {{");
+            }
+            sect.push('\n');
+            sect.push_str(&ns_body);
+            sect.push('\n');
+            for _ in self.ns.iter().rev() {
+                let _ = writeln!(sect, "}}");
+            }
+            sect.push('\n');
+        }
+        if !extern_decls.is_empty() {
+            sect.push_str(&extern_decls);
+            sect.push('\n');
+        }
+        (sect, warnings, errors)
+    }
+
+    /// The inline constructor/method **definitions** for every class in this module,
+    /// wrapped in the module's namespace. The header-only amalgamation emits this in
+    /// a second pass — after every module's declarations — so a body that uses a
+    /// class from another module sees its complete definition. Returns the text plus
+    /// `(warnings, errors)` from body generation.
+    fn inline_defs_section(&self) -> HeaderOutput {
+        let mut warnings: Vec<(usize, String)> = Vec::new();
+        let mut errors: Vec<(usize, String)> = Vec::new();
+        let m = &self.prog.modules[self.mi];
+        let mut body = String::new();
+        for decl in &m.file.decls {
+            if let Decl::Class(c) = decl {
+                if c.is_extern || has_meta(&c.meta, "proxy") {
+                    continue;
+                }
+                let (defs, mut w, mut e) =
+                    crate::codegen::source::inline_class_defs(self.prog, self.mi, c);
+                body.push_str(&defs);
+                warnings.append(&mut w);
+                errors.append(&mut e);
+            }
+        }
+        let mut out = String::new();
+        if !body.trim().is_empty() {
             for part in &self.ns {
                 let _ = writeln!(out, "namespace {part} {{");
             }
             out.push('\n');
-            out.push_str(&ns_body);
+            out.push_str(&body);
             out.push('\n');
             for _ in self.ns.iter().rev() {
                 let _ = writeln!(out, "}}");
             }
             out.push('\n');
         }
-        if !extern_decls.is_empty() {
-            out.push_str(&extern_decls);
-            out.push('\n');
-        }
-        let _ = writeln!(out, "#endif");
-        out
+        (out, warnings, errors)
     }
 
     /// Global-scope declaration for a `@:abi` function:
@@ -230,7 +658,9 @@ impl<'a> HeaderGen<'a> {
             .map(|p| param_decl(self.prog, self.mi, &[], p))
             .collect::<Vec<_>>()
             .join(", ");
-        Some(format!("{prefix}_EXPORT {ret} {prefix}_CALL {name}({params})"))
+        Some(format!(
+            "{prefix}_EXPORT {ret} {prefix}_CALL {name}({params})"
+        ))
     }
 
     // ---- forward declarations ------------------------------------------
@@ -371,8 +801,11 @@ impl<'a> HeaderGen<'a> {
         // value class below takes the enum's name)
         let _ = writeln!(s, "{t}struct {}_ {{", e.name);
         let _ = writeln!(s, "{t}\tenum Enum {{");
-        let names: Vec<String> =
-            e.variants.iter().map(|v| format!("{t}\t\t{}", v.name)).collect();
+        let names: Vec<String> = e
+            .variants
+            .iter()
+            .map(|v| format!("{t}\t\t{}", v.name))
+            .collect();
         s.push_str(&names.join(",\n"));
         s.push('\n');
         let _ = writeln!(s, "{t}\t}};");
@@ -383,11 +816,10 @@ impl<'a> HeaderGen<'a> {
         let _ = writeln!(s, "{t}\t{}_::Enum kind;", e.name);
         for v in &e.variants {
             for p in &v.params {
-                let cpp = p
-                    .ty
-                    .as_ref()
-                    .map(|ty| self.prog.map_type_use(ty, self.mi, &self.ns))
-                    .unwrap_or_else(|| "int".to_string());
+                let cpp =
+                    p.ty.as_ref()
+                        .map(|ty| self.prog.map_type_use(ty, self.mi, &self.ns))
+                        .unwrap_or_else(|| "int".to_string());
                 let _ = writeln!(s, "{t}\t{cpp} {}_{};", v.name, p.name);
             }
         }
@@ -396,11 +828,10 @@ impl<'a> HeaderGen<'a> {
                 .params
                 .iter()
                 .map(|p| {
-                    let cpp = p
-                        .ty
-                        .as_ref()
-                        .map(|ty| self.prog.map_type_use(ty, self.mi, &self.ns))
-                        .unwrap_or_else(|| "int".to_string());
+                    let cpp =
+                        p.ty.as_ref()
+                            .map(|ty| self.prog.map_type_use(ty, self.mi, &self.ns))
+                            .unwrap_or_else(|| "int".to_string());
                     format!("{cpp} {}", p.name)
                 })
                 .collect();
@@ -506,7 +937,10 @@ impl<'a> HeaderGen<'a> {
         let inits: Vec<String> = fields
             .iter()
             .filter(|f| f.optional)
-            .filter_map(|f| self.default_value(&f.ty).map(|d| format!("{}({d})", f.name)))
+            .filter_map(|f| {
+                self.default_value(&f.ty)
+                    .map(|d| format!("{}({d})", f.name))
+            })
             .collect();
         if !inits.is_empty() {
             let _ = writeln!(s, "{t}\t{name}() : {} {{}}", inits.join(", "));
@@ -628,7 +1062,10 @@ impl<'a> HeaderGen<'a> {
             // property's type in Haxe — never void.
             let patched: Function;
             let m = if m.ret.is_none() && accessor_ret_type(c, name).is_some() {
-                patched = Function { ret: accessor_ret_type(c, name), ..m.clone() };
+                patched = Function {
+                    ret: accessor_ret_type(c, name),
+                    ..m.clone()
+                };
                 &patched
             } else {
                 m
@@ -711,9 +1148,7 @@ impl<'a> HeaderGen<'a> {
             // Haxe physicality: a `(get, never)` property without `@:isVar` is
             // purely computed — it has no backing field at all (`(get, null)`
             // keeps one: `null` write access is a physical store within the class).
-            if f.get == PropAccess::Get
-                && f.set == PropAccess::Never
-                && !has_meta(&f.meta, "isVar")
+            if f.get == PropAccess::Get && f.set == PropAccess::Never && !has_meta(&f.meta, "isVar")
             {
                 continue;
             }
@@ -738,7 +1173,12 @@ impl<'a> HeaderGen<'a> {
                 for decl in &h.member_decls {
                     let _ = writeln!(s, "{t}\t{decl}");
                 }
-                let _ = writeln!(s, "{t}\t{}({});", h.name, self.params_no_default(&ctor.params));
+                let _ = writeln!(
+                    s,
+                    "{t}\t{}({});",
+                    h.name,
+                    self.params_no_default(&ctor.params)
+                );
                 let _ = writeln!(s, "{t}}};");
                 s.push('\n');
             }
@@ -754,7 +1194,13 @@ impl<'a> HeaderGen<'a> {
         (s, deferred)
     }
 
-    fn emit_accessors(&self, _c: &Class, f: &Field, nullable: &BTreeSet<String>, ind: usize) -> String {
+    fn emit_accessors(
+        &self,
+        _c: &Class,
+        f: &Field,
+        nullable: &BTreeSet<String>,
+        ind: usize,
+    ) -> String {
         let t = tabs(ind);
         let fty = self.field_type(_c, f, nullable);
         let is_ptr = fty.ends_with('*');
@@ -762,7 +1208,11 @@ impl<'a> HeaderGen<'a> {
         if generated_getter(f) {
             let getter = format!("Get{}", cap(&f.name));
             let constness = if is_ptr { "" } else { "const " };
-            let _ = writeln!(s, "{t}\t{constness}{fty} {getter}() {{ return {}; }}", f.name);
+            let _ = writeln!(
+                s,
+                "{t}\t{constness}{fty} {getter}() {{ return {}; }}",
+                f.name
+            );
         }
         if f.set == PropAccess::Set && !custom_setter(_c, f) {
             let setter = format!("Set{}", cap(&f.name));
@@ -782,11 +1232,15 @@ impl<'a> HeaderGen<'a> {
     /// own type is fine — a member body is a complete-class context.
     fn forwarder_deferred(&self, c: &Class, ty: Option<&Type>) -> bool {
         let order = self.type_def_order();
-        let Some(&here) = order.get(&c.name) else { return false };
+        let Some(&here) = order.get(&c.name) else {
+            return false;
+        };
         let Some(t) = ty else { return false };
         let mut names = Vec::new();
         type_names_in(t, &mut names);
-        names.iter().any(|n| order.get(n).is_some_and(|&def| def > here))
+        names
+            .iter()
+            .any(|n| order.get(n).is_some_and(|&def| def > here))
     }
 
     /// If `m` carries `@:op(...)`, the C++ operator that forwards to it (e.g.
@@ -796,7 +1250,11 @@ impl<'a> HeaderGen<'a> {
     /// validation pass.
     fn op_forwarder(&self, c: &Class, m: &Function) -> Option<Forwarder> {
         let name = m.name.as_ref()?;
-        let arg = m.meta.iter().find(|me| me.name == "op").and_then(|me| me.first_arg())?;
+        let arg = m
+            .meta
+            .iter()
+            .find(|me| me.name == "op")
+            .and_then(|me| me.first_arg())?;
         let token = cpp_operator(arg, m.params.len())?;
         let ret = match &m.ret {
             Some(ty) => self.prog.map_type_use(ty, self.mi, &self.ns),
@@ -906,7 +1364,9 @@ impl<'a> HeaderGen<'a> {
             // supplies the return type; else a `cast(…, T)` body; else `double`
             // (Haxe `Float`).
             None if matches!(&g.ty, Some(Type::Func { .. })) => {
-                let Some(Type::Func { ret, .. }) = &g.ty else { unreachable!() };
+                let Some(Type::Func { ret, .. }) = &g.ty else {
+                    unreachable!()
+                };
                 self.prog.map_type_use(ret, self.mi, &self.ns)
             }
             None => match &**body {
@@ -920,7 +1380,11 @@ impl<'a> HeaderGen<'a> {
     }
 
     fn params(&self, params: &[Param]) -> String {
-        params.iter().map(|p| self.param(p)).collect::<Vec<_>>().join(", ")
+        params
+            .iter()
+            .map(|p| self.param(p))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Like [`params`], but without ` = default` suffixes (for the `XHolder`
@@ -959,10 +1423,16 @@ impl<'a> HeaderGen<'a> {
     fn class_bases(&self, c: &Class) -> String {
         let mut bases = Vec::new();
         if let Some(sup) = &c.extends {
-            bases.push(format!("public {}", self.prog.map_type_base(sup, self.mi, &self.ns)));
+            bases.push(format!(
+                "public {}",
+                self.prog.map_type_base(sup, self.mi, &self.ns)
+            ));
         }
         for i in &c.implements {
-            bases.push(format!("public {}", self.prog.map_type_base(i, self.mi, &self.ns)));
+            bases.push(format!(
+                "public {}",
+                self.prog.map_type_base(i, self.mi, &self.ns)
+            ));
         }
         if bases.is_empty() {
             String::new()
@@ -1059,11 +1529,11 @@ fn param_default(prog: &Program, mi: usize, ns: &[String], p: &Param) -> String 
         Some("Float") => "0.0".to_string(),
         Some("Bool") => "false".to_string(),
         Some("String") => "\"\"".to_string(),
-        _ => p
-            .ty
-            .as_ref()
-            .and_then(|t| enum_default(prog, mi, ns, t))
-            .unwrap_or_else(|| "0".to_string()),
+        _ => {
+            p.ty.as_ref()
+                .and_then(|t| enum_default(prog, mi, ns, t))
+                .unwrap_or_else(|| "0".to_string())
+        }
     }
 }
 
@@ -1110,7 +1580,11 @@ fn enum_member_value(e: &Expr) -> Option<String> {
         // A bare identifier is a sibling enumerator, valid inside the same `enum`.
         Expr::Ident(n) => n.clone(),
         Expr::Paren(inner) => format!("({})", enum_member_value(inner)?),
-        Expr::Unary { op, expr, prefix: true } => {
+        Expr::Unary {
+            op,
+            expr,
+            prefix: true,
+        } => {
             let o = match op {
                 UnOp::Neg => "-",
                 UnOp::BitNot => "~",
@@ -1132,7 +1606,11 @@ fn enum_member_value(e: &Expr) -> Option<String> {
                 BinOp::Shr => ">>",
                 _ => return None,
             };
-            format!("{} {o} {}", enum_member_value(lhs)?, enum_member_value(rhs)?)
+            format!(
+                "{} {o} {}",
+                enum_member_value(lhs)?,
+                enum_member_value(rhs)?
+            )
         }
         _ => return None,
     })
@@ -1150,19 +1628,27 @@ fn enum_abstract_value(e: &Expr) -> Option<String> {
         Expr::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
         // A sibling member, valid as `X_::Other` from inside the same namespace.
         Expr::Ident(n) => n.clone(),
-        Expr::Unary { op: UnOp::Neg, expr, prefix: true } => format!("-{}", enum_abstract_value(expr)?),
+        Expr::Unary {
+            op: UnOp::Neg,
+            expr,
+            prefix: true,
+        } => format!("-{}", enum_abstract_value(expr)?),
         _ => return None,
     })
 }
 
 /// For an enum-typed value, `Name_::FirstVariant` (namespaced if needed).
 fn enum_default(prog: &Program, mi: usize, ns: &[String], ty: &Type) -> Option<String> {
-    let Type::Named { path, .. } = ty else { return None };
+    let Type::Named { path, .. } = ty else {
+        return None;
+    };
     let ti = prog.resolve_type(path, mi)?;
     if ti.kind != TypeKind::Enum {
         return None;
     }
-    let Decl::Enum(e) = prog.type_decl(ti)? else { return None };
+    let Decl::Enum(e) = prog.type_decl(ti)? else {
+        return None;
+    };
     let first = e.variants.first()?;
     let tns = ti.cpp_namespace();
     let prefix = if tns == ns || tns.is_empty() {
@@ -1339,8 +1825,8 @@ pub(crate) fn cpp_operator(arg: &str, n_params: usize) -> Option<String> {
         .filter(|c| !c.is_alphanumeric() && *c != '_' && !c.is_whitespace())
         .collect();
     const BINARY: &[&str] = &[
-        "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=", "&", "|", "^", "<<", ">>",
-        "&&", "||",
+        "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=", "&", "|", "^", "<<", ">>", "&&",
+        "||",
     ];
     const UNARY: &[&str] = &["-", "!", "~"];
     let ok = (n_params == 1 && BINARY.contains(&sym.as_str()))
@@ -1353,7 +1839,9 @@ pub(crate) fn cpp_operator(arg: &str, n_params: usize) -> Option<String> {
 /// generates the trivial `SetX` instead.
 fn custom_setter(c: &Class, f: &Field) -> bool {
     f.set == PropAccess::Set
-        && c.methods.iter().any(|m| m.name.as_deref() == Some(&format!("set_{}", f.name)))
+        && c.methods
+            .iter()
+            .any(|m| m.name.as_deref() == Some(&format!("set_{}", f.name)))
 }
 
 /// The return type Haxe infers for a property accessor whose signature omits
@@ -1362,7 +1850,9 @@ fn custom_setter(c: &Class, f: &Field) -> bool {
 /// `void` would emit a value `return` from a void C++ function). `None` when
 /// `method` is not an accessor of a matching declared property.
 pub(crate) fn accessor_ret_type(c: &Class, method: &str) -> Option<Type> {
-    let field = method.strip_prefix("get_").or_else(|| method.strip_prefix("set_"))?;
+    let field = method
+        .strip_prefix("get_")
+        .or_else(|| method.strip_prefix("set_"))?;
     let f = c.fields.iter().find(|f| f.name == field)?;
     let matches_kind = (method.starts_with("get_") && f.get == PropAccess::Get)
         || (method.starts_with("set_") && f.set == PropAccess::Set);
@@ -1400,7 +1890,11 @@ pub(crate) fn render_scalar_literal(e: &Expr) -> Option<String> {
         Expr::Null => "NULL".to_string(),
         Expr::Str { raw, .. } => format!("\"{raw}\""),
         Expr::Ident(name) => name.clone(),
-        Expr::Unary { op: UnOp::Neg, expr, prefix: true } => {
+        Expr::Unary {
+            op: UnOp::Neg,
+            expr,
+            prefix: true,
+        } => {
             format!("-{}", render_scalar_literal(expr)?)
         }
         Expr::Paren(inner) => render_scalar_literal(inner)?,

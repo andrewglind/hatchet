@@ -65,7 +65,10 @@ impl<'a> BodyGen<'a> {
                     self.flush(out);
                     if !field_ptr && vty.is_ptr {
                         // value is a pointer, target field is a value: null-guarded deref
-                        let _ = writeln!(out, "{t}if ({vcode} != NULL) {{ {name}.{key} = *{vcode}; }}");
+                        let _ = writeln!(
+                            out,
+                            "{t}if ({vcode} != NULL) {{ {name}.{key} = *{vcode}; }}"
+                        );
                     } else {
                         let _ = writeln!(out, "{t}{name}.{key} = {vcode};");
                     }
@@ -115,20 +118,34 @@ impl<'a> BodyGen<'a> {
         // `Struct = { .. }` → aggregate initialiser.
         if let Expr::ObjectLit(fields) = init {
             let agg = self.render_const_aggregate(&decl_ty, fields)?;
-            return Some(format!("\tstatic const {} {} = {agg};\n", decl_ty.base, g.name));
+            return Some(format!(
+                "\tstatic const {} {} = {agg};\n",
+                decl_ty.base, g.name
+            ));
         }
         // `Struct = OTHER` (alias) / any other scalar-ish init → copy-initialise.
         let v = crate::codegen::render_scalar_literal(init)?;
-        Some(format!("\tstatic const {} {} = {v};\n", decl_ty.base, g.name))
+        Some(format!(
+            "\tstatic const {} {} = {v};\n",
+            decl_ty.base, g.name
+        ))
     }
 
     /// Render a struct constant's value as a C++98 aggregate initialiser
     /// (`{ v0, v1 }`) in the struct's declared field order. `None` if the type is
     /// not a struct typedef or a field value is missing/unsupported.
-    pub(super) fn render_const_aggregate(&self, ty: &Ty, fields: &[(String, Expr)]) -> Option<String> {
+    pub(super) fn render_const_aggregate(
+        &self,
+        ty: &Ty,
+        fields: &[(String, Expr)],
+    ) -> Option<String> {
         let info = ty.info.as_ref()?;
-        let Decl::Typedef(td) = self.prog.type_decl(info)? else { return None };
-        let TypedefTarget::Struct(sfields) = &td.target else { return None };
+        let Decl::Typedef(td) = self.prog.type_decl(info)? else {
+            return None;
+        };
+        let TypedefTarget::Struct(sfields) = &td.target else {
+            return None;
+        };
         let mut parts = Vec::new();
         for sf in sfields {
             let val = fields.iter().find(|(k, _)| k == &sf.name).map(|(_, v)| v)?;
@@ -145,7 +162,12 @@ impl<'a> BodyGen<'a> {
     /// Render a file-scoped `final Array<T> = [..]` as a builder helper plus a
     /// `const` vector object initialised from it (C++98 cannot brace-initialise a
     /// `std::vector`). Keeps the symbol a `std::vector`, so call sites are unchanged.
-    pub(super) fn render_const_vector(&mut self, name: &str, vec_ty: &Ty, elems: &[Expr]) -> String {
+    pub(super) fn render_const_vector(
+        &mut self,
+        name: &str,
+        vec_ty: &Ty,
+        elems: &[Expr],
+    ) -> String {
         let builder = format!("_init_{name}");
         let spell = self.decl_spelling(vec_ty);
         let elem = self.elem_member_ty(vec_ty);
@@ -206,7 +228,11 @@ impl<'a> BodyGen<'a> {
         out: &mut String,
     ) {
         let t = "\t".repeat(ind);
-        let spell = if map_ty.base.is_empty() { "std::map<std::string, void*>".to_string() } else { self.decl_spelling(map_ty) };
+        let spell = if map_ty.base.is_empty() {
+            "std::map<std::string, void*>".to_string()
+        } else {
+            self.decl_spelling(map_ty)
+        };
         let _ = writeln!(out, "{t}{spell} {name};");
         for (k, v) in pairs {
             let (kc, _) = self.gen_expr(k);
@@ -240,7 +266,11 @@ impl<'a> BodyGen<'a> {
         for (key, value) in fields {
             let (vcode, vty) = self.gen_expr(value);
             self.flush(out);
-            let spell = if vty.base.is_empty() { "int".to_string() } else { self.decl_spelling(&vty) };
+            let spell = if vty.base.is_empty() {
+                "int".to_string()
+            } else {
+                self.decl_spelling(&vty)
+            };
             decls.push(format!("{spell} {key};"));
             assigns.push((key.clone(), vcode));
         }

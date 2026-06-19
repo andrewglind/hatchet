@@ -81,9 +81,7 @@ pub fn generate_source_diagnostics(
         .iter()
         .filter_map(|d| match d {
             Decl::Function(f)
-                if !f.modifiers.is_macro
-                    && !has_meta(&f.meta, "abi")
-                    && f.body.is_some() =>
+                if !f.modifiers.is_macro && !has_meta(&f.meta, "abi") && f.body.is_some() =>
             {
                 Some(f)
             }
@@ -94,7 +92,11 @@ pub fn generate_source_diagnostics(
         return None; // headers-only (enums/typedefs/interfaces)
     }
 
-    let stem = m.path.file_stem().and_then(|s| s.to_str()).unwrap_or("Module");
+    let stem = m
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Module");
     let mut out = String::new();
     let _ = writeln!(out, "#include \"{stem}.h\"");
     out.push('\n');
@@ -221,7 +223,11 @@ pub fn generate_source_diagnostics(
             // Advisory diagnostics for `@owned`/`@delete` overrides that look unsound to
             // the escape analysis (the tags are still obeyed; this only flags a likely
             // double-free / use-after-free).
-            warnings.extend(crate::sema::escape::advisory_warnings(prog, module_index, c));
+            warnings.extend(crate::sema::escape::advisory_warnings(
+                prog,
+                module_index,
+                c,
+            ));
         }
     }
 
@@ -249,6 +255,27 @@ pub fn generate_source_diagnostics(
     }
 
     Some((out, warnings, errors))
+}
+
+/// The constructor and method **definitions** for one class, each marked `inline`
+/// and qualified out-of-line (`inline Ret Class::method(...) { … }`), for placement
+/// inside the class's namespace in a header-only amalgamation. The class
+/// *declaration* (and its inline destructor) is emitted separately by the header
+/// generator; this supplies only the bodies that would otherwise live in a `.cpp`.
+/// Returns `(text, warnings, errors)` with each diagnostic paired to its source line.
+pub fn inline_class_defs(prog: &Program, mi: usize, class: &Class) -> SourceOutput {
+    let mut g = BodyGen::new(prog, mi, class, prog.extract_depth, prog.no_trace);
+    g.inline_defs = true;
+    let text = g.class_impl();
+    (text, g.warnings, g.errors)
+}
+
+/// `true` if this module-level `final` binds a function/lambda (so it lowers to a
+/// namespace free function defined in the `.cpp`). Used by the driver to reject
+/// module-level free functions in `--header-only` mode, where there is no `.cpp` to
+/// hold the definition.
+pub fn is_free_fn_global(g: &GlobalVar) -> bool {
+    lambda_parts(g).is_some()
 }
 
 /// A lightweight description of an expression's C++ type, enough to drive member
@@ -375,6 +402,10 @@ struct BodyGen<'a> {
     /// bind the value, so a reference to one of these names is a hard error (rather
     /// than silently emitting an undeclared identifier).
     nonbinding_catch_vars: Vec<String>,
+    /// When set, each out-of-line constructor/method definition is prefixed with
+    /// `inline` so it can live in a header included from several translation units
+    /// (`--header-only` emission), instead of being defined once in a `.cpp`.
+    inline_defs: bool,
 }
 
 impl<'a> BodyGen<'a> {
@@ -389,7 +420,9 @@ impl<'a> BodyGen<'a> {
         // M5 cutover (consumer #2): the container receiver names into which a pushed
         // `new` escapes to class-level storage (so it is emitted inline, not hoisted).
         let owned_containers: std::collections::HashSet<String> =
-            crate::sema::escape::escaping_push_receivers(prog, mi, class).into_iter().collect();
+            crate::sema::escape::escaping_push_receivers(prog, mi, class)
+                .into_iter()
+                .collect();
         // M5 cutover (consumer #3): the scalar pointer fields this object owns —
         // NULL-initialised in the constructor and freed before reassignment. Sourced
         // from the escape analysis (destructor-owned set), then filtered to the same
@@ -402,7 +435,10 @@ impl<'a> BodyGen<'a> {
             .iter()
             .filter(|f| class_owned.contains(&f.name))
             .filter(|f| !f.meta.iter().any(|m| m.name == "owned"))
-            .filter(|f| f.ty.as_ref().is_some_and(|t| prog.map_type_use(t, mi, &ns).ends_with('*')))
+            .filter(|f| {
+                f.ty.as_ref()
+                    .is_some_and(|t| prog.map_type_use(t, mi, &ns).ends_with('*'))
+            })
             .map(|f| f.name.clone())
             .collect();
         BodyGen {
@@ -435,6 +471,7 @@ impl<'a> BodyGen<'a> {
             expected: None,
             no_trace,
             nonbinding_catch_vars: Vec::new(),
+            inline_defs: false,
         }
     }
 
@@ -528,7 +565,8 @@ impl<'a> BodyGen<'a> {
         } else {
             format!("{}: ", self.current_fn)
         };
-        self.warnings.push((self.current_line, format!("{ctx}{msg}")));
+        self.warnings
+            .push((self.current_line, format!("{ctx}{msg}")));
     }
 
     /// Lint a container mutation through a parameter. Haxe `Array`/`Map` are
@@ -572,11 +610,6 @@ impl<'a> BodyGen<'a> {
             self.prelude.clear();
         }
     }
-
-
-
-
-
 }
 
 // ---- free helpers ------------------------------------------------------
@@ -602,13 +635,14 @@ fn stmt_contains_loop_break(st: &Stmt) -> bool {
     match st {
         Stmt::Break => true,
         Stmt::If { then, els, .. } => {
-            stmt_contains_loop_break(then)
-                || els.as_deref().is_some_and(stmt_contains_loop_break)
+            stmt_contains_loop_break(then) || els.as_deref().is_some_and(stmt_contains_loop_break)
         }
         Stmt::Block(b) => stmts_contain_loop_break(b),
         Stmt::Switch { cases, default, .. } => {
             cases.iter().any(|c| stmts_contain_loop_break(&c.body))
-                || default.as_ref().is_some_and(|d| stmts_contain_loop_break(d))
+                || default
+                    .as_ref()
+                    .is_some_and(|d| stmts_contain_loop_break(d))
         }
         Stmt::Try { body, catches, .. } => {
             stmt_contains_loop_break(body)
@@ -652,7 +686,14 @@ fn collect_escaping(
 ) {
     for st in stmts {
         match st {
-            Stmt::Expr(Expr::Assign { op: None, target, value }, _) => {
+            Stmt::Expr(
+                Expr::Assign {
+                    op: None,
+                    target,
+                    value,
+                },
+                _,
+            ) => {
                 // A local stored into a field — `this.field = local` or the bare
                 // `field = local` — escapes this scope (the field now owns it).
                 let into_field = match &**target {
@@ -808,10 +849,15 @@ fn effective_lambda_params(params: &[Param], decl_ty: Option<&Type>) -> Vec<Para
     params
         .iter()
         .enumerate()
-        .map(|(i, p)| match (&p.ty, func_params.and_then(|fps| fps.get(i))) {
-            (None, Some(fp)) => Param { ty: Some(fp.clone()), ..p.clone() },
-            _ => p.clone(),
-        })
+        .map(
+            |(i, p)| match (&p.ty, func_params.and_then(|fps| fps.get(i))) {
+                (None, Some(fp)) => Param {
+                    ty: Some(fp.clone()),
+                    ..p.clone()
+                },
+                _ => p.clone(),
+            },
+        )
         .collect()
 }
 
@@ -849,7 +895,11 @@ fn empty_class() -> Class {
 /// the namespace, one tab). Shared by the source generator (private finals → `.cpp`)
 /// and the header generator (public finals → `.h`). Returns `None` for finals that
 /// are not constants (function/lambda finals) or cannot be lowered.
-pub(crate) fn render_final_const(prog: &Program, module_index: usize, g: &GlobalVar) -> Option<String> {
+pub(crate) fn render_final_const(
+    prog: &Program,
+    module_index: usize,
+    g: &GlobalVar,
+) -> Option<String> {
     if lambda_parts(g).is_some() {
         return None;
     }
@@ -879,11 +929,29 @@ fn intrinsic_field(obj: &str, name: &str) -> Option<(String, Ty)> {
 
 fn float_ty() -> Ty {
     // Haxe `Float` lowers to C++ `double` (64-bit, matching official targets).
-    Ty { base: "double".into(), ..Default::default() }
+    Ty {
+        base: "double".into(),
+        ..Default::default()
+    }
 }
 
 fn int_ty() -> Ty {
-    Ty { base: "int".into(), ..Default::default() }
+    Ty {
+        base: "int".into(),
+        ..Default::default()
+    }
+}
+
+/// A Haxe `Int`-typed value backed by an unsigned C++ `size_t` (`.length` →
+/// `.size()`/`.length()`). Modelled as `int` for member lookup and arithmetic, but
+/// flagged `unsigned` so a comparison against a signed `int` gets the explicit
+/// `(size_t)` cast that silences MSVC's C4018.
+fn size_ty() -> Ty {
+    Ty {
+        base: "int".into(),
+        unsigned: true,
+        ..Default::default()
+    }
 }
 
 /// A Haxe `Int`-typed value backed by an unsigned C++ `size_t` (`.length` →
@@ -895,11 +963,17 @@ fn size_ty() -> Ty {
 }
 
 fn bool_ty() -> Ty {
-    Ty { base: "bool".into(), ..Default::default() }
+    Ty {
+        base: "bool".into(),
+        ..Default::default()
+    }
 }
 
 fn str_ty() -> Ty {
-    Ty { base: "std::string".into(), ..Default::default() }
+    Ty {
+        base: "std::string".into(),
+        ..Default::default()
+    }
 }
 
 /// A bare `Type::Named` from a type name (used to map a parsed overload
@@ -943,7 +1017,12 @@ fn parse_overload_sig(s: &str) -> Option<(Vec<String>, String)> {
         .map(str::trim)
         .filter(|p| !p.is_empty())
         // `name:Type` (or `?name:Type`) → the Type after the first `:`.
-        .map(|p| p.split_once(':').map(|(_, t)| t.trim()).unwrap_or("").to_string())
+        .map(|p| {
+            p.split_once(':')
+                .map(|(_, t)| t.trim())
+                .unwrap_or("")
+                .to_string()
+        })
         .collect();
     // Return type: after the close paren, `: R` up to the `{` body (or end).
     let ret = s[close + 1..]
@@ -981,7 +1060,10 @@ fn is_container_ty(ty: &Ty) -> bool {
 /// Per-position `@sink` flags for a parameter list — positions whose callee
 /// consumes (takes ownership of) what is passed, so the caller does not free it.
 fn param_sink_flags(params: &[Param]) -> Vec<bool> {
-    params.iter().map(|p| p.meta.iter().any(|m| m.name == "sink")).collect()
+    params
+        .iter()
+        .map(|p| p.meta.iter().any(|m| m.name == "sink"))
+        .collect()
 }
 
 /// Container methods that mutate their receiver (the rest — `indexOf`, `copy`,
@@ -1016,10 +1098,24 @@ fn split_top_comma(s: &str) -> Option<(&str, &str)> {
 fn binop(op: BinOp) -> &'static str {
     use BinOp::*;
     match op {
-        Add => "+", Sub => "-", Mul => "*", Div => "/", Mod => "%",
-        Eq => "==", Ne => "!=", Lt => "<", Gt => ">", Le => "<=", Ge => ">=",
-        And => "&&", Or => "||",
-        BitAnd => "&", BitOr => "|", BitXor => "^", Shl => "<<", Shr => ">>",
+        Add => "+",
+        Sub => "-",
+        Mul => "*",
+        Div => "/",
+        Mod => "%",
+        Eq => "==",
+        Ne => "!=",
+        Lt => "<",
+        Gt => ">",
+        Le => "<=",
+        Ge => ">=",
+        And => "&&",
+        Or => "||",
+        BitAnd => "&",
+        BitOr => "|",
+        BitXor => "^",
+        Shl => "<<",
+        Shr => ">>",
         // `>>>` is lowered through an unsigned cast before this table is consulted
         // (see `gen_expr` for `Expr::Binary` / `Expr::Assign`); never emitted bare.
         UShr => ">>",
@@ -1029,7 +1125,10 @@ fn binop(op: BinOp) -> &'static str {
 fn binop_result_ty(op: BinOp, lhs: Ty) -> Ty {
     use BinOp::*;
     match op {
-        Eq | Ne | Lt | Gt | Le | Ge | And | Or => Ty { base: "bool".into(), ..Default::default() },
+        Eq | Ne | Lt | Gt | Le | Ge | And | Or => Ty {
+            base: "bool".into(),
+            ..Default::default()
+        },
         UShr => int_ty(),
         _ => lhs,
     }
@@ -1061,7 +1160,14 @@ fn is_int_ty(ty: &Ty) -> bool {
     !ty.is_ptr
         && matches!(
             ty.base.as_str(),
-            "int" | "unsigned int" | "uint8_t" | "uint16_t" | "uint32_t" | "char" | "short" | "long"
+            "int"
+                | "unsigned int"
+                | "uint8_t"
+                | "uint16_t"
+                | "uint32_t"
+                | "char"
+                | "short"
+                | "long"
         )
 }
 
@@ -1213,7 +1319,10 @@ fn split_interpolation(raw: &str) -> (Vec<Seg>, Vec<String>) {
             exprs.push(inner.clone());
             segs.push(Seg::Expr(inner));
             i = j + 1;
-        } else if b[i] == b'$' && i + 1 < b.len() && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_') {
+        } else if b[i] == b'$'
+            && i + 1 < b.len()
+            && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_')
+        {
             // `$ident` shorthand
             if !lit.is_empty() {
                 segs.push(Seg::Lit(std::mem::take(&mut lit)));
@@ -1239,7 +1348,9 @@ fn split_interpolation(raw: &str) -> (Vec<Seg>, Vec<String>) {
 
 /// Escape a literal run for use inside a printf/sprintf format string.
 fn printf_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%")
 }
 
 fn cap(s: &str) -> String {

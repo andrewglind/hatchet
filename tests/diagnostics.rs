@@ -35,7 +35,9 @@ fn missing_field_type_is_an_error() {
             && d.message.contains("field `widget`")
             && d.line == 2),
         "expected an unresolved-type error for Widget on line 2, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -49,9 +51,12 @@ fn missing_type_in_new_expression_is_an_error() {
     let errs = unresolved_type_errors(&prog, idx);
     // `new Gizmo()` is on line 4 of the source.
     assert!(
-        errs.iter().any(|d| d.message.contains("Gizmo") && d.line == 4),
+        errs.iter()
+            .any(|d| d.message.contains("Gizmo") && d.line == 4),
         "expected an unresolved-type error for Gizmo on line 4, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -70,7 +75,9 @@ fn lambda_outside_map_or_final_is_unsupported() {
             && d.message.contains("lambda")
             && d.line == 4),
         "expected an Unsupported lambda diagnostic on line 4, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -91,7 +98,11 @@ fn lambda_in_map_or_top_level_final_is_supported() {
          }\n",
     );
     let errs = unsupported_construct_errors(&prog, idx);
-    assert!(errs.is_empty(), "no unsupported diagnostics expected, got: {:?}", errs.iter().map(|d| &d.message).collect::<Vec<_>>());
+    assert!(
+        errs.is_empty(),
+        "no unsupported diagnostics expected, got: {:?}",
+        errs.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -108,7 +119,9 @@ fn macro_function_is_unsupported() {
             && d.message.contains("macro")
             && d.message.contains("build")),
         "expected an Unsupported macro diagnostic, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -128,7 +141,9 @@ fn macro_function_with_reification_body_is_unsupported_not_a_parse_error() {
             && d.message.contains("macro")
             && d.message.contains("Square")),
         "expected an Unsupported macro diagnostic for Square, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -147,7 +162,10 @@ fn expr_macro_type_is_unsupported_not_unresolved() {
             && d.message.contains("field `node`")
             && d.line == 2),
         "expected an Unsupported Expr diagnostic on line 2, got: {:?}",
-        unsup.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        unsup
+            .iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
     // It must NOT also surface as an unresolved-type error.
     let unresolved = unresolved_type_errors(&prog, idx);
@@ -174,7 +192,9 @@ fn using_static_extension_is_unsupported() {
             && d.message.contains("StringTools")
             && d.line == 2),
         "expected an Unsupported `using` diagnostic on line 2, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -189,7 +209,9 @@ fn parameterized_enum_variant_is_supported() {
     assert!(
         !errs.iter().any(|d| d.message.contains("Move")),
         "parameterized variants must not be flagged, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -207,7 +229,9 @@ fn regex_literal_is_unsupported() {
             && d.message.contains("regular-expression literal")
             && d.line == 4),
         "expected an Unsupported regex-literal diagnostic on line 4, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -226,7 +250,10 @@ fn ereg_type_is_unsupported_not_unresolved() {
             && d.message.contains("EReg")
             && d.line == 4),
         "expected an Unsupported EReg diagnostic on line 4, got: {:?}",
-        unsup.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        unsup
+            .iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
     let unresolved = unresolved_type_errors(&prog, idx);
     assert!(
@@ -246,9 +273,12 @@ fn try_catch_with_an_unresolved_catch_type_is_an_error() {
     );
     let errs = unresolved_type_errors(&prog, idx);
     assert!(
-        errs.iter().any(|d| d.message.contains("Nope") && d.line == 4),
+        errs.iter()
+            .any(|d| d.message.contains("Nope") && d.line == 4),
         "expected an unresolved-type error for the catch type `Nope` on line 4, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -266,7 +296,9 @@ fn is_operator_is_unsupported() {
             && d.message.contains("type-check operator")
             && d.line == 4),
         "expected an Unsupported `is` diagnostic on line 4, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -284,9 +316,13 @@ fn is_is_a_contextual_keyword_not_reserved() {
     );
     let errs = unsupported_construct_errors(&prog, idx);
     assert!(
-        !errs.iter().any(|d| d.message.contains("type-check operator")),
+        !errs
+            .iter()
+            .any(|d| d.message.contains("type-check operator")),
         "`is` as an identifier/field must not be flagged as the operator, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -302,7 +338,9 @@ fn abstract_newtype_is_supported() {
     assert!(
         !errs.iter().any(|d| d.message.contains("`abstract`")),
         "an abstract newtype must not be flagged unsupported, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -323,7 +361,11 @@ fn primitives_containers_and_declared_types_are_not_flagged() {
          }\n",
     );
     let errs = unresolved_type_errors(&prog, idx);
-    assert!(errs.is_empty(), "no errors expected, got: {:?}", errs.iter().map(|d| &d.message).collect::<Vec<_>>());
+    assert!(
+        errs.is_empty(),
+        "no errors expected, got: {:?}",
+        errs.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -333,17 +375,16 @@ fn primitives_containers_and_declared_types_are_not_flagged() {
 
 #[test]
 fn generic_class_is_unsupported() {
-    let (prog, idx) = program_from(
-        "Box",
-        "class Box<T> {\n  public function new() {}\n}\n",
-    );
+    let (prog, idx) = program_from("Box", "class Box<T> {\n  public function new() {}\n}\n");
     let errs = unsupported_construct_errors(&prog, idx);
     assert!(
         errs.iter().any(|d| d.severity == Severity::Unsupported
             && d.message.contains("generic class `Box<T>`")
             && d.line == 1),
         "expected an Unsupported generic-class diagnostic on line 1, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -359,7 +400,9 @@ fn generic_interface_is_unsupported() {
             && d.message.contains("generic interface `Cmp<A, B>`")
             && d.line == 1),
         "expected an Unsupported generic-interface diagnostic on line 1, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -376,7 +419,9 @@ fn generic_method_is_unsupported_and_t_is_not_double_reported() {
         errs.iter().any(|d| d.severity == Severity::Unsupported
             && d.message.contains("generic method `first<T>`")),
         "expected an Unsupported generic-method diagnostic, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
     let unresolved = unresolved_type_errors(&prog, idx);
     assert!(
@@ -398,7 +443,9 @@ fn generic_typedef_is_unsupported() {
             && d.message.contains("generic typedef `Pair<T>`")
             && d.line == 1),
         "expected an Unsupported generic-typedef diagnostic on line 1, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -420,7 +467,9 @@ fn get_set_property_pair_is_supported() {
     assert!(
         errs.is_empty(),
         "(get, set) with both accessors must not be flagged, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -437,7 +486,9 @@ fn user_defined_setter_body_is_supported() {
     assert!(
         errs.is_empty(),
         "(default, set) with a custom set_x must not be flagged, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -453,7 +504,9 @@ fn supported_property_pairs_are_not_flagged() {
     assert!(
         !errs.iter().any(|d| d.message.contains("property")),
         "supported pairs must not be flagged, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -473,7 +526,9 @@ fn capture_pattern_is_unsupported() {
         errs.iter().any(|d| d.severity == Severity::Unsupported
             && d.message.contains("capture pattern `case x:`")),
         "expected an Unsupported capture-pattern diagnostic, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -489,7 +544,9 @@ fn destructuring_enum_pattern_is_supported() {
     assert!(
         errs.is_empty(),
         "destructuring a parameterized variant must not be flagged, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -505,7 +562,9 @@ fn literal_payload_subpattern_is_unsupported() {
         errs.iter().any(|d| d.severity == Severity::Unsupported
             && d.message.contains("non-capture payload sub-pattern")),
         "expected a payload-sub-pattern diagnostic, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -519,9 +578,12 @@ fn recursive_enum_payload_is_unsupported() {
     let errs = unsupported_construct_errors(&prog, idx);
     assert!(
         errs.iter().any(|d| d.severity == Severity::Unsupported
-            && d.message.contains("recursive enum payload `Tree2` in variant `Node`")),
+            && d.message
+                .contains("recursive enum payload `Tree2` in variant `Node`")),
         "expected a recursive-payload diagnostic, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -537,7 +599,9 @@ fn constant_patterns_are_not_flagged() {
     assert!(
         !errs.iter().any(|d| d.message.contains("pattern")),
         "constant patterns must not be flagged, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -553,7 +617,9 @@ fn generic_enum_is_unsupported() {
             && d.message.contains("generic enum `Tree<T>`")
             && d.line == 1),
         "expected an Unsupported generic-enum diagnostic on line 1, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -573,7 +639,9 @@ fn access_control_property_pairs_are_not_flagged() {
     assert!(
         !errs.iter().any(|d| d.message.contains("property")),
         "access-control pairs must not be flagged, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -587,7 +655,9 @@ fn computed_getter_property_is_not_flagged() {
     assert!(
         errs.is_empty(),
         "computed (get, never)/(get, null) must not be flagged, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -603,9 +673,12 @@ fn get_default_pair_is_unsupported() {
     let errs = unsupported_construct_errors(&prog, idx);
     assert!(
         errs.iter().any(|d| d.severity == Severity::Unsupported
-            && d.message.contains("`(get, default)` property accessor pair on `x`")),
+            && d.message
+                .contains("`(get, default)` property accessor pair on `x`")),
         "expected (get, default) to stay flagged, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -618,10 +691,13 @@ fn get_access_without_get_method_is_an_error() {
     let errs = unsupported_construct_errors(&prog, idx);
     assert!(
         errs.iter().any(|d| d.severity == Severity::Error
-            && d.message.contains("declares `get` access but no `get_area()` method")
+            && d.message
+                .contains("declares `get` access but no `get_area()` method")
             && d.line == 2),
         "expected a missing-get_area error on line 2, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -643,7 +719,9 @@ fn value_class_inheritance_is_unsupported() {
         errs.iter().any(|d| d.severity == Severity::Unsupported
             && d.message.contains("inheritance on the value class `Sh`")),
         "expected a value-class inheritance diagnostic, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -660,7 +738,9 @@ fn value_class_self_by_value_field_is_unsupported() {
         errs.iter().any(|d| d.severity == Severity::Unsupported
             && d.message.contains("by-value self-field `self`")),
         "expected a by-value self-field diagnostic, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -676,7 +756,8 @@ fn stack_only_nesting_is_unsupported_steering_to_abstract() {
     let errs = unsupported_construct_errors(&prog, idx);
     let msgs: Vec<&String> = errs.iter().map(|d| &d.message).collect();
     assert!(
-        msgs.iter().any(|m| m.contains("`@:stackOnly` type `Vec2`") && m.contains("field `pos`")
+        msgs.iter().any(|m| m.contains("`@:stackOnly` type `Vec2`")
+            && m.contains("field `pos`")
             && m.contains("use an `abstract`")),
         "expected a stack-only-as-field diagnostic steering to an abstract, got: {msgs:?}"
     );
@@ -698,7 +779,9 @@ fn abstract_value_type_may_be_nested() {
     assert!(
         errs.is_empty(),
         "an `abstract` value type must nest freely, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -714,6 +797,8 @@ fn switch_case_final_constant_is_not_a_capture() {
     assert!(
         !errs.iter().any(|d| d.message.contains("capture pattern")),
         "final constants must not be treated as capture patterns, got: {:?}",
-        errs.iter().map(|d| (d.line, &d.message)).collect::<Vec<_>>()
+        errs.iter()
+            .map(|d| (d.line, &d.message))
+            .collect::<Vec<_>>()
     );
 }

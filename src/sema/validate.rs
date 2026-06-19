@@ -50,7 +50,11 @@ fn collect_refs(prog: &Program, mi: usize) -> Collector {
             _ => {}
         }
     }
-    let mut c = Collector { type_params, refs: Vec::new(), func_uses: Vec::new() };
+    let mut c = Collector {
+        type_params,
+        refs: Vec::new(),
+        func_uses: Vec::new(),
+    };
     for d in &m.file.decls {
         c.decl(d);
     }
@@ -60,7 +64,12 @@ fn collect_refs(prog: &Program, mi: usize) -> Collector {
 /// Every "unresolved type" error for the declarations in module `mi`.
 pub fn unresolved_type_errors(prog: &Program, mi: usize) -> Vec<Diagnostic> {
     let m = &prog.modules[mi];
-    let file = m.path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    let file = m
+        .path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
     let mut out = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for r in collect_refs(prog, mi).refs {
@@ -100,7 +109,12 @@ pub fn unresolved_type_errors(prog: &Program, mi: usize) -> Vec<Diagnostic> {
 /// a placeholder that does not compile.
 pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic> {
     let m = &prog.modules[mi];
-    let file = m.path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    let file = m
+        .path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
     let mut out = Vec::new();
     // Every enum (and `enum abstract`) declared anywhere in the program, with its
     // member names — the constants a `switch` pattern may legitimately name. Any
@@ -116,7 +130,10 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
         for d in &module.file.decls {
             match d {
                 Decl::Enum(e) => {
-                    enums.insert(e.name.clone(), e.variants.iter().map(|v| v.name.clone()).collect());
+                    enums.insert(
+                        e.name.clone(),
+                        e.variants.iter().map(|v| v.name.clone()).collect(),
+                    );
                 }
                 Decl::Global(g) if g.is_final => {
                     finals.insert(g.name.clone());
@@ -183,14 +200,21 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
         out.push(Diagnostic::unsupported(
             file.clone(),
             u.line,
-            format!("the `using` static-extension declaration `{}`", u.path.join(".")),
+            format!(
+                "the `using` static-extension declaration `{}`",
+                u.path.join(".")
+            ),
         ));
     }
     // Top-level declarations Hatchet recognised but skipped at parse time (an
     // `abstract` type or `enum abstract`) — flag each with the label the parser set.
     for d in &m.file.decls {
         if let Decl::Unsupported { feature, line } = d {
-            out.push(Diagnostic::unsupported(file.clone(), *line, feature.clone()));
+            out.push(Diagnostic::unsupported(
+                file.clone(),
+                *line,
+                feature.clone(),
+            ));
         }
     }
     // Parameterized enum variants (`Move(dx:Int, dy:Int)`) lower to the tagged
@@ -274,7 +298,9 @@ fn flag_proxy(prog: &Program, d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
         Decl::Global(g) => (&g.meta, 0, "a variable"),
         _ => return,
     };
-    let Some(m) = meta.iter().find(|m| m.name == "proxy") else { return };
+    let Some(m) = meta.iter().find(|m| m.name == "proxy") else {
+        return;
+    };
     // Only an `abstract Name(T)` newtype or an `abstract class` may be a proxy.
     let abstract_form =
         matches!(d, Decl::Class(c) if c.abstract_underlying.is_some() || c.is_abstract);
@@ -315,7 +341,10 @@ fn flag_rest_params(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
                 out.push(Diagnostic::unsupported(
                     file.to_string(),
                     signature_line(f),
-                    format!("the rest parameter `...{}` of `{who}` (Haxe 4.2 varargs)", p.name),
+                    format!(
+                        "the rest parameter `...{}` of `{who}` (Haxe 4.2 varargs)",
+                        p.name
+                    ),
                 ));
             }
         }
@@ -409,7 +438,11 @@ fn flag_macro_functions(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
 fn flag_unsupported_ops(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
     let Decl::Class(c) = d else { return };
     for m in &c.methods {
-        let Some(arg) = m.meta.iter().find(|me| me.name == "op").and_then(|me| me.first_arg())
+        let Some(arg) = m
+            .meta
+            .iter()
+            .find(|me| me.name == "op")
+            .and_then(|me| me.first_arg())
         else {
             continue;
         };
@@ -468,7 +501,9 @@ fn flag_stack_only(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
 fn flag_stack_restricted_nesting(prog: &Program, mi: usize, file: &str, out: &mut Vec<Diagnostic>) {
     // Does `ty` (directly, or as a container element) name a `@:stackOnly` type?
     fn restricted_use<'a>(prog: &Program, mi: usize, ty: &'a Type) -> Option<&'a Type> {
-        let Type::Named { path, params, .. } = ty else { return None };
+        let Type::Named { path, params, .. } = ty else {
+            return None;
+        };
         let name = path.last().map(|s| s.as_str()).unwrap_or("");
         // `Array<T>`/`Map<K,V>` — recurse into the element/value types.
         if container_template(name).is_some() {
@@ -508,14 +543,23 @@ fn flag_stack_restricted_nesting(prog: &Program, mi: usize, file: &str, out: &mu
             }
         }
         // typedef struct fields too
-        if let Decl::Typedef(Typedef { target: TypedefTarget::Struct(sfields), name: tn, .. }) = d {
+        if let Decl::Typedef(Typedef {
+            target: TypedefTarget::Struct(sfields),
+            name: tn,
+            ..
+        }) = d
+        {
             for sf in sfields {
                 if let Some(bad) = restricted_use(prog, mi, &sf.ty) {
                     let n = match bad {
                         Type::Named { path, .. } => path.last().cloned().unwrap_or_default(),
                         _ => String::new(),
                     };
-                    report(bad, &format!("as the type of field `{}` in typedef `{tn}`", sf.name), &n);
+                    report(
+                        bad,
+                        &format!("as the type of field `{}` in typedef `{tn}`", sf.name),
+                        &n,
+                    );
                 }
             }
         }
@@ -641,7 +685,10 @@ fn flag_properties(d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
                 // A custom getter requires its `get_x` method — without it every
                 // routed read would call a method that does not exist.
                 if f.get == Get
-                    && !c.methods.iter().any(|m| m.name.as_deref() == Some(&format!("get_{}", f.name)))
+                    && !c
+                        .methods
+                        .iter()
+                        .any(|m| m.name.as_deref() == Some(&format!("get_{}", f.name)))
                 {
                     let line = match field_line(f) {
                         0 => c.line,
@@ -737,7 +784,11 @@ impl<'a> UnsupportedWalker<'a> {
     fn pattern_supported(&self, p: &Expr) -> bool {
         match p {
             Expr::Int(_) | Expr::Float(_) | Expr::Str { .. } | Expr::Bool(_) => true,
-            Expr::Unary { op: UnOp::Neg, expr, prefix: true } => {
+            Expr::Unary {
+                op: UnOp::Neg,
+                expr,
+                prefix: true,
+            } => {
                 matches!(&**expr, Expr::Int(_) | Expr::Float(_))
             }
             Expr::Paren(inner) => self.pattern_supported(inner),
@@ -756,7 +807,9 @@ impl<'a> UnsupportedWalker<'a> {
                     _ => None,
                 };
                 self.finals.contains(member)
-                    || ty.and_then(|t| self.enums.get(t)).is_some_and(|vs| vs.contains(member))
+                    || ty
+                        .and_then(|t| self.enums.get(t))
+                        .is_some_and(|vs| vs.contains(member))
             }
             _ => false,
         }
@@ -831,7 +884,8 @@ impl<'a> UnsupportedWalker<'a> {
             _ => "a non-constant `switch` pattern (only literals and enum members are lowered)"
                 .to_string(),
         };
-        self.out.push(Diagnostic::unsupported(self.file.clone(), self.line, what));
+        self.out
+            .push(Diagnostic::unsupported(self.file.clone(), self.line, what));
     }
 
     fn decl(&mut self, d: &Decl) {
@@ -904,7 +958,12 @@ impl<'a> UnsupportedWalker<'a> {
                 self.line = *line;
                 self.expr(e);
             }
-            Stmt::If { cond, then, els, line } => {
+            Stmt::If {
+                cond,
+                then,
+                els,
+                line,
+            } => {
                 self.line = *line;
                 self.expr(cond);
                 self.stmt(then);
@@ -912,17 +971,26 @@ impl<'a> UnsupportedWalker<'a> {
                     self.stmt(e);
                 }
             }
-            Stmt::For { iter, body, line, .. } => {
+            Stmt::For {
+                iter, body, line, ..
+            } => {
                 self.line = *line;
                 self.iterable(iter);
                 self.stmt(body);
             }
-            Stmt::While { cond, body, line, .. } => {
+            Stmt::While {
+                cond, body, line, ..
+            } => {
                 self.line = *line;
                 self.expr(cond);
                 self.stmt(body);
             }
-            Stmt::Switch { subject, cases, default, line } => {
+            Stmt::Switch {
+                subject,
+                cases,
+                default,
+                line,
+            } => {
                 self.line = *line;
                 self.expr(subject);
                 for c in cases {
@@ -967,7 +1035,11 @@ impl<'a> UnsupportedWalker<'a> {
             // A lambda reaching any ordinary expression position is unsupported.
             Expr::Lambda { .. } => self.flag_lambda(),
             Expr::Regex { .. } => self.flag_regex(),
-            Expr::Switch { subject, cases, default } => {
+            Expr::Switch {
+                subject,
+                cases,
+                default,
+            } => {
                 self.expr(subject);
                 for c in cases {
                     self.case_patterns(&c.patterns);
@@ -1051,7 +1123,9 @@ impl<'a> UnsupportedWalker<'a> {
                     self.expr(v);
                 }
             }
-            Expr::Comprehension { iter, guard, body, .. } => {
+            Expr::Comprehension {
+                iter, guard, body, ..
+            } => {
                 self.iterable(iter);
                 if let Some(g) = guard {
                     self.expr(g);
@@ -1116,7 +1190,9 @@ impl Collector {
     /// recurse into its parameters. `ctx` labels where the type appeared.
     fn check(&mut self, ty: &Type, ctx: &str) {
         match ty {
-            Type::Named { path, params, line, .. } => {
+            Type::Named {
+                path, params, line, ..
+            } => {
                 let name = path.last().map(|s| s.as_str()).unwrap_or("");
                 // `Dynamic`/`Any` are valid Haxe types with no concrete C++ spelling
                 // (the overload marker); they resolve, even if never emitted directly.
@@ -1267,7 +1343,9 @@ impl Collector {
                 }
             }
             Stmt::Expr(e, _) => self.expr(e, ctx),
-            Stmt::If { cond, then, els, .. } => {
+            Stmt::If {
+                cond, then, els, ..
+            } => {
                 self.expr(cond, ctx);
                 self.stmt(then, ctx);
                 if let Some(e) = els {
@@ -1282,7 +1360,12 @@ impl Collector {
                 self.expr(cond, ctx);
                 self.stmt(body, ctx);
             }
-            Stmt::Switch { subject, cases, default, .. } => {
+            Stmt::Switch {
+                subject,
+                cases,
+                default,
+                ..
+            } => {
                 self.expr(subject, ctx);
                 for c in cases {
                     for p in &c.patterns {
@@ -1334,7 +1417,11 @@ impl Collector {
     /// sub-expression so `new`/`cast`/type-checks anywhere are validated.
     fn expr(&mut self, e: &Expr, ctx: &str) {
         match e {
-            Expr::Switch { subject, cases, default } => {
+            Expr::Switch {
+                subject,
+                cases,
+                default,
+            } => {
                 self.expr(subject, ctx);
                 for c in cases {
                     for p in &c.patterns {
@@ -1423,7 +1510,9 @@ impl Collector {
                     self.expr(val, ctx);
                 }
             }
-            Expr::Comprehension { iter, guard, body, .. } => {
+            Expr::Comprehension {
+                iter, guard, body, ..
+            } => {
                 self.iterable(iter, ctx);
                 if let Some(g) = guard {
                     self.expr(g, ctx);
