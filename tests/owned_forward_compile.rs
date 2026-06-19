@@ -20,7 +20,11 @@ fn find_gxx() -> Option<String> {
         Some(r"C:\msys64\mingw32\bin\g++.exe".to_string()),
     ];
     candidates.into_iter().flatten().find(|c| {
-        Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+        Command::new(c)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     })
 }
 
@@ -106,13 +110,26 @@ fn owned_params_and_forward_decls_compile_and_run() {
     // The forward declaration is present, and the `@sink` `new` is inline with
     // no caller-side delete.
     let header = std::fs::read_to_string(out.join("lib").join("Bag.h")).unwrap();
-    assert!(header.contains("class Item;"), "Item forward-declared:\n{header}");
+    assert!(
+        header.contains("class Item;"),
+        "Item forward-declared:\n{header}"
+    );
     let body = std::fs::read_to_string(out.join("lib").join("Bag.cpp")).unwrap();
-    assert!(body.contains("this->items.push_back(it)"), "add stores the element:\n{body}");
+    assert!(
+        body.contains("this->items.push_back(it)"),
+        "add stores the element:\n{body}"
+    );
 
-    let exe = out.join(if cfg!(windows) { "ownfwd.exe" } else { "ownfwd" });
+    let exe = out.join(if cfg!(windows) {
+        "ownfwd.exe"
+    } else {
+        "ownfwd"
+    });
     let mut cmd = Command::new(&gxx);
-    cmd.args(["-std=c++98", "-pedantic", "-Wall"]).arg("-I").arg(&out).arg(&main_cpp);
+    cmd.args(["-std=c++98", "-pedantic", "-Wall"])
+        .arg("-I")
+        .arg(&out)
+        .arg(&main_cpp);
     for f in cpp_files(&out) {
         cmd.arg(f);
     }
@@ -124,10 +141,15 @@ fn owned_params_and_forward_decls_compile_and_run() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    let run = Command::new(&exe).output().expect("run the owned/forward demo");
+    let run = Command::new(&exe)
+        .output()
+        .expect("run the owned/forward demo");
     let stdout = String::from_utf8_lossy(&run.stdout);
     let _ = std::fs::remove_dir_all(&root);
 
     // Both items survive in the bag (no use-after-free): 10 + 32 = 42.
-    assert!(stdout.contains("count=2 total=42"), "stored owned pointers must stay alive:\n{stdout}");
+    assert!(
+        stdout.contains("count=2 total=42"),
+        "stored owned pointers must stay alive:\n{stdout}"
+    );
 }

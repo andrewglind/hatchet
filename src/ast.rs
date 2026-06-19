@@ -48,10 +48,7 @@ pub enum Type {
     /// Anonymous structure type: `{ x:Int, ?y:Float }`.
     Anon(Vec<StructField>),
     /// Function type `A -> B -> C`.
-    Func {
-        params: Vec<Type>,
-        ret: Box<Type>,
-    },
+    Func { params: Vec<Type>, ret: Box<Type> },
 }
 
 impl Type {
@@ -102,7 +99,10 @@ pub enum PropAccess {
 pub enum Expr {
     Int(String),
     Float(String),
-    Str { raw: String, interpolated: bool },
+    Str {
+        raw: String,
+        interpolated: bool,
+    },
     Bool(bool),
     Null,
     This,
@@ -114,10 +114,26 @@ pub enum Expr {
     Call(Box<Expr>, Vec<Expr>),
     New(Type, Vec<Expr>),
 
-    Unary { op: UnOp, expr: Box<Expr>, prefix: bool },
-    Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
-    Ternary { cond: Box<Expr>, then: Box<Expr>, els: Box<Expr> },
-    Assign { op: Option<BinOp>, target: Box<Expr>, value: Box<Expr> },
+    Unary {
+        op: UnOp,
+        expr: Box<Expr>,
+        prefix: bool,
+    },
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    Ternary {
+        cond: Box<Expr>,
+        then: Box<Expr>,
+        els: Box<Expr>,
+    },
+    Assign {
+        op: Option<BinOp>,
+        target: Box<Expr>,
+        value: Box<Expr>,
+    },
 
     /// `x ?? y`
     NullCoalesce(Box<Expr>, Box<Expr>),
@@ -128,9 +144,13 @@ pub enum Expr {
     MapLit(Vec<(Expr, Expr)>),
     ObjectLit(Vec<(String, Expr)>),
 
-    /// `[for (v in iter) body]` (array) or with `=>` body (map).
+    /// `[for (v in iter) body]` (array) or with `=>` body (map). `value_var` is
+    /// the optional second binding of key-value iteration (`for (k => v in iter)`):
+    /// then `var` is the key (an `Int` index over an Array, the key type over a
+    /// Map) and `value_var` is the element/value.
     Comprehension {
         var: String,
+        value_var: Option<String>,
         iter: Box<Iterable>,
         guard: Option<Box<Expr>>,
         body: ComprBody,
@@ -143,19 +163,48 @@ pub enum Expr {
     },
 
     /// `cast expr` or `cast(expr, Type)`.
-    Cast { expr: Box<Expr>, ty: Option<Type> },
+    Cast {
+        expr: Box<Expr>,
+        ty: Option<Type>,
+    },
     /// `(expr : Type)`.
-    TypeCheck { expr: Box<Expr>, ty: Type },
+    TypeCheck {
+        expr: Box<Expr>,
+        ty: Type,
+    },
     /// The Haxe 4.2 `expr is Type` runtime type-check operator. Hatchet does not
     /// transpile it yet; this is carried only so the validation pass can flag it as
     /// `Unsupported` with a precise location (a class-type check would need
     /// `dynamic_cast` / RTTI, which is a separate, target-sensitive feature).
-    Is { expr: Box<Expr>, ty: Type },
+    Is {
+        expr: Box<Expr>,
+        ty: Type,
+    },
 
     /// A `switch` used in value position (`var x = switch (e) { … }`). Carries the
     /// same shape as the statement form; codegen desugars it to a hoisted temporary
     /// plus a statement `switch` whose arms assign their trailing value to the temp.
-    Switch { subject: Box<Expr>, cases: Vec<Case>, default: Option<Vec<Stmt>> },
+    Switch {
+        subject: Box<Expr>,
+        cases: Vec<Case>,
+        default: Option<Vec<Stmt>>,
+    },
+
+    /// An `if`/`else` used in value position (`var x = if (c) a else b`, or an
+    /// `if`-expression as an array-comprehension body). Each branch is a block or a
+    /// nested value `if`; codegen desugars it like a value `switch` — a hoisted
+    /// temporary plus a statement `if` whose branches assign their trailing value.
+    If {
+        cond: Box<Expr>,
+        then: Box<Expr>,
+        els: Option<Box<Expr>>,
+    },
+
+    /// A brace-delimited block used in value position. Its value is the trailing
+    /// expression statement (`{ … ; v }` → `v`). Codegen hoists the statements and
+    /// assigns the trailing value to a temporary.
+    Block(Vec<Stmt>),
+
     /// Parenthesised expression (grouping preserved for fidelity).
     Paren(Box<Expr>),
 
@@ -168,7 +217,10 @@ pub enum Expr {
     /// A regular-expression literal `~/pattern/flags`. Hatchet does not transpile
     /// regex; this is carried only so the validation pass can flag it as
     /// `Unsupported` with a precise location.
-    Regex { pattern: String, flags: String },
+    Regex {
+        pattern: String,
+        flags: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,10 +254,24 @@ pub enum UnOp {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
-    Add, Sub, Mul, Div, Mod,
-    Eq, Ne, Lt, Gt, Le, Ge,
-    And, Or,
-    BitAnd, BitOr, BitXor, Shl, Shr,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    And,
+    Or,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
     /// Haxe `>>>` (unsigned right shift). C++98 has no `>>>`; codegen lowers it
     /// through an `unsigned int` cast: `(int)((unsigned int)a >> b)`.
     UShr,
@@ -267,12 +333,19 @@ pub enum Stmt {
     /// A `try { … } catch (e:T) { … }` block, lowered to C++ `try`/`catch` (a
     /// typed catch maps the exception type; an untyped/`Dynamic` catch becomes the
     /// non-binding `catch (...)`).
-    Try { body: Box<Stmt>, catches: Vec<Catch>, line: usize },
+    Try {
+        body: Box<Stmt>,
+        catches: Vec<Catch>,
+        line: usize,
+    },
     Block(Vec<Stmt>),
     /// Verbatim C++ injected at this point in the body, from `@:cppFileCode('...')`
     /// statement-level metadata. The code is emitted exactly as written (at column
     /// 0, so it can carry preprocessor directives like `#ifdef`/`#else`/`#endif`).
-    Verbatim { code: String, line: usize },
+    Verbatim {
+        code: String,
+        line: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -475,7 +548,10 @@ pub enum Decl {
     /// type or `enum abstract`). Its body is skipped at parse time; `feature` is a
     /// human label and `line` its location, so the validation pass can flag it as
     /// `Unsupported` rather than dying with a parse error.
-    Unsupported { feature: String, line: usize },
+    Unsupported {
+        feature: String,
+        line: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

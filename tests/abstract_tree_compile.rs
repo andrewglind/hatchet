@@ -19,7 +19,11 @@ fn find_gxx() -> Option<String> {
         Some(r"C:\msys64\mingw32\bin\g++.exe".to_string()),
     ];
     candidates.into_iter().flatten().find(|c| {
-        Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+        Command::new(c)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     })
 }
 
@@ -134,15 +138,34 @@ fn abstract_recursive_value_tree_compiles_and_runs() {
 
     // Value semantics: no heap, no frees anywhere in the generated body.
     let body = std::fs::read_to_string(out.join("lib").join("JValue.cpp")).unwrap();
-    assert!(!body.contains("new "), "a value class must not heap-allocate:\n{body}");
-    assert!(!body.contains("delete"), "a value class owns nothing to free:\n{body}");
+    assert!(
+        !body.contains("new "),
+        "a value class must not heap-allocate:\n{body}"
+    );
+    assert!(
+        !body.contains("delete"),
+        "a value class owns nothing to free:\n{body}"
+    );
     let header = std::fs::read_to_string(out.join("lib").join("JValue.h")).unwrap();
-    assert!(header.contains("std::vector<JValue>"), "recursive-by-value container:\n{header}");
-    assert!(!header.contains("virtual ~JValue"), "value class has no virtual destructor:\n{header}");
+    assert!(
+        header.contains("std::vector<JValue>"),
+        "recursive-by-value container:\n{header}"
+    );
+    assert!(
+        !header.contains("virtual ~JValue"),
+        "value class has no virtual destructor:\n{header}"
+    );
 
-    let exe = out.join(if cfg!(windows) { "abstree.exe" } else { "abstree" });
+    let exe = out.join(if cfg!(windows) {
+        "abstree.exe"
+    } else {
+        "abstree"
+    });
     let mut cmd = Command::new(&gxx);
-    cmd.args(["-std=c++98", "-pedantic", "-Wall"]).arg("-I").arg(&out).arg(&main_cpp);
+    cmd.args(["-std=c++98", "-pedantic", "-Wall"])
+        .arg("-I")
+        .arg(&out)
+        .arg(&main_cpp);
     for f in cpp_files(&out) {
         cmd.arg(f);
     }
@@ -154,7 +177,9 @@ fn abstract_recursive_value_tree_compiles_and_runs() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    let run = Command::new(&exe).output().expect("run the abstract value-tree demo");
+    let run = Command::new(&exe)
+        .output()
+        .expect("run the abstract value-tree demo");
     let stdout = String::from_utf8_lossy(&run.stdout);
     let _ = std::fs::remove_dir_all(&root);
 

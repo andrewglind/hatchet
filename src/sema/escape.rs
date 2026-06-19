@@ -93,7 +93,9 @@ pub fn analyze_class(prog: &Program, mi: usize, class: &Class) -> ClassEscape {
     let handed_out = fields_handed_out(prog, mi, class, &fields);
     inferred.retain(|f| !handed_out.contains(f));
     let owned: BTreeSet<String> = tagged.union(&inferred).cloned().collect();
-    ClassEscape { owned_fields: owned }
+    ClassEscape {
+        owned_fields: owned,
+    }
 }
 
 /// The `@owned`-tagged field names (the explicit override set).
@@ -111,7 +113,12 @@ fn tagged_owned(class: &Class) -> BTreeSet<String> {
 /// hand-out guard.
 fn inferred_owned(class: &Class, fields: &BTreeSet<String>) -> BTreeSet<String> {
     let mut inferred = BTreeSet::new();
-    for body in class.ctor.iter().chain(class.methods.iter()).filter_map(|f| f.body.as_ref()) {
+    for body in class
+        .ctor
+        .iter()
+        .chain(class.methods.iter())
+        .filter_map(|f| f.body.as_ref())
+    {
         // `None` ctx: owned-field detection never depends on argument ownership, so
         // it skips the interprocedural resolution (and the recursion it could spawn);
         // return-consumption likewise never adds an owned field, so the summary is empty.
@@ -131,7 +138,10 @@ fn inferred_owned(class: &Class, fields: &BTreeSet<String>) -> BTreeSet<String> 
 /// there, since over-claiming ownership only ever produces a leak, never a double-free.
 fn owned_fields_unguarded(class: &Class) -> BTreeSet<String> {
     let fields: BTreeSet<String> = class.fields.iter().map(|f| f.name.clone()).collect();
-    tagged_owned(class).union(&inferred_owned(class, &fields)).cloned().collect()
+    tagged_owned(class)
+        .union(&inferred_owned(class, &fields))
+        .cloned()
+        .collect()
 }
 
 /// Fields whose pointer value is handed back out of the object somewhere in the class —
@@ -140,10 +150,17 @@ fn owned_fields_unguarded(class: &Class) -> BTreeSet<String> {
 /// *borrowed* (used as a method or field receiver, or in a comparison). Such a field can
 /// be aliased and then freed or used outside the object's lifetime, so the soundness
 /// guard will not free it in the destructor.
-fn fields_handed_out(prog: &Program, mi: usize, class: &Class, fields: &BTreeSet<String>) -> BTreeSet<String> {
+fn fields_handed_out(
+    prog: &Program,
+    mi: usize,
+    class: &Class,
+    fields: &BTreeSet<String>,
+) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for f in class.ctor.iter().chain(class.methods.iter()) {
-        let Some(body) = f.body.as_ref() else { continue };
+        let Some(body) = f.body.as_ref() else {
+            continue;
+        };
         // A bare `name` that is a parameter or a local `var` refers to that binding, not
         // a same-named field (Haxe shadowing) — so a local `texture` passed to a call is
         // not the field `texture` being handed out. Collect those names up front and
@@ -174,7 +191,12 @@ fn collect_locals_stmt(st: &Stmt, out: &mut BTreeSet<String>) {
             }
         }
         Stmt::While { body, .. } => collect_locals_stmt(body, out),
-        Stmt::For { var, value_var, body, .. } => {
+        Stmt::For {
+            var,
+            value_var,
+            body,
+            ..
+        } => {
             out.insert(var.clone());
             if let Some(v) = value_var {
                 out.insert(v.clone());
@@ -214,13 +236,17 @@ fn scan_stmt_escapes(
         Stmt::Return(Some(e), _) | Stmt::Throw(e, _) => {
             scan_expr_escapes(prog, mi, e, true, fields, locals, out)
         }
-        Stmt::Var { init: Some(e), .. } => scan_expr_escapes(prog, mi, e, true, fields, locals, out),
+        Stmt::Var { init: Some(e), .. } => {
+            scan_expr_escapes(prog, mi, e, true, fields, locals, out)
+        }
         Stmt::Expr(Expr::Assign { target, value, .. }, _) => {
             scan_expr_escapes(prog, mi, value, true, fields, locals, out);
             scan_expr_escapes(prog, mi, target, false, fields, locals, out);
         }
         Stmt::Expr(e, _) => scan_expr_escapes(prog, mi, e, false, fields, locals, out),
-        Stmt::If { cond, then, els, .. } => {
+        Stmt::If {
+            cond, then, els, ..
+        } => {
             scan_expr_escapes(prog, mi, cond, false, fields, locals, out);
             scan_stmt_escapes(prog, mi, then, fields, locals, out);
             if let Some(e) = els {
@@ -241,7 +267,12 @@ fn scan_stmt_escapes(
             }
             scan_stmt_escapes(prog, mi, body, fields, locals, out);
         }
-        Stmt::Switch { subject, cases, default, .. } => {
+        Stmt::Switch {
+            subject,
+            cases,
+            default,
+            ..
+        } => {
             scan_expr_escapes(prog, mi, subject, false, fields, locals, out);
             for c in cases {
                 for s in &c.body {
@@ -367,7 +398,9 @@ fn target_own_field(target: &Expr, fields: &BTreeSet<String>) -> Option<String> 
 /// Resolve a `new X(...)` type to its `Class` declaration and the module index it was
 /// declared in (so types named inside *its* body resolve in their own scope).
 fn resolve_class<'a>(prog: &'a Program, mi: usize, ty: &Type) -> Option<(&'a Class, usize)> {
-    let Type::Named { path, .. } = ty else { return None };
+    let Type::Named { path, .. } = ty else {
+        return None;
+    };
     let info = prog.resolve_type(path, mi)?;
     let cmi = info.module_index;
     match prog.type_decl(info) {
@@ -408,8 +441,8 @@ fn ctor_owned_indices(
             let owned = owned_fields_unguarded(class);
             let fields: BTreeSet<String> = class.fields.iter().map(|f| f.name.clone()).collect();
             for (i, p) in ctor.params.iter().enumerate() {
-                let direct = param_dest_field(body, &p.name, &fields)
-                    .is_some_and(|f| owned.contains(&f));
+                let direct =
+                    param_dest_field(body, &p.name, &fields).is_some_and(|f| owned.contains(&f));
                 if direct
                     || param_into_owning_new(prog, mi, body, &p.name, &owned, &fields, visiting)
                 {
@@ -426,7 +459,15 @@ fn ctor_owned_indices(
 /// bare `field = param`), searched across the (flat) statement list.
 fn param_dest_field(body: &[Stmt], param: &str, fields: &BTreeSet<String>) -> Option<String> {
     for st in body {
-        if let Stmt::Expr(Expr::Assign { op: None, target, value }, _) = st {
+        if let Stmt::Expr(
+            Expr::Assign {
+                op: None,
+                target,
+                value,
+            },
+            _,
+        ) = st
+        {
             if let Expr::Ident(p) = &**value {
                 if p == param {
                     if let Some(f) = target_own_field(target, fields) {
@@ -453,13 +494,29 @@ fn param_into_owning_new(
     visiting: &mut BTreeSet<(usize, String)>,
 ) -> bool {
     for st in body {
-        let Stmt::Expr(Expr::Assign { op: None, target, value }, _) = st else { continue };
-        let Some(field) = target_own_field(target, fields) else { continue };
+        let Stmt::Expr(
+            Expr::Assign {
+                op: None,
+                target,
+                value,
+            },
+            _,
+        ) = st
+        else {
+            continue;
+        };
+        let Some(field) = target_own_field(target, fields) else {
+            continue;
+        };
         if !owned.contains(&field) {
             continue;
         }
-        let Expr::New(ty, args) = &**value else { continue };
-        let Some((xc, xmi)) = resolve_class(prog, mi, ty) else { continue };
+        let Expr::New(ty, args) = &**value else {
+            continue;
+        };
+        let Some((xc, xmi)) = resolve_class(prog, mi, ty) else {
+            continue;
+        };
         let owned_idx = ctor_owned_indices(prog, xmi, xc, visiting);
         for (j, a) in args.iter().enumerate() {
             if owned_idx.contains(&j) {
@@ -503,7 +560,9 @@ fn owned_returning_methods(
 ) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for m in &class.methods {
-        let (Some(name), Some(body)) = (m.name.as_ref(), m.body.as_ref()) else { continue };
+        let (Some(name), Some(body)) = (m.name.as_ref(), m.body.as_ref()) else {
+            continue;
+        };
         let fe = analyze_body(fields, body, Some((prog, mi)), BTreeSet::new());
         if fe.allocs.values().any(|o| *o == Owner::Return) {
             out.insert(name.clone());
@@ -596,7 +655,9 @@ impl<'a> Walk<'a> {
     /// when interprocedural resolution is disabled or the type can't be resolved (a
     /// conservative "the constructor borrows / is unknown", so the args escape).
     fn ctor_owned_args(&self, ty: &Type) -> BTreeSet<usize> {
-        let Some((prog, mi)) = self.ctx else { return BTreeSet::new() };
+        let Some((prog, mi)) = self.ctx else {
+            return BTreeSet::new();
+        };
         match resolve_class(prog, mi, ty) {
             Some((c, cmi)) => {
                 let mut visiting = BTreeSet::new();
@@ -608,7 +669,11 @@ impl<'a> Walk<'a> {
 
     fn stmt(&mut self, s: &Stmt) {
         match s {
-            Stmt::Var { name, init: Some(e), .. } => {
+            Stmt::Var {
+                name,
+                init: Some(e),
+                ..
+            } => {
                 let src = self.value(e, Some(name));
                 self.assigns.push((name.clone(), src));
             }
@@ -617,7 +682,9 @@ impl<'a> Walk<'a> {
                 let src = self.value(e, None);
                 self.sinks.push((Sink::Return, src));
             }
-            Stmt::If { cond, then, els, .. } => {
+            Stmt::If {
+                cond, then, els, ..
+            } => {
                 let _ = self.value(cond, None);
                 self.stmt(then);
                 if let Some(e) = els {
@@ -645,7 +712,12 @@ impl<'a> Walk<'a> {
                     self.stmt(s);
                 }
             }
-            Stmt::Switch { subject, cases, default, .. } => {
+            Stmt::Switch {
+                subject,
+                cases,
+                default,
+                ..
+            } => {
                 let _ = self.value(subject, None);
                 for c in cases {
                     for s in &c.body {
@@ -664,7 +736,11 @@ impl<'a> Walk<'a> {
 
     fn expr_stmt(&mut self, e: &Expr) {
         match e {
-            Expr::Assign { op: None, target, value } => {
+            Expr::Assign {
+                op: None,
+                target,
+                value,
+            } => {
                 if let Some(field) = self.own_field(target) {
                     let src = self.value(value, None);
                     self.sinks.push((Sink::Field(field), src));
@@ -750,7 +826,8 @@ impl<'a> Walk<'a> {
             Expr::Field(recv, m) if matches!(**recv, Expr::This) => Some(m.as_str()),
             _ => None,
         };
-        name.map(|n| self.owned_returning.contains(n)).unwrap_or(false)
+        name.map(|n| self.owned_returning.contains(n))
+            .unwrap_or(false)
     }
 
     /// Evaluate an expression in a *result* position, returning what it produces.
@@ -768,7 +845,11 @@ impl<'a> Walk<'a> {
                 let owned = self.ctor_owned_args(ty);
                 for (i, a) in args.iter().enumerate() {
                     let src = self.value(a, None);
-                    let sink = if owned.contains(&i) { Sink::Owned } else { Sink::Call };
+                    let sink = if owned.contains(&i) {
+                        Sink::Owned
+                    } else {
+                        Sink::Call
+                    };
                     self.sinks.push((sink, src));
                 }
                 Source::New(id)
@@ -883,7 +964,11 @@ impl<'a> Walk<'a> {
             allocs.insert(*id, owner);
         }
 
-        FnEscape { allocs, alloc_local: self.alloc_local, scope_owned }
+        FnEscape {
+            allocs,
+            alloc_local: self.alloc_local,
+            scope_owned,
+        }
     }
 }
 
@@ -931,7 +1016,12 @@ pub fn escaping_push_receivers(prog: &Program, mi: usize, class: &Class) -> BTre
     let ns = prog.modules[mi].package.clone();
     let fields: BTreeSet<String> = class.fields.iter().map(|f| f.name.clone()).collect();
     let mut edges: Vec<(String, PushFlow)> = Vec::new();
-    for body in class.ctor.iter().chain(class.methods.iter()).filter_map(|f| f.body.as_ref()) {
+    for body in class
+        .ctor
+        .iter()
+        .chain(class.methods.iter())
+        .filter_map(|f| f.body.as_ref())
+    {
         collect_push_edges(body, &fields, &mut edges);
     }
     // Seed with the owned class-field containers (keyed `this.field`), then
@@ -954,12 +1044,19 @@ pub fn escaping_push_receivers(prog: &Program, mi: usize, class: &Class) -> BTre
             break;
         }
     }
-    keys.into_iter().map(|k| k.strip_prefix("this.").map(String::from).unwrap_or(k)).collect()
+    keys.into_iter()
+        .map(|k| k.strip_prefix("this.").map(String::from).unwrap_or(k))
+        .collect()
 }
 
 /// Container fields whose leaf elements are pointers this class allocates with `new`
 /// (so it owns them): `(field, nesting depth)`.
-fn owned_container_fields(prog: &Program, mi: usize, ns: &[String], class: &Class) -> Vec<(String, usize)> {
+fn owned_container_fields(
+    prog: &Program,
+    mi: usize,
+    ns: &[String],
+    class: &Class,
+) -> Vec<(String, usize)> {
     let bearing = new_bearing_names(class);
     let mut out = Vec::new();
     for f in &class.fields {
@@ -977,7 +1074,12 @@ fn owned_container_fields(prog: &Program, mi: usize, ns: &[String], class: &Clas
 
 /// If `ty` is a nested `Array<...>` whose leaf element maps to a pointer, the nesting
 /// depth; otherwise `None`. (Also used by the destructor emission in `codegen`.)
-pub fn container_depth_if_pointer_leaf(prog: &Program, mi: usize, ns: &[String], ty: &Type) -> Option<usize> {
+pub fn container_depth_if_pointer_leaf(
+    prog: &Program,
+    mi: usize,
+    ns: &[String],
+    ty: &Type,
+) -> Option<usize> {
     let mut depth = 0;
     let mut cur = ty;
     while let Type::Named { path, params, .. } = cur {
@@ -991,7 +1093,9 @@ pub fn container_depth_if_pointer_leaf(prog: &Program, mi: usize, ns: &[String],
     if depth == 0 {
         return None;
     }
-    prog.map_type_use(cur, mi, ns).ends_with('*').then_some(depth)
+    prog.map_type_use(cur, mi, ns)
+        .ends_with('*')
+        .then_some(depth)
 }
 
 /// Names (locals as `n`, fields as `this.f`) that receive `new`-allocated elements
@@ -999,7 +1103,12 @@ pub fn container_depth_if_pointer_leaf(prog: &Program, mi: usize, ns: &[String],
 fn new_bearing_names(class: &Class) -> BTreeSet<String> {
     let fields: BTreeSet<String> = class.fields.iter().map(|f| f.name.clone()).collect();
     let mut edges: Vec<(String, PushFlow)> = Vec::new();
-    for body in class.ctor.iter().chain(class.methods.iter()).filter_map(|f| f.body.as_ref()) {
+    for body in class
+        .ctor
+        .iter()
+        .chain(class.methods.iter())
+        .filter_map(|f| f.body.as_ref())
+    {
         collect_push_edges(body, &fields, &mut edges);
     }
     let mut bearing = BTreeSet::new();
@@ -1021,7 +1130,11 @@ fn new_bearing_names(class: &Class) -> BTreeSet<String> {
     bearing
 }
 
-fn collect_push_edges(stmts: &[Stmt], fields: &BTreeSet<String>, out: &mut Vec<(String, PushFlow)>) {
+fn collect_push_edges(
+    stmts: &[Stmt],
+    fields: &BTreeSet<String>,
+    out: &mut Vec<(String, PushFlow)>,
+) {
     for st in stmts {
         match st {
             Stmt::Expr(e, _) => push_edge_from_expr(e, fields, out),
@@ -1114,7 +1227,9 @@ pub fn advisory_warnings(prog: &Program, mi: usize, class: &Class) -> Vec<(usize
     // An `@delete` local whose value the analysis says does not merely live and die in
     // this scope — it escapes to a field, is returned, or is aliased.
     for func in class.ctor.iter().chain(class.methods.iter()) {
-        let Some(body) = func.body.as_ref() else { continue };
+        let Some(body) = func.body.as_ref() else {
+            continue;
+        };
         let mut marked: Vec<(String, usize)> = Vec::new();
         collect_delete_vars(body, &mut marked);
         if marked.is_empty() {
@@ -1151,7 +1266,12 @@ pub fn advisory_warnings(prog: &Program, mi: usize, class: &Class) -> Vec<(usize
 fn collect_delete_vars(body: &[Stmt], out: &mut Vec<(String, usize)>) {
     for st in body {
         match st {
-            Stmt::Var { name, delete: true, line, .. } => out.push((name.clone(), *line)),
+            Stmt::Var {
+                name,
+                delete: true,
+                line,
+                ..
+            } => out.push((name.clone(), *line)),
             Stmt::If { then, els, .. } => {
                 collect_delete_vars(std::slice::from_ref(then), out);
                 if let Some(e) = els {
@@ -1181,13 +1301,19 @@ mod tests {
     use crate::parser;
 
     fn method<'a>(c: &'a Class, name: &str) -> &'a Function {
-        c.methods.iter().find(|m| m.name.as_deref() == Some(name)).expect("method")
+        c.methods
+            .iter()
+            .find(|m| m.name.as_deref() == Some(name))
+            .expect("method")
     }
 
     /// Build a one-file `Program` so `analyze_fn` can resolve `new X` constructors.
     fn prog_of(src: &str) -> Program {
         let file = parser::parse(src).expect("parse");
-        Program::build(std::path::Path::new("."), vec![(std::path::PathBuf::from("C.hx"), file)])
+        Program::build(
+            std::path::Path::new("."),
+            vec![(std::path::PathBuf::from("C.hx"), file)],
+        )
     }
 
     fn class_c(prog: &Program) -> &Class {
@@ -1212,7 +1338,10 @@ mod tests {
 
     #[test]
     fn field_assigned_new_is_owned() {
-        assert!(owned_of("class C { var f:T; public function new() { this.f = new T(); } }").contains("f"));
+        assert!(
+            owned_of("class C { var f:T; public function new() { this.f = new T(); } }")
+                .contains("f")
+        );
     }
 
     #[test]
@@ -1221,10 +1350,16 @@ mod tests {
         // is via a local (a case the old `collect_new_assigns` heuristic missed).
         let prog = prog_of("class T {} class C { var f:T; public function new() { var x = new T(); this.f = x; } }");
         let c = class_c(&prog);
-        assert!(analyze_class(&prog, 0, c).owned_fields.contains("f"), "field owns the allocation");
+        assert!(
+            analyze_class(&prog, 0, c).owned_fields.contains("f"),
+            "field owns the allocation"
+        );
         // The local must NOT also be scope-owned (that would double-free).
         let fe = analyze_fn(&prog, 0, c, c.ctor.as_ref().unwrap());
-        assert!(!fe.scope_owned.contains("x"), "x escapes to the field, not the scope");
+        assert!(
+            !fe.scope_owned.contains("x"),
+            "x escapes to the field, not the scope"
+        );
     }
 
     #[test]
@@ -1242,7 +1377,10 @@ mod tests {
         let c = class_c(&prog);
         let fe = analyze_fn(&prog, 0, c, method(c, "make"));
         assert!(fe.allocs.values().any(|o| *o == Owner::Return));
-        assert!(fe.scope_owned.is_empty(), "a returned new is not scope-freed");
+        assert!(
+            fe.scope_owned.is_empty(),
+            "a returned new is not scope-freed"
+        );
     }
 
     #[test]
@@ -1256,8 +1394,15 @@ mod tests {
         let c = class_c(&prog);
         let fe = analyze_fn(&prog, 0, c, method(c, "run"));
         assert!(fe.scope_owned.contains("line"));
-        assert!(fe.allocs.values().any(|o| *o == Owner::Transferred), "vertex is owned by Line");
-        assert!(!fe.allocs.values().any(|o| matches!(o, Owner::Leak(_))), "no leak: {:?}", fe.allocs);
+        assert!(
+            fe.allocs.values().any(|o| *o == Owner::Transferred),
+            "vertex is owned by Line"
+        );
+        assert!(
+            !fe.allocs.values().any(|o| matches!(o, Owner::Leak(_))),
+            "no leak: {:?}",
+            fe.allocs
+        );
     }
 
     #[test]
@@ -1277,7 +1422,11 @@ mod tests {
             "Thing is transitively owned by C->Wrapper: {:?}",
             fe.allocs
         );
-        assert!(!fe.allocs.values().any(|o| matches!(o, Owner::Leak(_))), "no leak: {:?}", fe.allocs);
+        assert!(
+            !fe.allocs.values().any(|o| matches!(o, Owner::Leak(_))),
+            "no leak: {:?}",
+            fe.allocs
+        );
     }
 
     #[test]
@@ -1295,8 +1444,16 @@ mod tests {
         let fe = analyze_fn(&prog, 0, c, method(c, "run"));
         // Terminates (no stack overflow) and classifies the `new A` allocation; the
         // borrowed `b` arg is not owned, so nothing is transferred.
-        assert!(fe.allocs.values().any(|o| *o == Owner::Scope), "the new A is a scope local: {:?}", fe.allocs);
-        assert!(!fe.allocs.values().any(|o| *o == Owner::Transferred), "cycle bottoms out borrowed: {:?}", fe.allocs);
+        assert!(
+            fe.allocs.values().any(|o| *o == Owner::Scope),
+            "the new A is a scope local: {:?}",
+            fe.allocs
+        );
+        assert!(
+            !fe.allocs.values().any(|o| *o == Owner::Transferred),
+            "cycle bottoms out borrowed: {:?}",
+            fe.allocs
+        );
     }
 
     #[test]
@@ -1304,11 +1461,15 @@ mod tests {
         // The constructor's class isn't in scope (a native/borrowing callee), so its
         // parameter ownership is unknown — the argument conservatively escapes (a
         // safe leak, never a double-free).
-        let prog = prog_of("class C { public function run() { var line = new Line(new Vertex()); } }");
+        let prog =
+            prog_of("class C { public function run() { var line = new Line(new Vertex()); } }");
         let c = class_c(&prog);
         let fe = analyze_fn(&prog, 0, c, method(c, "run"));
         assert!(fe.scope_owned.contains("line"));
-        assert!(fe.allocs.values().any(|o| *o == Owner::Leak(LeakReason::Escapes)));
+        assert!(fe
+            .allocs
+            .values()
+            .any(|o| *o == Owner::Leak(LeakReason::Escapes)));
     }
 
     #[test]
@@ -1321,7 +1482,10 @@ mod tests {
         let c = class_c(&prog);
         let fields: BTreeSet<String> = c.fields.iter().map(|f| f.name.clone()).collect();
         let s = owned_returning_methods(&prog, 0, c, &fields);
-        assert!(s.contains("make") && !s.contains("noop"), "owned-returning set: {s:?}");
+        assert!(
+            s.contains("make") && !s.contains("noop"),
+            "owned-returning set: {s:?}"
+        );
     }
 
     #[test]
@@ -1333,8 +1497,16 @@ mod tests {
         );
         let c = class_c(&prog);
         let fe = analyze_fn(&prog, 0, c, method(c, "run"));
-        assert!(fe.scope_owned.contains("t"), "consumed owned return is scope-owned: {:?}", fe.scope_owned);
-        assert!(!fe.allocs.values().any(|o| matches!(o, Owner::Leak(_))), "no leak: {:?}", fe.allocs);
+        assert!(
+            fe.scope_owned.contains("t"),
+            "consumed owned return is scope-owned: {:?}",
+            fe.scope_owned
+        );
+        assert!(
+            !fe.allocs.values().any(|o| matches!(o, Owner::Leak(_))),
+            "no leak: {:?}",
+            fe.allocs
+        );
     }
 
     #[test]
@@ -1342,11 +1514,17 @@ mod tests {
         // A `new`/owned-call result used only as a comparison operand and discarded is
         // a freeable temporary (`Scope`), not an escaping leak — the binary operator
         // never carries the pointer forward.
-        let prog = prog_of("class T {} class C { public function run():Void { if (new T() == null) {} } }");
+        let prog = prog_of(
+            "class T {} class C { public function run():Void { if (new T() == null) {} } }",
+        );
         let c = class_c(&prog);
         let fe = analyze_fn(&prog, 0, c, method(c, "run"));
         assert!(!fe.allocs.is_empty(), "the operand allocation is tracked");
-        assert!(fe.allocs.values().all(|o| *o == Owner::Scope), "operand temp is scope, not leak: {:?}", fe.allocs);
+        assert!(
+            fe.allocs.values().all(|o| *o == Owner::Scope),
+            "operand temp is scope, not leak: {:?}",
+            fe.allocs
+        );
     }
 
     #[test]
@@ -1358,9 +1536,15 @@ mod tests {
         );
         let c = class_c(&prog);
         let owned = analyze_class(&prog, 0, c).owned_fields;
-        assert!(!owned.contains("a") && !owned.contains("b"), "aliased object is not double-owned: {owned:?}");
+        assert!(
+            !owned.contains("a") && !owned.contains("b"),
+            "aliased object is not double-owned: {owned:?}"
+        );
         let fe = analyze_fn(&prog, 0, c, c.ctor.as_ref().unwrap());
-        assert!(fe.allocs.values().any(|o| *o == Owner::Leak(LeakReason::Aliased)));
+        assert!(fe
+            .allocs
+            .values()
+            .any(|o| *o == Owner::Leak(LeakReason::Aliased)));
     }
 
     #[test]
@@ -1375,7 +1559,10 @@ mod tests {
     fn owned_tag_marks_a_field_with_no_new() {
         // An injected pointer (param stored into a field, never `new`ed here) is
         // owned only because of the `@owned` tag.
-        assert!(owned_of("class C { @owned var c:Child; public function new(c:Child) { this.c = c; } }").contains("c"));
+        assert!(owned_of(
+            "class C { @owned var c:Child; public function new(c:Child) { this.c = c; } }"
+        )
+        .contains("c"));
     }
 
     // ---- M4 aliasing / soundness guard ------------------------------------
@@ -1391,7 +1578,10 @@ mod tests {
         );
         let c = class_c(&prog);
         let owned = analyze_class(&prog, 0, c).owned_fields;
-        assert!(!owned.contains("f"), "a returned field is handed out, so not freed (leak): {owned:?}");
+        assert!(
+            !owned.contains("f"),
+            "a returned field is handed out, so not freed (leak): {owned:?}"
+        );
     }
 
     #[test]
@@ -1401,7 +1591,10 @@ mod tests {
         );
         let c = class_c(&prog);
         let owned = analyze_class(&prog, 0, c).owned_fields;
-        assert!(!owned.contains("f"), "a field passed to a call may be retained, so not freed: {owned:?}");
+        assert!(
+            !owned.contains("f"),
+            "a field passed to a call may be retained, so not freed: {owned:?}"
+        );
     }
 
     #[test]
@@ -1414,7 +1607,10 @@ mod tests {
         );
         let c = class_c(&prog);
         let owned = analyze_class(&prog, 0, c).owned_fields;
-        assert!(owned.contains("f"), "a borrowed-only field is still freed: {owned:?}");
+        assert!(
+            owned.contains("f"),
+            "a borrowed-only field is still freed: {owned:?}"
+        );
     }
 
     #[test]
@@ -1426,7 +1622,10 @@ mod tests {
         );
         let c = class_c(&prog);
         let owned = analyze_class(&prog, 0, c).owned_fields;
-        assert!(owned.contains("f"), "@owned override is exempt from the guard: {owned:?}");
+        assert!(
+            owned.contains("f"),
+            "@owned override is exempt from the guard: {owned:?}"
+        );
     }
 
     // ---- field-ownership flow cases ---------------------------------------
@@ -1437,7 +1636,10 @@ mod tests {
     #[test]
     fn owns_the_direct_cases() {
         // Direct `new` into a field, a container push, and an `@owned` injected field.
-        assert!(owned_of("class T {} class C { var f:T; public function new() { this.f = new T(); } }").contains("f"));
+        assert!(owned_of(
+            "class T {} class C { var f:T; public function new() { this.f = new T(); } }"
+        )
+        .contains("f"));
         assert!(owned_of(
             "class I {} class C { var items:Array<I>; public function new() { this.items = []; this.items.push(new I()); } }",
         )
@@ -1470,7 +1672,10 @@ mod tests {
     fn advisories_of(src: &str) -> Vec<String> {
         let prog = prog_of(src);
         let c = class_c(&prog);
-        advisory_warnings(&prog, 0, c).into_iter().map(|(_, m)| m).collect()
+        advisory_warnings(&prog, 0, c)
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect()
     }
 
     #[test]
@@ -1493,7 +1698,10 @@ mod tests {
             "class V {} class C { @owned var a:V; public function new(a:V) { this.a = a; } public function get():V { return this.a; } }",
         );
         assert_eq!(msgs.len(), 1, "{msgs:?}");
-        assert!(msgs[0].contains("@owned field `a`") && msgs[0].contains("handed out"), "{msgs:?}");
+        assert!(
+            msgs[0].contains("@owned field `a`") && msgs[0].contains("handed out"),
+            "{msgs:?}"
+        );
     }
 
     #[test]
@@ -1504,7 +1712,10 @@ mod tests {
             "class V {} class C { var f:V; public function set():Void { @delete var x:V = new V(); this.f = x; } }",
         );
         assert_eq!(msgs.len(), 1, "{msgs:?}");
-        assert!(msgs[0].contains("@delete local `x`") && msgs[0].contains("field `f`"), "{msgs:?}");
+        assert!(
+            msgs[0].contains("@delete local `x`") && msgs[0].contains("field `f`"),
+            "{msgs:?}"
+        );
     }
 
     #[test]
@@ -1513,6 +1724,9 @@ mod tests {
             "class V {} class C { public function make():V { @delete var x:V = new V(); return x; } }",
         );
         assert_eq!(msgs.len(), 1, "{msgs:?}");
-        assert!(msgs[0].contains("@delete local `x`") && msgs[0].contains("returned"), "{msgs:?}");
+        assert!(
+            msgs[0].contains("@delete local `x`") && msgs[0].contains("returned"),
+            "{msgs:?}"
+        );
     }
 }

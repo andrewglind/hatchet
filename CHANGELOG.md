@@ -3,6 +3,70 @@
 All notable changes to Hatchet are documented here. Versions follow the
 project's milestones.
 
+## v0.2.1 — Header-only output, resolve-only includes, null-safe fix (2026-06-19)
+
+A minor release on top of Milestone 10: a **single-header amalgamation** mode, an explicit
+**resolve-only input** flag, the generalisation of `@:headerCode` to any module, and a correctness fix
+for null-safe navigation. No breaking changes — the new flags are opt-in and default `.h`/`.cpp` output
+is unchanged.
+
+### Highlights
+
+- **`--header-only <NAME>`** — amalgamate an entire `--src` set into one self-contained `<NAME>.h`: the
+  prelude inlined, every class emitted with inline bodies, native `@:include`s hoisted, no `.cpp` and no
+  separate `StdAfx.h`. A drop-in single-header library.
+- **`--include <PATH>...`** — resolve-only inputs: `extern`/`@:native` stub files parsed for resolution
+  and `@:include` propagation, but never transpiled (the Haxe equivalent of a C/C++ header).
+- **`@:headerCode` on any module** — previously honoured only on the prelude source, now injected
+  verbatim into any emitted module's header (matching hxcpp).
+- **Fix** — null-safe navigation combined with null-coalescing (`recv?.m() ?? default`).
+
+### Header-only output
+
+`--header-only <NAME>` (a trailing `.h` is stripped) amalgamates every `--src` module into a single
+`<NAME>.h`:
+
+- the prelude (the `uint*_t` shim, the standard includes, the export macros, and any `StdAfx.hx`
+  `@:headerCode`) is inlined at the top instead of emitted as a separate `StdAfx.h`;
+- every class is emitted with its constructor/method bodies **inline** (`inline T C::m() { … }`), so no
+  `.cpp` is produced;
+- the native `@:include`s of all modules are hoisted to the top and de-duplicated;
+- declarations and bodies are emitted in **two passes** (all declarations, then all bodies) behind a
+  global forward-declaration block, so cross-module references resolve.
+
+Because the single header has no `#include`s to settle the order, the modules are **topologically
+sorted**: a module that needs another's type *complete* — a base class (`extends`/`implements`) or a
+value (non-pointer) field — is emitted after its dependency (pointer cross-references impose no order,
+the forward-declaration block covers them). A genuine cross-module dependency **cycle** is a hard error
+rather than non-compiling output. Module-level free functions and `@:abi` exports are rejected in this
+mode (there is no `.cpp` to define them).
+
+### Resolve-only inputs (`--include`)
+
+`--src` and `--include` now separate the two roles the input list used to conflate. `--src` files are
+transpiled; `--include` files (files, directories, or globs, like `--src`) are added to the resolution
+scope so the `--src` files' native references resolve and their `@:include` headers propagate, but are
+**never emitted**. This makes native-stub boundaries explicit and keeps them out of a `--header-only`
+amalgamation. Backward compatible: `extern` stubs passed via `--src` are still not emitted.
+
+### Fixes
+
+- **Null-safe navigation with null-coalescing.** `recv?.method() ?? default` (and `recv?.field ??
+  default`) on a pointer receiver was lowered to a discardable comma form that evaluated the call but
+  yielded `0`, throwing the navigated value away — so every such read returned the default. It now
+  lowers to the value form `(recv != NULL ? recv->method() : default)`. Surfaced by the anachrjsonistic
+  `Proxy` accessors, whose `(this?.isObject() ?? false)` guards now read back correctly.
+
+### Validation
+
+- New self-contained compile-and-run gates: the `--header-only` amalgamation (including cross-module
+  ordering and the cycle diagnostic), `--include` resolve-only emission, and the null-safe/coalesce
+  lowering. The standalone [anachrjsonistic](https://github.com/andrewglind/anachrjsonistic) library was
+  re-transpiled as a single header and verified to parse and read values correctly under
+  `g++ -std=c++98`.
+- The in-repo `examples/shapes` demo was removed; anachrjsonistic is the end-to-end showcase, and the
+  test suite's own temp-dir compile-and-run gates remain the in-repo C++98 validation.
+
 ## v0.2.0 — Milestone 10: Abstract types (2026-06-18)
 
 This release makes Haxe **`abstract` types** a first-class lowering target: zero-overhead value

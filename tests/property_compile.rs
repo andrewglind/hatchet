@@ -21,7 +21,11 @@ fn find_gxx() -> Option<String> {
         Some(r"C:\msys64\mingw32\bin\g++.exe".to_string()),
     ];
     candidates.into_iter().flatten().find(|c| {
-        Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+        Command::new(c)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     })
 }
 
@@ -126,14 +130,29 @@ fn properties_compile_and_run() {
     // generated `GetArea` shadows it, and the non-@:isVar `(get, never)`
     // property has no backing field.
     let header = std::fs::read_to_string(out.join("lib").join("Rect.h")).unwrap();
-    assert!(header.contains("double get_area();"), "custom getter declared:\n{header}");
-    assert!(!header.contains("GetArea"), "no generated getter for a custom `(get, …)`:\n{header}");
-    assert!(!header.contains("double area;"), "(get, never) without @:isVar has no backing field:\n{header}");
-    assert!(header.contains("double perimeter;"), "(get, null) keeps its (physical) backing field:\n{header}");
+    assert!(
+        header.contains("double get_area();"),
+        "custom getter declared:\n{header}"
+    );
+    assert!(
+        !header.contains("GetArea"),
+        "no generated getter for a custom `(get, …)`:\n{header}"
+    );
+    assert!(
+        !header.contains("double area;"),
+        "(get, never) without @:isVar has no backing field:\n{header}"
+    );
+    assert!(
+        header.contains("double perimeter;"),
+        "(get, null) keeps its (physical) backing field:\n{header}"
+    );
 
     let exe = out.join(if cfg!(windows) { "prop.exe" } else { "prop" });
     let mut cmd = Command::new(&gxx);
-    cmd.args(["-std=c++98", "-pedantic", "-Wall"]).arg("-I").arg(&out).arg(&main_cpp);
+    cmd.args(["-std=c++98", "-pedantic", "-Wall"])
+        .arg("-I")
+        .arg(&out)
+        .arg(&main_cpp);
     for f in cpp_files(&out) {
         cmd.arg(f);
     }
@@ -149,10 +168,22 @@ fn properties_compile_and_run() {
     let stdout = String::from_utf8_lossy(&run.stdout);
     let _ = std::fs::remove_dir_all(&root);
 
-    assert!(stdout.contains("area=24"), "external read through get_area():\n{stdout}");
-    assert!(stdout.contains("desc=52"), "internal reads route through accessors:\n{stdout}");
-    assert!(stdout.contains("calls=2"), "get_perimeter invoked exactly twice:\n{stdout}");
-    assert!(stdout.contains("w=3"), "(default, null) generated getter still works:\n{stdout}");
+    assert!(
+        stdout.contains("area=24"),
+        "external read through get_area():\n{stdout}"
+    );
+    assert!(
+        stdout.contains("desc=52"),
+        "internal reads route through accessors:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("calls=2"),
+        "get_perimeter invoked exactly twice:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("w=3"),
+        "(default, null) generated getter still works:\n{stdout}"
+    );
 }
 
 const GAUGE_HX: &str = r#"package lib;
@@ -230,13 +261,29 @@ fn custom_setters_compile_and_run() {
     // Header shape: the custom setter is the declared method, no trivial
     // `SetLevel` shadows it, and external reads still have their `GetLevel`.
     let header = std::fs::read_to_string(out.join("lib").join("Gauge.h")).unwrap();
-    assert!(header.contains("int set_level(int v);"), "custom setter declared:\n{header}");
-    assert!(!header.contains("SetLevel"), "no trivial setter when set_level exists:\n{header}");
-    assert!(header.contains("GetLevel()"), "generated getter for external reads:\n{header}");
+    assert!(
+        header.contains("int set_level(int v);"),
+        "custom setter declared:\n{header}"
+    );
+    assert!(
+        !header.contains("SetLevel"),
+        "no trivial setter when set_level exists:\n{header}"
+    );
+    assert!(
+        header.contains("GetLevel()"),
+        "generated getter for external reads:\n{header}"
+    );
 
-    let exe = out.join(if cfg!(windows) { "setter.exe" } else { "setter" });
+    let exe = out.join(if cfg!(windows) {
+        "setter.exe"
+    } else {
+        "setter"
+    });
     let mut cmd = Command::new(&gxx);
-    cmd.args(["-std=c++98", "-pedantic", "-Wall"]).arg("-I").arg(&out).arg(&main_cpp);
+    cmd.args(["-std=c++98", "-pedantic", "-Wall"])
+        .arg("-I")
+        .arg(&out)
+        .arg(&main_cpp);
     for f in cpp_files(&out) {
         cmd.arg(f);
     }
@@ -248,13 +295,24 @@ fn custom_setters_compile_and_run() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    let run = Command::new(&exe).output().expect("run the custom-setter demo");
+    let run = Command::new(&exe)
+        .output()
+        .expect("run the custom-setter demo");
     let stdout = String::from_utf8_lossy(&run.stdout);
     let _ = std::fs::remove_dir_all(&root);
 
-    assert!(stdout.contains("start=100"), "ctor write clamps via set_level:\n{stdout}");
-    assert!(stdout.contains("adjusted=1"), "internal compound writes clamp via set_level:\n{stdout}");
-    assert!(stdout.contains("blasted=100"), "external writes clamp via set_level:\n{stdout}");
+    assert!(
+        stdout.contains("start=100"),
+        "ctor write clamps via set_level:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("adjusted=1"),
+        "internal compound writes clamp via set_level:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("blasted=100"),
+        "external writes clamp via set_level:\n{stdout}"
+    );
 }
 
 const PARTICLE_HX: &str = r#"package lib;
@@ -321,8 +379,14 @@ fn float32_and_inferred_setter_return_compile_and_run() {
     assert!(gen_ok, "transpiling the Float32 demo failed");
 
     let header = std::fs::read_to_string(out.join("lib").join("Particle.h")).unwrap();
-    assert!(header.contains("float vx;"), "cpp.Float32 field is a C++ float:\n{header}");
-    assert!(header.contains("float mass;"), "Single field is a C++ float:\n{header}");
+    assert!(
+        header.contains("float vx;"),
+        "cpp.Float32 field is a C++ float:\n{header}"
+    );
+    assert!(
+        header.contains("float mass;"),
+        "Single field is a C++ float:\n{header}"
+    );
     assert!(
         header.contains("double set_x(double x);"),
         "omitted accessor return type is the property's type:\n{header}"
@@ -330,7 +394,10 @@ fn float32_and_inferred_setter_return_compile_and_run() {
 
     let exe = out.join(if cfg!(windows) { "f32.exe" } else { "f32" });
     let mut cmd = Command::new(&gxx);
-    cmd.args(["-std=c++98", "-pedantic", "-Wall"]).arg("-I").arg(&out).arg(&main_cpp);
+    cmd.args(["-std=c++98", "-pedantic", "-Wall"])
+        .arg("-I")
+        .arg(&out)
+        .arg(&main_cpp);
     for f in cpp_files(&out) {
         cmd.arg(f);
     }
@@ -346,7 +413,16 @@ fn float32_and_inferred_setter_return_compile_and_run() {
     let stdout = String::from_utf8_lossy(&run.stdout);
     let _ = std::fs::remove_dir_all(&root);
 
-    assert!(stdout.contains("vx_bytes=4"), "Float32 is genuinely 4 bytes:\n{stdout}");
-    assert!(stdout.contains("step=3"), "Float32 arithmetic flows into Float:\n{stdout}");
-    assert!(stdout.contains("ret=7.25"), "the value-returning setter works:\n{stdout}");
+    assert!(
+        stdout.contains("vx_bytes=4"),
+        "Float32 is genuinely 4 bytes:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("step=3"),
+        "Float32 arithmetic flows into Float:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("ret=7.25"),
+        "the value-returning setter works:\n{stdout}"
+    );
 }

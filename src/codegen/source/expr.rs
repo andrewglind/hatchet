@@ -32,9 +32,11 @@ impl<'a> BodyGen<'a> {
         let (icode, _) = self.gen_expr(idx);
         let ix = self.fresh("ix");
         let t = "\t".repeat(self.prelude_ind);
-        self.prelude.push_str(&format!("{t}size_t {ix} = (size_t)({icode});\n"));
         self.prelude
-            .push_str(&format!("{t}if ({ix} >= {access}.size()) {access}.resize({ix} + 1);\n"));
+            .push_str(&format!("{t}size_t {ix} = (size_t)({icode});\n"));
+        self.prelude.push_str(&format!(
+            "{t}if ({ix} >= {access}.size()) {access}.resize({ix} + 1);\n"
+        ));
         let ety = self.element_ty(&rty);
         // `arr[i] = []` clears the (now-present) element container.
         if matches!(value, Expr::ArrayLit(v) if v.is_empty()) {
@@ -101,7 +103,8 @@ impl<'a> BodyGen<'a> {
                 let tmp = self.fresh("rcv");
                 let t = "\t".repeat(self.prelude_ind);
                 let spell = self.decl_spelling(&rty);
-                self.prelude.push_str(&format!("{t}{spell} {tmp} = {rc};\n"));
+                self.prelude
+                    .push_str(&format!("{t}{spell} {tmp} = {rc};\n"));
                 tmp
             };
             let op = if rty.is_ptr { "->" } else { "." };
@@ -116,7 +119,12 @@ impl<'a> BodyGen<'a> {
     }
 
     pub(super) fn gen_assign_or_expr(&mut self, e: &Expr) -> (String, Ty) {
-        if let Expr::Assign { op: None, target, value } = e {
+        if let Expr::Assign {
+            op: None,
+            target,
+            value,
+        } = e
+        {
             // `arr[i] = v` into an Array (→ std::vector): Haxe auto-extends the
             // array on an out-of-range write, so emit a grow-guard first (C++
             // `operator[]` past the end is undefined behaviour). Maps and other
@@ -133,7 +141,10 @@ impl<'a> BodyGen<'a> {
             // `this->set_x(v)`, exactly as Haxe routes it. Checked before the
             // `x = []`/object-literal shortcuts — those must route too.
             if let Some(name) = self.own_field_setter(target) {
-                let fty = self.class_field(&name).map(|f| self.field_ty(f)).unwrap_or_default();
+                let fty = self
+                    .class_field(&name)
+                    .map(|f| self.field_ty(f))
+                    .unwrap_or_default();
                 let vcode = if let Expr::ObjectLit(fields) = &**value {
                     if fty.info.is_some() && !fty.base.is_empty() {
                         self.hoist_object(fields, fty.clone())
@@ -188,7 +199,12 @@ impl<'a> BodyGen<'a> {
     /// If `recv.field = value` targets an external property accessor, produce the
     /// `recv->SetField(value)` (generated) or `recv->set_field(value)` (custom
     /// `set_x`) call.
-    pub(super) fn accessor_set(&mut self, recv: &Expr, field: &str, value: &Expr) -> Option<String> {
+    pub(super) fn accessor_set(
+        &mut self,
+        recv: &Expr,
+        field: &str,
+        value: &Expr,
+    ) -> Option<String> {
         // own fields (`this.x`) are handled by the own-field routing (custom
         // setter) or assigned directly (generated trivial setter).
         if matches!(recv, Expr::This) {
@@ -227,9 +243,21 @@ impl<'a> BodyGen<'a> {
 
     pub(super) fn gen_expr_inner(&mut self, e: &Expr) -> (String, Ty) {
         match e {
-            Expr::Int(s) => (s.clone(), Ty { base: "int".into(), ..Default::default() }),
+            Expr::Int(s) => (
+                s.clone(),
+                Ty {
+                    base: "int".into(),
+                    ..Default::default()
+                },
+            ),
             Expr::Float(s) => (float_lit(s), float_ty()),
-            Expr::Bool(b) => (b.to_string(), Ty { base: "bool".into(), ..Default::default() }),
+            Expr::Bool(b) => (
+                b.to_string(),
+                Ty {
+                    base: "bool".into(),
+                    ..Default::default()
+                },
+            ),
             Expr::Null => ("NULL".into(), Ty::default()),
             // `untyped X` — emit X verbatim; its type is opaque to Hatchet.
             Expr::Verbatim(code) => (code.clone(), Ty::default()),
@@ -243,11 +271,21 @@ impl<'a> BodyGen<'a> {
             // using one is never generated; this arm only keeps the match total.
             Expr::Is { .. } => {
                 self.err("the `is` type-check operator is not supported".to_string());
-                ("/* is unsupported */".into(), Ty { base: "bool".into(), ..Default::default() })
+                (
+                    "/* is unsupported */".into(),
+                    Ty {
+                        base: "bool".into(),
+                        ..Default::default()
+                    },
+                )
             }
-            Expr::Switch { subject, cases, default } => {
-                self.gen_switch_expr(subject, cases, default.as_deref())
-            }
+            Expr::Switch {
+                subject,
+                cases,
+                default,
+            } => self.gen_switch_expr(subject, cases, default.as_deref()),
+            Expr::If { cond, then, els } => self.gen_if_expr(cond, then, els.as_deref()),
+            Expr::Block(stmts) => self.gen_block_expr(stmts),
             Expr::Str { raw, interpolated } => self.gen_string(raw, *interpolated),
             // In an `abstract` newtype's method, `this` is the underlying value,
             // held in the synthetic `this->__this` member.
@@ -259,7 +297,10 @@ impl<'a> BodyGen<'a> {
                 Ty {
                     base: self.class.name.clone(),
                     is_ptr: true,
-                    info: self.prog.resolve_type(std::slice::from_ref(&self.class.name), self.mi).cloned(),
+                    info: self
+                        .prog
+                        .resolve_type(std::slice::from_ref(&self.class.name), self.mi)
+                        .cloned(),
                     ..Default::default()
                 },
             ),
@@ -295,7 +336,8 @@ impl<'a> BodyGen<'a> {
                         let tmp = self.fresh("null");
                         let spell = self.decl_spelling(&ty);
                         let t = "\t".repeat(self.prelude_ind);
-                        self.prelude.push_str(&format!("{t}{spell} {tmp} = {code};\n"));
+                        self.prelude
+                            .push_str(&format!("{t}{spell} {tmp} = {code};\n"));
                         self.register_owned(&tmp);
                         return (tmp, ty);
                     }
@@ -311,21 +353,38 @@ impl<'a> BodyGen<'a> {
                 // `new Array<T>()` / `new Map<K,V>()` → a value-constructed,
                 // empty container (Haxe heap arrays are C++ value containers).
                 if base.starts_with("std::vector") || base.starts_with("std::map") {
-                    return (format!("{base}()"), Ty { base, ..Default::default() });
+                    return (
+                        format!("{base}()"),
+                        Ty {
+                            base,
+                            ..Default::default()
+                        },
+                    );
                 }
                 // `new String(x)` → a string *value*, not a heap pointer.
                 if base == "std::string" {
                     let a = self.gen_args(args);
-                    return (format!("std::string({a})"), Ty { base, ..Default::default() });
+                    return (
+                        format!("std::string({a})"),
+                        Ty {
+                            base,
+                            ..Default::default()
+                        },
+                    );
                 }
                 // `new` of a `@:stackOnly` class → a value temporary (`Foo(args)`),
                 // not a heap `new Foo(args)`: value semantics, no ownership.
-                if matches!(ty, Type::Named { path, .. } if self.prog.is_value_class(path, self.mi)) {
+                if matches!(ty, Type::Named { path, .. } if self.prog.is_value_class(path, self.mi))
+                {
                     let param_tys = self.ctor_param_types(ty);
                     let a = self.gen_args_typed(args, &param_tys, false);
                     return (
                         format!("{base}({a})"),
-                        Ty { base, info: ty_named_info(self.prog, self.mi, ty), ..Default::default() },
+                        Ty {
+                            base,
+                            info: ty_named_info(self.prog, self.mi, ty),
+                            ..Default::default()
+                        },
                     );
                 }
                 let param_tys = self.ctor_param_types(ty);
@@ -350,7 +409,11 @@ impl<'a> BodyGen<'a> {
                 // is discarded and the semantics match.)
                 if matches!(op, UnOp::Incr | UnOp::Decr) {
                     if let Some((w, read, fty)) = self.routed_compound_write(expr) {
-                        let delta = if matches!(op, UnOp::Incr) { "+ 1" } else { "- 1" };
+                        let delta = if matches!(op, UnOp::Incr) {
+                            "+ 1"
+                        } else {
+                            "- 1"
+                        };
                         return (format!("{w}({read} {delta})"), fty);
                     }
                 }
@@ -388,7 +451,13 @@ impl<'a> BodyGen<'a> {
                         let (s, sty) = if l_null { (&r, &rty) } else { (&l, &lty) };
                         if sty.base == "std::string" && !sty.is_ptr {
                             let neg = if matches!(*op, BinOp::Ne) { "!" } else { "" };
-                            return (format!("{neg}{s}.empty()"), Ty { base: "bool".into(), ..Default::default() });
+                            return (
+                                format!("{neg}{s}.empty()"),
+                                Ty {
+                                    base: "bool".into(),
+                                    ..Default::default()
+                                },
+                            );
                         }
                     }
                 }
@@ -396,7 +465,9 @@ impl<'a> BodyGen<'a> {
                 // (stringifying the other side). In C++ `int + "literal"` would be
                 // pointer arithmetic and `std::string + int` does not compile, so build a
                 // `std::string` concatenation, formatting any non-string operand.
-                if matches!(*op, BinOp::Add) && (lty.base == "std::string" || rty.base == "std::string") {
+                if matches!(*op, BinOp::Add)
+                    && (lty.base == "std::string" || rty.base == "std::string")
+                {
                     let lpart = self.concat_part(&l, &lty);
                     let rpart = self.concat_part(&r, &rty);
                     // `"a" + "b"` is `const char* + const char*` — anchor the left as a
@@ -410,7 +481,10 @@ impl<'a> BodyGen<'a> {
                     };
                     return (
                         format!("{lpart} + {rpart}"),
-                        Ty { base: "std::string".into(), ..Default::default() },
+                        Ty {
+                            base: "std::string".into(),
+                            ..Default::default()
+                        },
                     );
                 }
                 // Haxe `/` always yields Float, even for Int operands; C++ `/`
@@ -429,6 +503,16 @@ impl<'a> BodyGen<'a> {
                 // operand, lower to `fmod` (C89 <math.h>, portable to VC6).
                 if matches!(*op, BinOp::Mod) && (is_float_base(&lty) || is_float_base(&rty)) {
                     return (format!("fmod({l}, {r})"), float_ty());
+                }
+                // A signed/unsigned comparison (e.g. a loop counter against
+                // `arr.length`) warns under MSVC (C4018). Make the conversion C++
+                // already performs explicit with a `(size_t)` cast on the signed side.
+                let (mut l, mut r) = (l, r);
+                if matches!(
+                    *op,
+                    BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge | BinOp::Eq | BinOp::Ne
+                ) {
+                    cast_signed_for_unsigned_cmp(&mut l, &lty, &mut r, &rty);
                 }
                 let ty = binop_result_ty(*op, lty);
                 (format!("{l} {} {r}", binop(*op)), ty)
@@ -459,8 +543,10 @@ impl<'a> BodyGen<'a> {
                 // property routes like the statement form.
                 if op.is_none() {
                     if let Some(name) = self.own_field_setter(target) {
-                        let fty =
-                            self.class_field(&name).map(|f| self.field_ty(f)).unwrap_or_default();
+                        let fty = self
+                            .class_field(&name)
+                            .map(|f| self.field_ty(f))
+                            .unwrap_or_default();
                         let (v, _) = self.gen_expr(value);
                         return (format!("this->set_{name}({v})"), fty);
                     }
@@ -469,9 +555,7 @@ impl<'a> BodyGen<'a> {
                 let (v, vty) = self.gen_expr(value);
                 match op {
                     // `x >>>= y` — no C++ spelling; expand through the unsigned cast.
-                    Some(BinOp::UShr) => {
-                        (format!("{t} = (int)((unsigned int)({t}) >> {v})"), tty)
-                    }
+                    Some(BinOp::UShr) => (format!("{t} = (int)((unsigned int)({t}) >> {v})"), tty),
                     // `x %= y` with a float operand — C++ `%=` is integer-only.
                     Some(BinOp::Mod) if is_float_base(&tty) || is_float_base(&vty) => {
                         (format!("{t} = fmod({t}, {v})"), tty)
@@ -480,11 +564,7 @@ impl<'a> BodyGen<'a> {
                     None => (format!("{t} = {v}"), tty),
                 }
             }
-            Expr::NullCoalesce(a, b) => {
-                let (ac, aty) = self.gen_expr(a);
-                let (bc, _) = self.gen_expr(b);
-                (format!("({ac} != NULL ? {ac} : {bc})"), aty)
-            }
+            Expr::NullCoalesce(a, b) => self.gen_null_coalesce(a, b),
             Expr::SafeField(recv, field) => self.gen_safe_field(recv, field),
             Expr::ArrayLit(elems) => {
                 // Inline array literal → hoisted vector temporary.
@@ -492,7 +572,14 @@ impl<'a> BodyGen<'a> {
                 let elem = self.element_ty(&vec_ty);
                 let tmp = self.fresh("arr");
                 let mut buf = String::new();
-                self.expand_array_into_local(&tmp, &vec_ty, &elem, elems, self.prelude_ind, &mut buf);
+                self.expand_array_into_local(
+                    &tmp,
+                    &vec_ty,
+                    &elem,
+                    elems,
+                    self.prelude_ind,
+                    &mut buf,
+                );
                 self.prelude.push_str(&buf);
                 (tmp, vec_ty)
             }
@@ -501,7 +588,12 @@ impl<'a> BodyGen<'a> {
                 let tmp = self.fresh("map");
                 let mut buf = String::new();
                 self.expand_map_into_local(
-                    &tmp, &map_ty, &Ty::default(), pairs, self.prelude_ind, &mut buf,
+                    &tmp,
+                    &map_ty,
+                    &Ty::default(),
+                    pairs,
+                    self.prelude_ind,
+                    &mut buf,
                 );
                 self.prelude.push_str(&buf);
                 (tmp, map_ty)
@@ -514,9 +606,13 @@ impl<'a> BodyGen<'a> {
                 self.prelude.push_str(&buf);
                 (tmp, ty)
             }
-            Expr::Comprehension { var, iter, guard, body } => {
-                self.gen_comprehension(var, iter, guard.as_deref(), body)
-            }
+            Expr::Comprehension {
+                var,
+                value_var,
+                iter,
+                guard,
+                body,
+            } => self.gen_comprehension(var, value_var.as_deref(), iter, guard.as_deref(), body),
             Expr::Lambda { .. } => ("/* lambda */".into(), Ty::default()),
             Expr::Cast { expr, ty } => {
                 let (c, cty) = self.gen_expr(expr);
@@ -566,8 +662,16 @@ impl<'a> BodyGen<'a> {
         let it = self.fresh("it");
         let t = "\t".repeat(ind);
         self.flush(out);
-        let _ = writeln!(out, "{t}{}::iterator {it} = {map_code}.find({key_code});", map_ty.base);
-        let alias = IterAlias { it_name: it, map_code, value_ty: value_ty.clone() };
+        let _ = writeln!(
+            out,
+            "{t}{}::iterator {it} = {map_code}.find({key_code});",
+            map_ty.base
+        );
+        let alias = IterAlias {
+            it_name: it,
+            map_code,
+            value_ty: value_ty.clone(),
+        };
         let mut local_ty = value_ty;
         local_ty.iter = Some(Box::new(alias));
         self.define_local(name, local_ty);
@@ -577,7 +681,12 @@ impl<'a> BodyGen<'a> {
     /// A null comparison against a `Map.get(k)` alias → the iterator existence
     /// check: `x == null` → `it == map.end()`, `x != null` → `it != map.end()`.
     /// `None` for any other comparison.
-    pub(super) fn try_iter_null_check(&self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Option<(String, Ty)> {
+    pub(super) fn try_iter_null_check(
+        &self,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+    ) -> Option<(String, Ty)> {
         if !matches!(op, BinOp::Eq | BinOp::Ne) {
             return None;
         }
@@ -593,7 +702,10 @@ impl<'a> BodyGen<'a> {
         let cmp = if matches!(op, BinOp::Ne) { "!=" } else { "==" };
         Some((
             format!("{} {cmp} {}.end()", alias.it_name, alias.map_code),
-            Ty { base: "bool".into(), ..Default::default() },
+            Ty {
+                base: "bool".into(),
+                ..Default::default()
+            },
         ))
     }
 
@@ -618,7 +730,11 @@ impl<'a> BodyGen<'a> {
             return (format!("this->{name}"), ty);
         }
         // a type name (for static / enum access)?
-        if let Some(info) = self.prog.resolve_type(&[name.to_string()], self.mi).cloned() {
+        if let Some(info) = self
+            .prog
+            .resolve_type(&[name.to_string()], self.mi)
+            .cloned()
+        {
             return (
                 name.to_string(),
                 Ty {
@@ -664,14 +780,20 @@ impl<'a> BodyGen<'a> {
         // `enum abstract` whose member is the underlying type).
         if let Expr::Ident(tname) = recv {
             if self.lookup_local(tname).is_none() && self.class_field(tname).is_none() {
-                if let Some(info) = self.prog.resolve_type(std::slice::from_ref(tname), self.mi).cloned() {
+                if let Some(info) = self
+                    .prog
+                    .resolve_type(std::slice::from_ref(tname), self.mi)
+                    .cloned()
+                {
                     if matches!(info.kind, TypeKind::Enum | TypeKind::EnumAbstract) {
                         // Qualified ADT variant (`Op.Halt` in value position) →
                         // the factory call; parameterized variants are handled
                         // by `gen_call` (and `case` labels by `case_label`).
                         if let Some(e) = self.adt_enum(&info) {
-                            let paramless =
-                                e.variants.iter().any(|v| v.name == name && v.params.is_empty());
+                            let paramless = e
+                                .variants
+                                .iter()
+                                .any(|v| v.name == name && v.params.is_empty());
                             let ctor = self.enum_value_ctor(&info, name);
                             let code = if paramless { format!("{ctor}()") } else { ctor };
                             return (
@@ -693,7 +815,11 @@ impl<'a> BodyGen<'a> {
                         };
                         return (
                             self.enum_constant(&info, name),
-                            Ty { base, info: Some(info), ..Default::default() },
+                            Ty {
+                                base,
+                                info: Some(info),
+                                ..Default::default()
+                            },
                         );
                     }
                 }
@@ -728,12 +854,12 @@ impl<'a> BodyGen<'a> {
         if name == "length" {
             if is_container_ty(&rty) {
                 if rty.is_ptr {
-                    return (format!("(*{rcode}).size()"), int_ty());
+                    return (format!("(*{rcode}).size()"), size_ty());
                 }
-                return (format!("{rcode}.size()"), int_ty());
+                return (format!("{rcode}.size()"), size_ty());
             }
             if rty.base == "std::string" {
-                return (format!("{rcode}.length()"), int_ty());
+                return (format!("{rcode}.length()"), size_ty());
             }
         }
 
@@ -792,38 +918,131 @@ impl<'a> BodyGen<'a> {
         };
         let tmp = self.fresh("tmp");
         let t = "\t".repeat(self.prelude_ind);
-        self.prelude.push_str(&format!("{t}{}* {tmp} = new {base}({a});\n", base));
+        self.prelude
+            .push_str(&format!("{t}{}* {tmp} = new {base}({a});\n", base));
         (tmp, rty)
     }
 
     pub(super) fn gen_safe_field(&mut self, recv: &Expr, field: &str) -> (String, Ty) {
+        let (rcode, is_ptr, access, fty) = self.gen_safe_field_parts(recv, field);
+        // Pointer receiver: guard against NULL. A discarded result keeps the `0` else
+        // branch (the value form, when wanted, is built by `gen_null_coalesce`).
+        if is_ptr {
+            return (format!("({rcode} != NULL ? {access} : 0)"), Ty::default());
+        }
+        (access, fty)
+    }
+
+    /// The parts of a `recv?.field` access: the receiver code, whether it is a
+    /// pointer (so a `NULL` guard is needed), the non-null access expression, and
+    /// the field's type. A value receiver cannot be null in C++, so it is accessed
+    /// directly (`is_ptr == false`).
+    fn gen_safe_field_parts(&mut self, recv: &Expr, field: &str) -> (String, bool, String, Ty) {
         let (rcode, rty) = self.gen_expr(recv);
-        // Value receivers cannot be null in C++ — access directly.
         if !rty.is_ptr {
             if let Some(info) = &rty.info {
                 if let Some(g) = self.field_getter(info, field) {
-                    return (format!("{rcode}.{g}()"), self.accessor_field_ty(info, field));
+                    let fty = self.accessor_field_ty(info, field);
+                    return (rcode.clone(), false, format!("{rcode}.{g}()"), fty);
                 }
             }
-            let fty = rty.info.as_ref().and_then(|i| self.member_field_ty(i, field)).unwrap_or_default();
-            return (format!("{rcode}.{field}"), fty);
+            let fty = rty
+                .info
+                .as_ref()
+                .and_then(|i| self.member_field_ty(i, field))
+                .unwrap_or_default();
+            let access = format!("{rcode}.{field}");
+            return (rcode, false, access, fty);
         }
-        // Pointer receiver: guard against NULL.
-        let access = match rty.info.as_ref().and_then(|info| self.field_getter(info, field)) {
-            Some(g) => format!("{rcode}->{g}()"),
-            None => format!("{rcode}->{field}"),
+        let (access, fty) = match rty.info.as_ref().and_then(|info| self.field_getter(info, field)) {
+            Some(g) => {
+                let fty = self.accessor_field_ty(rty.info.as_ref().unwrap(), field);
+                (format!("{rcode}->{g}()"), fty)
+            }
+            None => {
+                let fty = rty
+                    .info
+                    .as_ref()
+                    .and_then(|i| self.member_field_ty(i, field))
+                    .unwrap_or_default();
+                (format!("{rcode}->{field}"), fty)
+            }
         };
-        (format!("({rcode} != NULL ? {access} : 0)"), Ty::default())
+        (rcode, true, access, fty)
+    }
+
+    /// The parts of a `recv?.method(args)` safe call: the receiver code, whether it
+    /// is a pointer (so a `NULL` guard is needed), the non-null call expression, and
+    /// the call's return type.
+    fn gen_safe_call_parts(
+        &mut self,
+        recv: &Expr,
+        method: &str,
+        args: &[Expr],
+    ) -> (String, bool, String, Ty) {
+        let (rcode, rty) = self.gen_expr(recv);
+        let op = if rty.is_ptr { "->" } else { "." };
+        let param_tys = self.callee_param_types(&rty, method);
+        let overloaded = self.method_is_overloaded(&rty, method);
+        if overloaded {
+            if let Some(msg) = self.overload_mismatch(&rty, method, args) {
+                self.err(msg);
+            }
+        }
+        let sink = self.callee_sink_params(&rty, method);
+        let a = self.gen_args_owned(args, &param_tys, &sink, overloaded);
+        let ret = self.method_return_ty(&rty, method, args);
+        let call = format!("{rcode}{op}{method}({a})");
+        (rcode, rty.is_ptr, call, ret)
+    }
+
+    /// Lower `a ?? b`. When `a` is a null-safe navigation — `recv?.method(args)` or
+    /// `recv?.field` — the safe-nav and the coalesce collapse into a single
+    /// NULL-guarded select that yields the navigated **value**:
+    /// `(recv != NULL ? recv->X : b)`. That is what the pattern means, and it keeps
+    /// the discardable `(…, 0)` statement form (which always yields `0`) from leaking
+    /// into a value position — the bug where `recv?.isObject() ?? false` always read
+    /// `false`. Any other `a` keeps the plain pointer form `(a != NULL ? a : b)`.
+    fn gen_null_coalesce(&mut self, a: &Expr, b: &Expr) -> (String, Ty) {
+        let mut lhs = a;
+        while let Expr::Paren(inner) = lhs {
+            lhs = inner;
+        }
+        // `recv?.method(args) ?? b`
+        if let Expr::Call(target, cargs) = lhs {
+            if let Expr::SafeField(recv, method) = &**target {
+                let (rcode, is_ptr, call, ret) = self.gen_safe_call_parts(recv, method, cargs);
+                if !is_ptr {
+                    return (call, ret); // a value receiver can never be null
+                }
+                let (bc, _) = self.gen_expr(b);
+                return (format!("({rcode} != NULL ? {call} : {bc})"), ret);
+            }
+        }
+        // `recv?.field ?? b`
+        if let Expr::SafeField(recv, field) = lhs {
+            let (rcode, is_ptr, access, fty) = self.gen_safe_field_parts(recv, field);
+            if !is_ptr {
+                return (access, fty);
+            }
+            let (bc, _) = self.gen_expr(b);
+            return (format!("({rcode} != NULL ? {access} : {bc})"), fty);
+        }
+        let (ac, aty) = self.gen_expr(a);
+        let (bc, _) = self.gen_expr(b);
+        (format!("({ac} != NULL ? {ac} : {bc})"), aty)
     }
 
     /// If `target(args)` constructs a parameterized enum variant — a bare
     /// `Add(1, 2)` or a qualified `Op.Add(1, 2)` — emit the static factory call
     /// (`Op::Add(1, 2)`). `None` for anything that is not an ADT constructor.
-    pub(super) fn try_enum_ctor_call(&mut self, target: &Expr, args: &[Expr]) -> Option<(String, Ty)> {
+    pub(super) fn try_enum_ctor_call(
+        &mut self,
+        target: &Expr,
+        args: &[Expr],
+    ) -> Option<(String, Ty)> {
         let (info, vname) = match target {
-            Expr::Ident(n)
-                if self.lookup_local(n).is_none() && self.class_field(n).is_none() =>
-            {
+            Expr::Ident(n) if self.lookup_local(n).is_none() && self.class_field(n).is_none() => {
                 // Find the ADT declaring this variant (the expected type wins).
                 let mut found: Option<TypeInfo> = None;
                 if let Some(i) = self.expected.as_ref().and_then(|t| t.info.as_ref()) {
@@ -842,12 +1061,16 @@ impl<'a> BodyGen<'a> {
                 (found?, n.clone())
             }
             Expr::Field(recv, n) => {
-                let Expr::Ident(tname) = &**recv else { return None };
+                let Expr::Ident(tname) = &**recv else {
+                    return None;
+                };
                 if self.lookup_local(tname).is_some() || self.class_field(tname).is_some() {
                     return None;
                 }
-                let info =
-                    self.prog.resolve_type(std::slice::from_ref(tname), self.mi)?.clone();
+                let info = self
+                    .prog
+                    .resolve_type(std::slice::from_ref(tname), self.mi)?
+                    .clone();
                 self.adt_enum(&info)?;
                 (info, n.clone())
             }
@@ -860,7 +1083,11 @@ impl<'a> BodyGen<'a> {
             return None;
         }
         let a = self.gen_args(args);
-        let ty = Ty { base: info.name.clone(), info: Some(info.clone()), ..Default::default() };
+        let ty = Ty {
+            base: info.name.clone(),
+            info: Some(info.clone()),
+            ..Default::default()
+        };
         Some((format!("{}({a})", self.enum_value_ctor(&info, &vname)), ty))
     }
 
@@ -868,22 +1095,14 @@ impl<'a> BodyGen<'a> {
         // `recv?.method(args)` → NULL-guarded call (comma operator keeps it usable
         // as a discardable expression even when the method returns void).
         if let Expr::SafeField(recv, method) = target {
-            let (rcode, rty) = self.gen_expr(recv);
-            let op = if rty.is_ptr { "->" } else { "." };
-            let param_tys = self.callee_param_types(&rty, method);
-            let overloaded = self.method_is_overloaded(&rty, method);
-            if overloaded {
-                if let Some(msg) = self.overload_mismatch(&rty, method, args) {
-                    self.err(msg);
-                }
+            let (rcode, is_ptr, call, ret) = self.gen_safe_call_parts(recv, method, args);
+            if !is_ptr {
+                return (call, ret);
             }
-            let sink = self.callee_sink_params(&rty, method);
-            let a = self.gen_args_owned(args, &param_tys, &sink, overloaded);
-            let ret = self.method_return_ty(&rty, method, args);
-            if !rty.is_ptr {
-                return (format!("{rcode}{op}{method}({a})"), ret);
-            }
-            let call = format!("{rcode}->{method}({a})");
+            // Discardable form: the navigated value is thrown away (the comma
+            // operator keeps it usable even when the method returns void). When the
+            // value is actually wanted — `recv?.m() ?? default` — `gen_null_coalesce`
+            // builds the value form instead.
             return (format!("({rcode} != NULL ? ({call}, 0) : 0)"), Ty::default());
         }
         // Parameterized-enum constructor call (`Add(1, 2)` or `Op.Add(1, 2)`) →
@@ -917,12 +1136,17 @@ impl<'a> BodyGen<'a> {
             // handled above).
             if let Expr::Ident(tname) = &**recv {
                 if self.lookup_local(tname).is_none() && self.class_field(tname).is_none() {
-                    if let Some(info) =
-                        self.prog.resolve_type(std::slice::from_ref(tname), self.mi).cloned()
+                    if let Some(info) = self
+                        .prog
+                        .resolve_type(std::slice::from_ref(tname), self.mi)
+                        .cloned()
                     {
                         if info.kind == TypeKind::Class {
-                            let recv_ty =
-                                Ty { base: info.name.clone(), info: Some(info.clone()), ..Default::default() };
+                            let recv_ty = Ty {
+                                base: info.name.clone(),
+                                info: Some(info.clone()),
+                                ..Default::default()
+                            };
                             let param_tys = self.callee_param_types(&recv_ty, method);
                             let overloaded = self.method_is_overloaded(&recv_ty, method);
                             if overloaded {
@@ -1013,7 +1237,10 @@ impl<'a> BodyGen<'a> {
                     Decl::Function(f) if f.name.as_deref() == Some(name) && f.body.is_some() => {
                         return Some(match &f.ret {
                             Some(t) => self.ty_of(t),
-                            None => Ty { base: "void".into(), ..Default::default() },
+                            None => Ty {
+                                base: "void".into(),
+                                ..Default::default()
+                            },
                         });
                     }
                     _ => {}
@@ -1037,12 +1264,20 @@ impl<'a> BodyGen<'a> {
     }
 
     pub(super) fn gen_args(&mut self, args: &[Expr]) -> String {
-        args.iter().map(|a| self.gen_expr(a).0).collect::<Vec<_>>().join(", ")
+        args.iter()
+            .map(|a| self.gen_expr(a).0)
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Generate call arguments, hoisting anonymous struct literals to temporaries
     /// typed by the callee's parameter (an anon-struct argument → a named temp var).
-    pub(super) fn gen_args_typed(&mut self, args: &[Expr], param_tys: &[Option<Ty>], coerce_str: bool) -> String {
+    pub(super) fn gen_args_typed(
+        &mut self,
+        args: &[Expr],
+        param_tys: &[Option<Ty>],
+        coerce_str: bool,
+    ) -> String {
         self.gen_args_owned(args, param_tys, &[], coerce_str)
     }
 
@@ -1071,9 +1306,16 @@ impl<'a> BodyGen<'a> {
                     Expr::ObjectLit(fields) => {
                         let tgt = target.clone().unwrap_or_else(|| self.current_ret.clone());
                         if heap {
-                            let value_ty = Ty { is_ptr: false, nullable: false, ..tgt.clone() };
+                            let value_ty = Ty {
+                                is_ptr: false,
+                                nullable: false,
+                                ..tgt.clone()
+                            };
                             let tmp = self.hoist_object(fields, value_ty);
-                            let ptr_ty = Ty { is_ptr: true, ..tgt.clone() };
+                            let ptr_ty = Ty {
+                                is_ptr: true,
+                                ..tgt.clone()
+                            };
                             return self.place_new_arg(format!("new {}({tmp})", tgt.base), ptr_ty);
                         }
                         self.hoist_object(fields, tgt)
@@ -1083,7 +1325,14 @@ impl<'a> BodyGen<'a> {
                         let elem = self.element_ty(&vec_ty);
                         let tmp = self.fresh("arr");
                         let mut buf = String::new();
-                        self.expand_array_into_local(&tmp, &vec_ty, &elem, elems, self.prelude_ind, &mut buf);
+                        self.expand_array_into_local(
+                            &tmp,
+                            &vec_ty,
+                            &elem,
+                            elems,
+                            self.prelude_ind,
+                            &mut buf,
+                        );
                         self.prelude.push_str(&buf);
                         tmp
                     }
@@ -1122,14 +1371,26 @@ impl<'a> BodyGen<'a> {
                                 _ => vty.base.clone(),
                             };
                             if !t.is_empty() {
-                                let ptr_ty = Ty { base: t.clone(), is_ptr: true, ..Default::default() };
+                                let ptr_ty = Ty {
+                                    base: t.clone(),
+                                    is_ptr: true,
+                                    ..Default::default()
+                                };
                                 return self.place_new_arg(format!("new {t}({code})"), ptr_ty);
                             }
                         }
                         // In an overloaded call, a bare string literal is a
                         // `const char*` and C++ prefers the `bool` overload over
                         // `std::string`; wrap it so the intended overload is chosen.
-                        if coerce_str && matches!(a, Expr::Str { interpolated: false, .. }) {
+                        if coerce_str
+                            && matches!(
+                                a,
+                                Expr::Str {
+                                    interpolated: false,
+                                    ..
+                                }
+                            )
+                        {
                             return format!("std::string({code})");
                         }
                         code
@@ -1150,7 +1411,8 @@ impl<'a> BodyGen<'a> {
         let tmp = self.fresh("v");
         let spell = self.decl_spelling(&ty);
         let t = "\t".repeat(self.prelude_ind);
-        self.prelude.push_str(&format!("{t}{spell} {tmp} = {new_code};\n"));
+        self.prelude
+            .push_str(&format!("{t}{spell} {tmp} = {new_code};\n"));
         self.register_owned(&tmp);
         tmp
     }
@@ -1176,8 +1438,12 @@ impl<'a> BodyGen<'a> {
     }
 
     pub(super) fn push_into_retaining_container(&self, e: &'a Expr) -> Option<&'a Expr> {
-        let Expr::Call(target, args) = e else { return None };
-        let Expr::Field(recv, method) = &**target else { return None };
+        let Expr::Call(target, args) = e else {
+            return None;
+        };
+        let Expr::Field(recv, method) = &**target else {
+            return None;
+        };
         let value = match (method.as_str(), args.len()) {
             ("push", 1) => &args[0],
             ("insert", 2) => &args[1],

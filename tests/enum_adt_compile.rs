@@ -19,7 +19,11 @@ fn find_gxx() -> Option<String> {
         Some(r"C:\msys64\mingw32\bin\g++.exe".to_string()),
     ];
     candidates.into_iter().flatten().find(|c| {
-        Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+        Command::new(c)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     })
 }
 
@@ -126,9 +130,18 @@ fn adt_enums_compile_and_run() {
 
     // Header shape: tag struct, per-variant payload fields, inline factories.
     let header = std::fs::read_to_string(out.join("lib").join("Op.h")).unwrap();
-    assert!(header.contains("struct Op_ {"), "tag struct emitted:\n{header}");
-    assert!(header.contains("Op_::Enum kind;"), "value class holds the tag:\n{header}");
-    assert!(header.contains("int Add_a;"), "payload fields per variant:\n{header}");
+    assert!(
+        header.contains("struct Op_ {"),
+        "tag struct emitted:\n{header}"
+    );
+    assert!(
+        header.contains("Op_::Enum kind;"),
+        "value class holds the tag:\n{header}"
+    );
+    assert!(
+        header.contains("int Add_a;"),
+        "payload fields per variant:\n{header}"
+    );
     assert!(
         header.contains("std::string Scale_label;"),
         "non-POD payloads are plain members (no union):\n{header}"
@@ -144,7 +157,10 @@ fn adt_enums_compile_and_run() {
 
     let exe = out.join(if cfg!(windows) { "adt.exe" } else { "adt" });
     let mut cmd = Command::new(&gxx);
-    cmd.args(["-std=c++98", "-pedantic", "-Wall"]).arg("-I").arg(&out).arg(&main_cpp);
+    cmd.args(["-std=c++98", "-pedantic", "-Wall"])
+        .arg("-I")
+        .arg(&out)
+        .arg(&main_cpp);
     for f in cpp_files(&out) {
         cmd.arg(f);
     }
@@ -161,9 +177,18 @@ fn adt_enums_compile_and_run() {
     let _ = std::fs::remove_dir_all(&root);
 
     // 3 + 5 + 0 + (0 + 30) — construction, destructuring, arrays of ADTs.
-    assert!(stdout.contains("total=38"), "ADT construction/dispatch wrong:\n{stdout}");
+    assert!(
+        stdout.contains("total=38"),
+        "ADT construction/dispatch wrong:\n{stdout}"
+    );
     // value-position switch binding a payload capture
-    assert!(stdout.contains("name=scaled"), "value-position ADT switch wrong:\n{stdout}");
+    assert!(
+        stdout.contains("name=scaled"),
+        "value-position ADT switch wrong:\n{stdout}"
+    );
     // structural equality / inequality
-    assert!(stdout.contains("eq=1"), "ADT structural equality wrong:\n{stdout}");
+    assert!(
+        stdout.contains("eq=1"),
+        "ADT structural equality wrong:\n{stdout}"
+    );
 }

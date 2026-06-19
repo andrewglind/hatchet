@@ -5,11 +5,19 @@ use super::*;
 impl<'a> BodyGen<'a> {
     /// Constructor parameter types for `new T(...)`, resolved in T's module.
     pub(super) fn ctor_param_types(&self, ty: &Type) -> Vec<Option<Ty>> {
-        let Some(info) = ty_named_info(self.prog, self.mi, ty) else { return Vec::new() };
+        let Some(info) = ty_named_info(self.prog, self.mi, ty) else {
+            return Vec::new();
+        };
         let cmi = info.module_index;
-        let Some(Decl::Class(c)) = self.prog.type_decl(&info) else { return Vec::new() };
+        let Some(Decl::Class(c)) = self.prog.type_decl(&info) else {
+            return Vec::new();
+        };
         match &c.ctor {
-            Some(ctor) => ctor.params.iter().map(|p| self.param_ty_in(p, cmi)).collect(),
+            Some(ctor) => ctor
+                .params
+                .iter()
+                .map(|p| self.param_ty_in(p, cmi))
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -19,8 +27,12 @@ impl<'a> BodyGen<'a> {
     /// A `new` at such a position is freed by the constructed object, so it must be
     /// emitted inline rather than hoisted into a scope-owned local.
     pub(super) fn ctor_owned_params(&self, ty: &Type) -> Vec<bool> {
-        let Some(info) = ty_named_info(self.prog, self.mi, ty) else { return Vec::new() };
-        let Some(Decl::Class(c)) = self.prog.type_decl(&info) else { return Vec::new() };
+        let Some(info) = ty_named_info(self.prog, self.mi, ty) else {
+            return Vec::new();
+        };
+        let Some(Decl::Class(c)) = self.prog.type_decl(&info) else {
+            return Vec::new();
+        };
         // Which constructor parameters take ownership of their argument comes from
         // the escape analysis, as a per-position predicate.
         let owned = crate::sema::escape::ctor_owned_params(self.prog, info.module_index, c);
@@ -52,25 +64,50 @@ impl<'a> BodyGen<'a> {
 
     /// Infer a `std::vector<T>` type from an array literal's first element.
     pub(super) fn infer_array(&mut self, elems: &[Expr]) -> Ty {
-        let elem = elems.first().map(|e| self.gen_expr(e).1).unwrap_or_default();
+        let elem = elems
+            .first()
+            .map(|e| self.gen_expr(e).1)
+            .unwrap_or_default();
         // discard any prelude produced while probing the element type
         self.prelude.clear();
-        let inner = if elem.base.is_empty() { "int".to_string() } else { self.decl_spelling(&elem) };
-        Ty { base: format!("std::vector<{inner} >"), ..Default::default() }
+        let inner = if elem.base.is_empty() {
+            "int".to_string()
+        } else {
+            self.decl_spelling(&elem)
+        };
+        Ty {
+            base: format!("std::vector<{inner} >"),
+            ..Default::default()
+        }
     }
 
     /// Key and value `Ty`s of a `std::map<K, V>` from its base spelling,
     /// recovering struct `info` for the value type where possible.
     pub(super) fn map_kv_ty(&self, map: &Ty) -> (Ty, Ty) {
-        if let Some(inner) = map.base.strip_prefix("std::map<").and_then(|s| s.strip_suffix(">")) {
+        if let Some(inner) = map
+            .base
+            .strip_prefix("std::map<")
+            .and_then(|s| s.strip_suffix(">"))
+        {
             if let Some((k, v)) = split_top_comma(inner.trim()) {
-                let key = Ty { base: k.trim().to_string(), ..Default::default() };
+                let key = Ty {
+                    base: k.trim().to_string(),
+                    ..Default::default()
+                };
                 let v = v.trim();
                 let is_ptr = v.ends_with('*');
                 let base = v.trim_end_matches('*').trim().to_string();
-                let bare = base.rsplit("::").next().unwrap_or(&base).to_string();
-                let info = self.prog.resolve_type(&[bare], self.mi).cloned();
-                return (key, Ty { base, is_ptr, info, ..Default::default() });
+                let bare = base.rsplit("::").next().unwrap_or(&base);
+                let info = self.prog.resolve_type_by_cpp(bare, self.mi).cloned();
+                return (
+                    key,
+                    Ty {
+                        base,
+                        is_ptr,
+                        info,
+                        ..Default::default()
+                    },
+                );
             }
         }
         (Ty::default(), Ty::default())
@@ -78,22 +115,38 @@ impl<'a> BodyGen<'a> {
 
     /// Value `Ty` of a `std::map<K, V>` from its base spelling.
     pub(super) fn map_value_ty(&self, map: &Ty) -> Ty {
-        if let Some(inner) = map.base.strip_prefix("std::map<").and_then(|s| s.strip_suffix(">")) {
+        if let Some(inner) = map
+            .base
+            .strip_prefix("std::map<")
+            .and_then(|s| s.strip_suffix(">"))
+        {
             if let Some((_, v)) = split_top_comma(inner.trim()) {
                 let v = v.trim();
                 let is_ptr = v.ends_with('*');
-                return Ty { base: v.trim_end_matches('*').trim().to_string(), is_ptr, ..Default::default() };
+                return Ty {
+                    base: v.trim_end_matches('*').trim().to_string(),
+                    is_ptr,
+                    ..Default::default()
+                };
             }
         }
         Ty::default()
     }
 
     pub(super) fn map_key_ty(&self, map: &Ty) -> Ty {
-        if let Some(inner) = map.base.strip_prefix("std::map<").and_then(|s| s.strip_suffix(">")) {
+        if let Some(inner) = map
+            .base
+            .strip_prefix("std::map<")
+            .and_then(|s| s.strip_suffix(">"))
+        {
             if let Some((k, _)) = split_top_comma(inner.trim()) {
                 let k = k.trim();
                 let is_ptr = k.ends_with('*');
-                return Ty { base: k.trim_end_matches('*').trim().to_string(), is_ptr, ..Default::default() };
+                return Ty {
+                    base: k.trim_end_matches('*').trim().to_string(),
+                    is_ptr,
+                    ..Default::default()
+                };
             }
         }
         Ty::default()
@@ -142,7 +195,10 @@ impl<'a> BodyGen<'a> {
             }
             i += 1;
         };
-        self.renames.last_mut().unwrap().insert(haxe.to_string(), cpp.clone());
+        self.renames
+            .last_mut()
+            .unwrap()
+            .insert(haxe.to_string(), cpp.clone());
         cpp
     }
 
@@ -170,7 +226,10 @@ impl<'a> BodyGen<'a> {
     /// loop braces are already block-scoped, so only the `for`-init needs this.)
     pub(super) fn loop_var(&mut self, haxe: &str) -> String {
         let cpp = self.fresh(haxe);
-        self.renames.last_mut().unwrap().insert(haxe.to_string(), cpp.clone());
+        self.renames
+            .last_mut()
+            .unwrap()
+            .insert(haxe.to_string(), cpp.clone());
         cpp
     }
 
@@ -214,7 +273,14 @@ impl<'a> BodyGen<'a> {
             }
             _ => None,
         };
-        Ty { base, is_ptr, info, nullable: false, iter: None }
+        Ty {
+            base,
+            is_ptr,
+            info,
+            nullable: false,
+            unsigned: false,
+            iter: None,
+        }
     }
 
     /// The `Ty` of a callee parameter, folding in optionality. `param_decl`
@@ -246,7 +312,10 @@ impl<'a> BodyGen<'a> {
     /// The return type as a value (pointer stripped), for building the temporary
     /// that a struct/array `return` populates before any heap wrapping.
     pub(super) fn return_value_ty(&self) -> Ty {
-        Ty { is_ptr: false, ..self.current_ret.clone() }
+        Ty {
+            is_ptr: false,
+            ..self.current_ret.clone()
+        }
     }
 
     /// Heap-wrap a value temporary when the function returns a pointer
@@ -271,18 +340,42 @@ impl<'a> BodyGen<'a> {
         }
     }
 
+    /// The C++ for `return []`/`return {}` (an empty array/map literal) given the
+    /// method's return type. A pointer return (`Null<Array<T>>` → `T*`) yields
+    /// `NULL`; a by-value container (`std::vector<...>`/`std::map<...>`, which
+    /// carry no `TypeInfo`) yields a default-constructed empty container — you
+    /// cannot `return NULL` from a function returning a container by value.
+    pub(super) fn return_empty_container(&self) -> String {
+        if self.current_ret.is_ptr {
+            "NULL".to_string()
+        } else if !self.current_ret.base.is_empty() {
+            format!("{}()", self.return_value_ty().base)
+        } else {
+            "NULL".to_string()
+        }
+    }
+
     pub(super) fn element_ty(&self, container: &Ty) -> Ty {
         // crude: strip one std::vector<...>/std::map<...> level
         let b = &container.base;
-        if let Some(inner) = b.strip_prefix("std::vector<").and_then(|s| s.strip_suffix(">")) {
+        if let Some(inner) = b
+            .strip_prefix("std::vector<")
+            .and_then(|s| s.strip_suffix(">"))
+        {
             let inner = inner.trim();
             let is_ptr = inner.ends_with('*');
             let base = inner.trim_end_matches('*').trim().to_string();
             // Recover the user/native type so member access on the loop variable
-            // still resolves (`for (tile in tiles) tile.GetExtents()`).
-            let bare = base.rsplit("::").next().unwrap_or(&base).to_string();
-            let info = self.prog.resolve_type(&[bare], self.mi).cloned();
-            return Ty { base, is_ptr, info, ..Default::default() };
+            // still resolves (`for (tile in tiles) tile.GetExtents()`). Resolve via
+            // the C++ leaf name so a `@:native`-renamed element type is found too.
+            let bare = base.rsplit("::").next().unwrap_or(&base);
+            let info = self.prog.resolve_type_by_cpp(bare, self.mi).cloned();
+            return Ty {
+                base,
+                is_ptr,
+                info,
+                ..Default::default()
+            };
         }
         Ty::default()
     }
@@ -301,7 +394,9 @@ impl<'a> BodyGen<'a> {
     pub(super) fn assigned_own_field(&self, target: &Expr) -> Option<String> {
         match target {
             Expr::Field(recv, field) if matches!(**recv, Expr::This) => Some(field.clone()),
-            Expr::Ident(name) if self.lookup_local(name).is_none() && self.class_field(name).is_some() => {
+            Expr::Ident(name)
+                if self.lookup_local(name).is_none() && self.class_field(name).is_some() =>
+            {
                 Some(name.clone())
             }
             _ => None,
@@ -361,13 +456,21 @@ impl<'a> BodyGen<'a> {
             let suppressed_get = f.get != PropAccess::Get && format!("get_{}", f.name) == name;
             let suppressed_set = format!("set_{}", f.name) == name
                 && !(f.set == PropAccess::Set
-                    && self.class.methods.iter().any(|m| m.name.as_deref() == Some(name)));
+                    && self
+                        .class
+                        .methods
+                        .iter()
+                        .any(|m| m.name.as_deref() == Some(name)));
             suppressed_get || suppressed_set
         })
     }
 
     pub(super) fn class_method_return(&self, name: &str) -> Option<Ty> {
-        let m = self.class.methods.iter().find(|m| m.name.as_deref() == Some(name))?;
+        let m = self
+            .class
+            .methods
+            .iter()
+            .find(|m| m.name.as_deref() == Some(name))?;
         m.ret.as_ref().map(|t| self.ty_of(t))
     }
 
@@ -383,7 +486,9 @@ impl<'a> BodyGen<'a> {
     /// user's `set_x` when one is defined (real Haxe `set` access), else the
     /// generated trivial `SetX`. `None` for non-`set` write access.
     pub(super) fn field_setter(&self, info: &TypeInfo, name: &str) -> Option<String> {
-        let Some(Decl::Class(c)) = self.prog.type_decl(info) else { return None };
+        let Some(Decl::Class(c)) = self.prog.type_decl(info) else {
+            return None;
+        };
         let f = self.find_field(c, name)?;
         if f.set != PropAccess::Set {
             return None;
@@ -398,7 +503,11 @@ impl<'a> BodyGen<'a> {
 
     /// Does `class` (or a base) define a method named `name`?
     pub(super) fn class_defines_method(&self, class: &'a Class, name: &str) -> bool {
-        if class.methods.iter().any(|m| m.name.as_deref() == Some(name)) {
+        if class
+            .methods
+            .iter()
+            .any(|m| m.name.as_deref() == Some(name))
+        {
             return true;
         }
         if let Some(Type::Named { path, .. }) = &class.extends {
@@ -456,7 +565,10 @@ impl<'a> BodyGen<'a> {
     pub(super) fn member_field_ty(&self, info: &TypeInfo, name: &str) -> Option<Ty> {
         match self.prog.type_decl(info)? {
             Decl::Class(c) => self.find_field(c, name).map(|f| self.field_ty(f)),
-            Decl::Typedef(Typedef { target: TypedefTarget::Struct(fields), .. }) => fields
+            Decl::Typedef(Typedef {
+                target: TypedefTarget::Struct(fields),
+                ..
+            }) => fields
                 .iter()
                 .find(|f| f.name == name)
                 .map(|f| self.ty_of(&f.ty)),
@@ -465,8 +577,12 @@ impl<'a> BodyGen<'a> {
     }
 
     pub(super) fn method_return_ty(&self, recv: &Ty, method: &str, args: &[Expr]) -> Ty {
-        let Some(info) = &recv.info else { return Ty::default() };
-        let Some(decl) = self.prog.type_decl(info) else { return Ty::default() };
+        let Some(info) = &recv.info else {
+            return Ty::default();
+        };
+        let Some(decl) = self.prog.type_decl(info) else {
+            return Ty::default();
+        };
         let methods = match decl {
             Decl::Class(c) => &c.methods,
             Decl::Interface(i) => &i.methods,
@@ -494,7 +610,9 @@ impl<'a> BodyGen<'a> {
     /// call arguments need coercion to select the intended C++ overload).
     pub(super) fn method_is_overloaded(&self, recv: &Ty, method: &str) -> bool {
         let Some(info) = &recv.info else { return false };
-        let Some(decl) = self.prog.type_decl(info) else { return false };
+        let Some(decl) = self.prog.type_decl(info) else {
+            return false;
+        };
         let methods = match decl {
             Decl::Class(c) => &c.methods,
             Decl::Interface(i) => &i.methods,
@@ -513,8 +631,12 @@ impl<'a> BodyGen<'a> {
     pub(super) fn resolve_overload_ret(&self, m: &Function, args: &[Expr]) -> Option<Ty> {
         let arg_tys: Vec<Ty> = args.iter().map(|a| self.arg_ty(a)).collect();
         for meta in m.meta.iter().filter(|x| x.name == "overload") {
-            let Some(raw) = meta.first_arg() else { continue };
-            let Some((params, ret)) = parse_overload_sig(raw) else { continue };
+            let Some(raw) = meta.first_arg() else {
+                continue;
+            };
+            let Some((params, ret)) = parse_overload_sig(raw) else {
+                continue;
+            };
             if params.len() != arg_tys.len() {
                 continue;
             }
@@ -534,7 +656,12 @@ impl<'a> BodyGen<'a> {
     /// argument types match **no** declared overload signature. Hatchet will not
     /// guess which C++ overload was intended, so the call site is a hard error.
     /// `None` when the method is not overloaded or at least one overload matches.
-    pub(super) fn overload_mismatch(&self, recv: &Ty, method: &str, args: &[Expr]) -> Option<String> {
+    pub(super) fn overload_mismatch(
+        &self,
+        recv: &Ty,
+        method: &str,
+        args: &[Expr],
+    ) -> Option<String> {
         let info = recv.info.as_ref()?;
         let decl = self.prog.type_decl(info)?;
         let methods = match decl {
@@ -553,7 +680,11 @@ impl<'a> BodyGen<'a> {
             .iter()
             .map(|a| {
                 let t = self.arg_ty(a);
-                if t.base.is_empty() { "?".to_string() } else { t.base.clone() }
+                if t.base.is_empty() {
+                    "?".to_string()
+                } else {
+                    t.base.clone()
+                }
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -571,7 +702,10 @@ impl<'a> BodyGen<'a> {
             Expr::Int(_) => int_ty(),
             Expr::Float(_) => float_ty(),
             Expr::Bool(_) => bool_ty(),
-            Expr::Str { .. } => Ty { base: "std::string".into(), ..Default::default() },
+            Expr::Str { .. } => Ty {
+                base: "std::string".into(),
+                ..Default::default()
+            },
             Expr::Ident(n) => self.lookup_local(n).unwrap_or_default(),
             // A *typed* cast (`cast(x, cpp.Float32)`) carries exactly the type the
             // call means to select an overload on (e.g. C++ `float` vs `double`) —
@@ -606,10 +740,15 @@ impl<'a> BodyGen<'a> {
                 // tagged value through its factory (`Op::Halt()`), not the bare
                 // tag (parameterized variants are constructed via `gen_call`).
                 if let Some(e) = self.adt_enum(info) {
-                    let paramless =
-                        e.variants.iter().any(|v| v.name == name && v.params.is_empty());
-                    let ty =
-                        Ty { base: info.name.clone(), info: Some(info.clone()), ..Default::default() };
+                    let paramless = e
+                        .variants
+                        .iter()
+                        .any(|v| v.name == name && v.params.is_empty());
+                    let ty = Ty {
+                        base: info.name.clone(),
+                        info: Some(info.clone()),
+                        ..Default::default()
+                    };
                     let ctor = self.enum_value_ctor(info, name);
                     let code = if paramless { format!("{ctor}()") } else { ctor };
                     return Some((code, ty));
@@ -624,7 +763,11 @@ impl<'a> BodyGen<'a> {
                 } else {
                     info.name.clone()
                 };
-                let ty = Ty { base, info: Some(info.clone()), ..Default::default() };
+                let ty = Ty {
+                    base,
+                    info: Some(info.clone()),
+                    ..Default::default()
+                };
                 return Some((self.enum_constant(info, name), ty));
             }
         }

@@ -116,7 +116,11 @@ fn merged_body(header_code: Option<&str>) -> String {
     } else if existing.trim().is_empty() {
         format!("\n{block}\n")
     } else {
-        let sep = if existing.ends_with('\n') { "\n" } else { "\n\n" };
+        let sep = if existing.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
         format!("{existing}{sep}{block}\n")
     }
 }
@@ -182,21 +186,34 @@ pub fn content_for(
     export_macro: &str,
 ) -> String {
     let guard = guard_for_package(stem, package);
+    let inner = prelude_body(header_code, export_macro);
+    format!("#ifndef {guard}\n#define {guard}\n\n{inner}\n\n#endif\n")
+}
+
+/// The prelude's inner content — `uint*_t` shim, the developer's `@:headerCode`
+/// merged with the required includes, then the export macros — **without** the
+/// include-guard wrapper. `content_for` wraps this for a standalone `StdAfx.h`;
+/// header-only amalgamation inlines it directly under the single header's own guard.
+pub fn prelude_body(header_code: Option<&str>, export_macro: &str) -> String {
     let body = merged_body(header_code);
     let macros = export_macros(export_macro);
     let sections = [stdint_shim().trim(), body.trim(), macros.trim()];
-    let inner = sections
+    sections
         .iter()
         .filter(|s| !s.is_empty())
         .copied()
         .collect::<Vec<_>>()
-        .join("\n\n");
-    format!("#ifndef {guard}\n#define {guard}\n\n{inner}\n\n#endif\n")
+        .join("\n\n")
 }
 
 /// Generate the prelude header (`<stem>.h`) that sits next to the given prelude
 /// source (`<stem>.hx`), merging its `@:headerCode` with the required includes.
-pub fn generate(stem: &str, hx_path: &Path, src: &str, export_macro: &str) -> Option<GeneratedFile> {
+pub fn generate(
+    stem: &str,
+    hx_path: &Path,
+    src: &str,
+    export_macro: &str,
+) -> Option<GeneratedFile> {
     // Sources are commonly CRLF; generated C++ is always LF for consistency.
     let header_code = extract_header_code(src).map(|h| h.replace("\r\n", "\n").replace('\r', "\n"));
     let package = package_parts(src);
@@ -212,9 +229,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -224,23 +239,29 @@ mod tests {
     #[test]
     fn extracts_verbatim_header_code() {
         let src = "@:headerCode('\n#include <vector>\n')\nclass StdAfx {}";
-        assert_eq!(
-            extract_header_code(src).unwrap(),
-            "\n#include <vector>\n"
-        );
+        assert_eq!(extract_header_code(src).unwrap(), "\n#include <vector>\n");
     }
 
     #[test]
     fn guard_naming() {
-        assert_eq!(guard_for_package("StdAfx", &["modules".into()]), "STDAFX_MODULES_H");
-        assert_eq!(guard_for_package("StdAfx", &["game".into()]), "STDAFX_GAME_H");
+        assert_eq!(
+            guard_for_package("StdAfx", &["modules".into()]),
+            "STDAFX_MODULES_H"
+        );
+        assert_eq!(
+            guard_for_package("StdAfx", &["game".into()]),
+            "STDAFX_GAME_H"
+        );
         assert_eq!(
             guard_for_package("StdAfx", &["native".into(), "api".into()]),
             "STDAFX_NATIVE_API_H"
         );
         assert_eq!(guard_for_package("StdAfx", &[]), "STDAFX_H");
         // A custom prelude name flows into the guard.
-        assert_eq!(guard_for_package("MyGame", &["game".into()]), "MYGAME_GAME_H");
+        assert_eq!(
+            guard_for_package("MyGame", &["game".into()]),
+            "MYGAME_GAME_H"
+        );
     }
 
     #[test]
@@ -251,21 +272,43 @@ mod tests {
     }
 
     const REQUIRED: [&str; 7] = [
-        "<stdlib.h>", "<stdio.h>", "<math.h>", "<time.h>", "<string>", "<vector>", "<map>",
+        "<stdlib.h>",
+        "<stdio.h>",
+        "<math.h>",
+        "<time.h>",
+        "<string>",
+        "<vector>",
+        "<map>",
     ];
 
     #[test]
     fn content_for_synthesizes_full_prelude_when_no_header_code() {
         let out = content_for("StdAfx", None, &[], "HATCHET");
-        assert!(out.starts_with("#ifndef STDAFX_H\n#define STDAFX_H\n"), "{out}");
+        assert!(
+            out.starts_with("#ifndef STDAFX_H\n#define STDAFX_H\n"),
+            "{out}"
+        );
         assert!(out.ends_with("#endif\n"), "{out}");
         for h in REQUIRED {
-            assert_eq!(out.matches(&format!("#include {h}")).count(), 1, "{h}\n{out}");
+            assert_eq!(
+                out.matches(&format!("#include {h}")).count(),
+                1,
+                "{h}\n{out}"
+            );
         }
-        assert!(!out.contains("<float.h>"), "float.h is not part of the required set:\n{out}");
+        assert!(
+            !out.contains("<float.h>"),
+            "float.h is not part of the required set:\n{out}"
+        );
         // The uint*_t shim is present and precedes the includes (types first).
-        assert!(out.contains("typedef unsigned __int32 uint32_t;"), "MSVC uint shim:\n{out}");
-        assert!(out.contains("#include <stdint.h>"), "C++11 fallthrough:\n{out}");
+        assert!(
+            out.contains("typedef unsigned __int32 uint32_t;"),
+            "MSVC uint shim:\n{out}"
+        );
+        assert!(
+            out.contains("#include <stdint.h>"),
+            "C++11 fallthrough:\n{out}"
+        );
         assert!(
             out.find("uint32_t").unwrap() < out.find("#include <stdlib.h>").unwrap(),
             "the shim comes before the required includes:\n{out}"
@@ -278,9 +321,16 @@ mod tests {
         // are added, nothing is duplicated, and the custom content is kept.
         let hc = "\n#pragma once\n#include <string>\n#include <vector>\n#include <map>\n";
         let out = content_for("StdAfx", Some(hc), &["modules".into()], "HATCHET");
-        assert!(out.contains("#pragma once"), "keeps custom header code: {out}");
+        assert!(
+            out.contains("#pragma once"),
+            "keeps custom header code: {out}"
+        );
         for h in REQUIRED {
-            assert_eq!(out.matches(&format!("#include {h}")).count(), 1, "{h}\n{out}");
+            assert_eq!(
+                out.matches(&format!("#include {h}")).count(),
+                1,
+                "{h}\n{out}"
+            );
         }
     }
 
@@ -289,12 +339,18 @@ mod tests {
         // The export macros land in the prelude, parameterised by the prefix, and
         // expand to the MSVC tokens under `_MSC_VER`.
         let out = content_for("StdAfx", None, &["game".into()], "NATIVE");
-        assert!(out.contains("#if defined(_MSC_VER)"), "platform guard present:\n{out}");
+        assert!(
+            out.contains("#if defined(_MSC_VER)"),
+            "platform guard present:\n{out}"
+        );
         assert!(
             out.contains("#define NATIVE_EXPORT extern \"C\" __declspec(dllexport)"),
             "MSVC export macro:\n{out}"
         );
-        assert!(out.contains("#define NATIVE_CALL   __cdecl"), "MSVC call macro:\n{out}");
+        assert!(
+            out.contains("#define NATIVE_CALL   __cdecl"),
+            "MSVC call macro:\n{out}"
+        );
         assert!(
             out.contains("#define NATIVE_CLASS  __declspec(dllexport)"),
             "MSVC class-export macro (no extern \"C\"):\n{out}"
@@ -304,6 +360,9 @@ mod tests {
             "GCC fallback present:\n{out}"
         );
         // Macros sit inside the include guard.
-        assert!(out.trim_end().ends_with("#endif"), "guard closes last:\n{out}");
+        assert!(
+            out.trim_end().ends_with("#endif"),
+            "guard closes last:\n{out}"
+        );
     }
 }
