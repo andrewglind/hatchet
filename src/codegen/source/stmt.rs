@@ -556,10 +556,14 @@ impl<'a> BodyGen<'a> {
                 let _ = writeln!(out, "{t}}}");
             }
             Iterable::Coll(coll) => {
-                let (c_raw, cty) = self.gen_expr(coll);
+                let (c_raw, raw_ty) = self.gen_expr(coll);
                 self.flush(out);
+                // Resolve through alias typedefs (`typedef Tilesets = Array<…>`) so
+                // the container/map/iterator checks see the real C++ head, not the
+                // alias name; access still uses the original pointer-ness.
+                let cty = self.deref_alias(&raw_ty);
                 // A nullable container is a pointer — dereference it to iterate.
-                let access = if cty.is_ptr {
+                let access = if raw_ty.is_ptr {
                     format!("(*{c_raw})")
                 } else {
                     c_raw.clone()
@@ -618,7 +622,7 @@ impl<'a> BodyGen<'a> {
                     let _ = writeln!(out, "{t}}}");
                 } else if let Some(plan) = value_var
                     .is_none()
-                    .then(|| self.iter_plan(&c_raw, &cty))
+                    .then(|| self.iter_plan(&c_raw, &raw_ty))
                     .flatten()
                 {
                     // A custom `Iterator` (has `hasNext`/`next`) or `Iterable` (has
@@ -654,7 +658,7 @@ impl<'a> BodyGen<'a> {
                     self.emit_owned_deletes(out, ind + 1);
                     self.pop_scope();
                     let _ = writeln!(out, "{t}}}");
-                } else if value_var.is_some() && self.iter_plan(&c_raw, &cty).is_some() {
+                } else if value_var.is_some() && self.iter_plan(&c_raw, &raw_ty).is_some() {
                     // The type implements the (value-only) Iterator/Iterable
                     // protocol, but `key => value` needs the key-value protocol,
                     // which Hatchet supports only for Map and Array (index keys).
@@ -711,9 +715,13 @@ impl<'a> BodyGen<'a> {
                 )
             }
             Iterable::Coll(coll) => {
-                let (c_raw, cty) = self.gen_expr(coll);
+                let (c_raw, raw_ty) = self.gen_expr(coll);
+                // Resolve through alias typedefs so the container/map/iterator checks
+                // see the real C++ head (see `gen_for`); access keeps the original
+                // pointer-ness.
+                let cty = self.deref_alias(&raw_ty);
                 // A nullable container is a pointer — dereference it to iterate.
-                let access = if cty.is_ptr {
+                let access = if raw_ty.is_ptr {
                     format!("(*{c_raw})")
                 } else {
                     c_raw.clone()
@@ -741,7 +749,7 @@ impl<'a> BodyGen<'a> {
                     (hdr, format!("{t}}}\n"))
                 } else if let Some(plan) = value_var
                     .is_none()
-                    .then(|| self.iter_plan(&c_raw, &cty))
+                    .then(|| self.iter_plan(&c_raw, &raw_ty))
                     .flatten()
                 {
                     // A custom `Iterator`/`Iterable` (see `gen_for`). A comprehension
