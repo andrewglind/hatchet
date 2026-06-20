@@ -311,14 +311,17 @@ impl<'a> BodyGen<'a> {
             Expr::Index(recv, idx) => {
                 let (r, rty) = self.gen_expr(recv);
                 let (i, _) = self.gen_expr(idx);
+                // Resolve alias typedefs so an aliased container indexes/element-types
+                // correctly (the receiver code is unchanged).
+                let cty = self.deref_alias(&rty);
                 // A nullable container (`Null<Array<T>>`) is a pointer; index the
                 // pointee, not the pointer.
-                let access = if rty.is_ptr && is_container_ty(&rty) {
+                let access = if rty.is_ptr && is_container_ty(&cty) {
                     format!("(*{r})")
                 } else {
                     r
                 };
-                (format!("{access}[{i}]"), self.element_ty(&rty))
+                (format!("{access}[{i}]"), self.element_ty(&cty))
             }
             Expr::Call(target, args) => {
                 let (code, ty) = self.gen_call(target, args);
@@ -348,15 +351,15 @@ impl<'a> BodyGen<'a> {
             Expr::New(ty, args) => {
                 let base = self.prog.map_type_base(ty, self.mi, &self.ns);
                 // `new Array<T>()` / `new Map<K,V>()` → a value-constructed,
-                // empty container (Haxe heap arrays are C++ value containers).
-                if base.starts_with("std::vector") || base.starts_with("std::map") {
-                    return (
-                        format!("{base}()"),
-                        Ty {
-                            base,
-                            ..Default::default()
-                        },
-                    );
+                // empty container (Haxe heap arrays are C++ value containers). An
+                // alias typedef (`typedef Tilesets = Array<…>`) resolves to the same
+                // container head, so `new Tilesets()` value-constructs `Tilesets()`
+                // (a valid std::vector typedef) rather than heap-allocating.
+                let nty = self.ty_of(ty);
+                let resolved = self.deref_alias(&nty);
+                if resolved.base.starts_with("std::vector") || resolved.base.starts_with("std::map")
+                {
+                    return (format!("{base}()"), nty);
                 }
                 // `new String(x)` → a string *value*, not a heap pointer.
                 if base == "std::string" {
@@ -842,13 +845,14 @@ impl<'a> BodyGen<'a> {
         // Haxe `.length` → `.size()` (Array/Map) or `.length()` (String). A nullable
         // container is a pointer (`Null<Array<T>>`), so it must be dereferenced.
         if name == "length" {
-            if is_container_ty(&rty) {
+            let cty = self.deref_alias(&rty);
+            if is_container_ty(&cty) {
                 if rty.is_ptr {
                     return (format!("(*{rcode}).size()"), size_ty());
                 }
                 return (format!("{rcode}.size()"), size_ty());
             }
-            if rty.base == "std::string" {
+            if cty.base == "std::string" {
                 return (format!("{rcode}.length()"), size_ty());
             }
         }
@@ -1159,17 +1163,22 @@ impl<'a> BodyGen<'a> {
                 }
             }
             let (rcode, rty) = self.gen_expr(recv);
+            // Resolve through alias typedefs (`typedef Tilesets = Array<…>`) so a
+            // method on an aliased container/string still dispatches to the
+            // std::vector / std::map / std::string lowering. The receiver code is
+            // unchanged (the C++ value already *is* that container via its typedef).
+            let cty = self.deref_alias(&rty);
             // Haxe container methods → std::vector / std::map equivalents.
-            if is_container_ty(&rty) {
+            if is_container_ty(&cty) {
                 if is_mutating_container_method(method) {
                     self.warn_if_param_container_mutated(recv, method);
                 }
-                if let Some(res) = self.container_call(&rcode, &rty, method, args) {
+                if let Some(res) = self.container_call(&rcode, &cty, method, args) {
                     return res;
                 }
             }
             // Haxe String methods → std::string expressions (Tier 1).
-            if rty.base == "std::string" {
+            if cty.base == "std::string" {
                 if let Some(res) = self.string_call(&rcode, method, args) {
                     return res;
                 }
@@ -1423,8 +1432,11 @@ impl<'a> BodyGen<'a> {
     /// `@:stackOnly` class as a value construction (no heap, no ownership) — so
     /// such a `new` is never hoisted into an owned local or freed.
     pub(super) fn value_new(&self, ty: &Type) -> bool {
-        is_value_new(ty)
-            || matches!(ty, Type::Named { path, .. } if self.prog.is_value_class(path, self.mi))
+        // Resolve alias typedefs (`typedef Tilesets = Array<…>`) so `new Tilesets()`
+        // is recognised as a value container — value-constructed, never owned/freed.
+        let resolved = self.prog.resolve_alias_type(ty, self.mi);
+        is_value_new(&resolved)
+            || matches!(&resolved, Type::Named { path, .. } if self.prog.is_value_class(path, self.mi))
     }
 
     pub(super) fn push_into_retaining_container(&self, e: &'a Expr) -> Option<&'a Expr> {

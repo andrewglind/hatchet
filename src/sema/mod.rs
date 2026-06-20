@@ -503,6 +503,41 @@ impl Program {
         }
     }
 
+    /// Follow `AliasTypedef` chains to the underlying Haxe type — e.g.
+    /// `typedef Tilesets = Array<Tileset>` resolves to `Array<Tileset>`. A non-alias
+    /// (or a parameterised/struct type) is returned unchanged. Each hop re-roots in
+    /// the typedef's own module so the target's names resolve there; the walk is
+    /// bounded against a pathological alias cycle. Used so a value's *container-ness*
+    /// (Array/Map/String) is seen through an alias for construction/iteration/escape.
+    pub fn resolve_alias_type(&self, ty: &Type, ctx_module: usize) -> Type {
+        let mut cur = ty.clone();
+        let mut ctx = ctx_module;
+        for _ in 0..16 {
+            let Type::Named { path, params, .. } = &cur else {
+                break;
+            };
+            if !params.is_empty() {
+                break;
+            }
+            let Some(ti) = self.resolve_type(path, ctx) else {
+                break;
+            };
+            if ti.kind != TypeKind::AliasTypedef {
+                break;
+            }
+            let next_ctx = ti.module_index;
+            let Some(Decl::Typedef(td)) = self.type_decl(ti) else {
+                break;
+            };
+            let TypedefTarget::Alias(target) = &td.target else {
+                break;
+            };
+            cur = target.clone();
+            ctx = next_ctx;
+        }
+        cur
+    }
+
     /// Does `class` (or any transitive base / implemented interface, including
     /// native ones) declare a method named `name`? Used to decide `virtual`.
     pub fn method_overrides_base(&self, class: &Class, ctx_module: usize, name: &str) -> bool {

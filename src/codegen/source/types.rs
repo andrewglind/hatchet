@@ -340,6 +340,36 @@ impl<'a> BodyGen<'a> {
         }
     }
 
+    /// Follow `AliasTypedef` chains to the underlying type, for the structural
+    /// checks that key on a C++ spelling (`is_container_ty`/`rcode_is_map`/
+    /// `element_ty`). A `typedef Tilesets = Array<Tileset>` maps *as a name* to the
+    /// emitted `Tilesets` typedef — correct for declarations and `.push()`/`[]`,
+    /// which go through the real `std::vector` — but iteration needs to see the
+    /// `std::vector<…>` head to bind the element. Resolution happens in the
+    /// typedef's own module so its target's names qualify correctly; the loop is
+    /// bounded against a pathological alias cycle.
+    pub(super) fn deref_alias(&self, ty: &Ty) -> Ty {
+        let mut cur = ty.clone();
+        for _ in 0..16 {
+            let Some(info) = &cur.info else { break };
+            if info.kind != TypeKind::AliasTypedef {
+                break;
+            }
+            let Some(Decl::Typedef(td)) = self.prog.type_decl(info) else {
+                break;
+            };
+            let TypedefTarget::Alias(target) = &td.target else {
+                break;
+            };
+            let next = self.ty_of_in(target, info.module_index);
+            if next.base == cur.base {
+                break;
+            }
+            cur = next;
+        }
+        cur
+    }
+
     pub(super) fn element_ty(&self, container: &Ty) -> Ty {
         // crude: strip one std::vector<...>/std::map<...> level
         let b = &container.base;
@@ -584,6 +614,23 @@ impl<'a> BodyGen<'a> {
             }
             None => Ty::default(),
         }
+    }
+
+    /// Whether `recv`'s resolved class/interface declares a method named `name`
+    /// (directly — base-class methods are not consulted). Drives custom-iterator
+    /// detection: a value with `hasNext`/`next` is an `Iterator`, one with
+    /// `iterator` is an `Iterable`.
+    pub(super) fn has_method(&self, recv: &Ty, name: &str) -> bool {
+        let Some(info) = &recv.info else { return false };
+        let Some(decl) = self.prog.type_decl(info) else {
+            return false;
+        };
+        let methods = match decl {
+            Decl::Class(c) => &c.methods,
+            Decl::Interface(i) => &i.methods,
+            _ => return false,
+        };
+        methods.iter().any(|m| m.name.as_deref() == Some(name))
     }
 
     /// Whether the named method on `recv` carries `@:overload` signatures (so its

@@ -299,7 +299,12 @@ impl<'a> BodyGen<'a> {
         self.current_ret = ret_ty.clone();
         let ret_cpp = self.decl_spelling(&ret_ty);
         let plist = self.header_params(&params);
-        let prefix = if g.access == Access::Private {
+        // See `plain_fn_def`: a header-only amalgamation has no `.cpp`, so the
+        // definition is emitted `inline` in the header; otherwise a file-local
+        // (`private`) function is `static`.
+        let prefix = if self.inline_defs {
+            "inline "
+        } else if g.access == Access::Private {
             "static "
         } else {
             ""
@@ -420,7 +425,12 @@ impl<'a> BodyGen<'a> {
         self.current_ret = ret_ty.clone();
         let ret_cpp = self.decl_spelling(&ret_ty);
         let plist = self.header_params(&f.params);
-        let prefix = if f.access == Access::Private {
+        // In a header-only amalgamation there is no `.cpp`, so the definition lives
+        // in the header and must be `inline` (ODR-safe across the translation units
+        // that include it). Otherwise a file-local (`private`) function is `static`.
+        let prefix = if self.inline_defs {
+            "inline "
+        } else if f.access == Access::Private {
             "static "
         } else {
             ""
