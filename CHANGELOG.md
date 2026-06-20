@@ -3,6 +3,35 @@
 All notable changes to Hatchet are documented here. Versions follow the
 project's milestones.
 
+## Unreleased
+
+### Custom `Iterator` / `Iterable` iteration
+
+`for (x in e)` now iterates any value that implements the Haxe iteration protocol, not just ranges,
+`Array`, and `Map`:
+
+- an **Iterator** — `e` itself exposes `hasNext():Bool` and `next():T`;
+- an **Iterable** — `e` exposes `iterator():Iterator<T>`.
+
+Both lower to a `while (it.hasNext()) { T x = it.next(); … }` loop, with `.`/`->` access chosen by whether
+the iterator is a value or a reference type. When `iterator()` hands back a heap (reference-type) iterator,
+the loop **owns and `delete`s it** — including on an early `return` out of the loop body (freed via the
+all-scopes delete) with no double-free on normal completion. The same lowering drives array/map
+comprehensions (`[for (x in e) …]`). A value that implements neither protocol (nor is a range/Array/Map)
+is still a hard error, as is `key => value` over a value-only custom iterator (that needs a `Map` or
+`Array`). Base-class iterator methods are not yet consulted (the protocol methods must be declared on the
+type itself).
+
+### Header-only: module-level free functions
+
+`--header-only` now supports **module-level free functions** — both the plain `function name(...) {...}`
+form and the `final NAME = (...) -> ...` lambda form. They are emitted `inline` into the amalgamated
+header (ODR-safe across the translation units that include it), alongside the inline class bodies; a
+file-local (`private`) helper used before its definition is forward-declared. Only `@:abi` `extern "C"`
+exports remain unsupported in this mode — an exported symbol still needs an object file. Because every
+module in a package shares one C++ namespace in the amalgamation, two free functions with the **same name
+in the same package** are now a hard error rather than non-compiling output.
+
 ## v0.2.1 — Header-only output, resolve-only includes, null-safe fix (2026-06-19)
 
 A minor release on top of Milestone 10: a **single-header amalgamation** mode, an explicit

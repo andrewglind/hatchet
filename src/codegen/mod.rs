@@ -622,6 +622,14 @@ impl<'a> HeaderGen<'a> {
                 errors.append(&mut e);
             }
         }
+        // Module-level free functions (plain `function`s and `final NAME = lambda`)
+        // are emitted `inline` here too — a header-only amalgamation has no `.cpp`
+        // to define them in.
+        let (fn_defs, mut fw, mut fe) =
+            crate::codegen::source::inline_free_fn_defs(self.prog, self.mi);
+        body.push_str(&fn_defs);
+        warnings.append(&mut fw);
+        errors.append(&mut fe);
         let mut out = String::new();
         if !body.trim().is_empty() {
             for part in &self.ns {

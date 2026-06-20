@@ -606,6 +606,23 @@ impl<'a> BodyGen<'a> {
         }
     }
 
+    /// Whether `recv`'s resolved class/interface declares a method named `name`
+    /// (directly — base-class methods are not consulted). Drives custom-iterator
+    /// detection: a value with `hasNext`/`next` is an `Iterator`, one with
+    /// `iterator` is an `Iterable`.
+    pub(super) fn has_method(&self, recv: &Ty, name: &str) -> bool {
+        let Some(info) = &recv.info else { return false };
+        let Some(decl) = self.prog.type_decl(info) else {
+            return false;
+        };
+        let methods = match decl {
+            Decl::Class(c) => &c.methods,
+            Decl::Interface(i) => &i.methods,
+            _ => return false,
+        };
+        methods.iter().any(|m| m.name.as_deref() == Some(name))
+    }
+
     /// Whether the named method on `recv` carries `@:overload` signatures (so its
     /// call arguments need coercion to select the intended C++ overload).
     pub(super) fn method_is_overloaded(&self, recv: &Ty, method: &str) -> bool {
