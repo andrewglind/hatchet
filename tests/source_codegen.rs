@@ -1926,6 +1926,170 @@ class M {
 }
 
 #[test]
+fn custom_iterator_lowers_to_a_hasnext_next_while_loop() {
+    // A value with `hasNext`/`next` is an Iterator; a value with `iterator()` is an
+    // Iterable. Both lower to a `while (it.hasNext()) { T x = it.next(); … }` loop,
+    // and an Iterable whose `iterator()` returns a heap (reference-type) iterator
+    // makes the loop `delete` it once after the loop.
+    let src = "\
+class It {
+  var n:Int;
+  public function new(s:Int) { this.n = s; }
+  public function hasNext():Bool { return this.n > 0; }
+  public function next():Int { var v = this.n; this.n -= 1; return v; }
+}
+class Seq {
+  public function new() {}
+  public function iterator():It { return new It(3); }
+}
+class C {
+  public function new() {}
+  public function run():Void {
+    var total:Int = 0;
+    var it = new It(5);
+    for (x in it) { total += x; }
+    var s = new Seq();
+    for (y in s) { total += y; }
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_customiter_unit_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("C.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("C"))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The Iterator is aliased (not copied/freed); the Iterable's heap iterator is
+    // allocated via iterator() and deleted exactly once.
+    assert!(
+        out.contains("->hasNext()") && out.contains("->next()"),
+        "expected a hasNext/next while loop:\n{out}"
+    );
+    assert!(
+        out.contains("->iterator()"),
+        "expected an iterator() call for the Iterable:\n{out}"
+    );
+    assert!(
+        out.contains("delete ") && out.contains("->iterator();"),
+        "the heap iterator must be freed:\n{out}"
+    );
+    // No index path for a custom iterator.
+    assert!(
+        !out.contains(".size();"),
+        "a custom iterator must not use the array index path:\n{out}"
+    );
+}
+
+#[test]
+fn custom_iterator_key_value_form_is_an_error() {
+    // `key => value` over a value-only custom iterator is unsupported (it needs a
+    // Map or Array); Hatchet must reject it rather than emit wrong code.
+    let src = "\
+class It {
+  var n:Int;
+  public function new(s:Int) { this.n = s; }
+  public function hasNext():Bool { return this.n > 0; }
+  public function next():Int { var v = this.n; this.n -= 1; return v; }
+}
+class C {
+  public function new() {}
+  public function run():Void {
+    var it = new It(3);
+    for (k => v in it) {}
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_customiter_kv_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("C.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("C"))
+        .unwrap();
+    let (_, _, errors) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        errors
+            .iter()
+            .any(|(_, e)| e.contains("cannot iterate") && e.contains("yields values only")),
+        "expected a key=>value-over-custom-iterator error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn iterator_only_via_alias_or_base_class_fails_loudly() {
+    // The custom-iterator detection needs the protocol methods on the iterated type
+    // itself. Reaching them only through a typedef alias, or by inheriting them from
+    // a base class, is NOT detected — and must be a hard error (with a specific
+    // message), in both a `for` statement and a comprehension, never silent wrong
+    // code (a comprehension previously assumed `.size()`/`[]` for any unknown type).
+    let src = "\
+class It {
+  var n:Int;
+  public function new(s:Int) { this.n = s; }
+  public function hasNext():Bool { return this.n > 0; }
+  public function next():Int { var v = this.n; this.n -= 1; return v; }
+}
+typedef Alias = It;
+class Sub extends It {
+  public function new(s:Int) { super(s); }
+}
+class C {
+  public function new() {}
+  public function viaAliasFor():Void {
+    var a:Alias = new It(3);
+    for (x in a) {}
+  }
+  public function viaAliasCompr():Array<Int> {
+    var a:Alias = new It(3);
+    return [for (x in a) x];
+  }
+  public function viaBase():Void {
+    var s = new Sub(3);
+    for (x in s) {}
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_iter_indirect_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("C.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("C"))
+        .unwrap();
+    let (_, _, errors) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Two alias errors (the `for` and the comprehension) naming the typedef cause.
+    let alias_errs = errors
+        .iter()
+        .filter(|(_, e)| e.contains("cannot iterate") && e.contains("typedef alias"))
+        .count();
+    assert!(
+        alias_errs >= 2,
+        "expected loud alias errors for both the for-loop and the comprehension, got: {errors:?}"
+    );
+    // The base-class case is also rejected, with its own hint.
+    assert!(
+        errors
+            .iter()
+            .any(|(_, e)| e.contains("cannot iterate") && e.contains("base class")),
+        "expected a loud base-class iterator error, got: {errors:?}"
+    );
+}
+
+#[test]
 fn array_key_value_iteration_binds_the_index() {
     // `for (index => value in array)` is valid Haxe — the key is the Int index.
     // Exercised in both statement and comprehension position.
@@ -1994,8 +2158,9 @@ abstract Holder(Val) {
 
 #[test]
 fn for_over_a_non_container_is_an_error() {
-    // Hatchet has no general Iterator/Iterable protocol; iterating something that is
-    // not a range, Array, or Map must fail loudly rather than emit invalid C++.
+    // Iterating a value that is neither a range, Array, or Map, nor implements the
+    // Iterator/Iterable protocol (here a bare `Int`) must fail loudly rather than
+    // emit invalid C++.
     let src = "\
 class B {
   public function new() {}
@@ -2018,7 +2183,8 @@ class B {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
-        errors.iter().any(|(_, e)| e.contains("cannot iterate") && e.contains("only ranges, Array, and Map")),
+        errors.iter().any(|(_, e)| e.contains("cannot iterate")
+            && e.contains("Iterator/Iterable protocol")),
         "expected a non-container iteration error, got: {errors:?}"
     );
 }

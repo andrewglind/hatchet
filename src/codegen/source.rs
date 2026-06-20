@@ -271,11 +271,95 @@ pub fn inline_class_defs(prog: &Program, mi: usize, class: &Class) -> SourceOutp
 }
 
 /// `true` if this module-level `final` binds a function/lambda (so it lowers to a
-/// namespace free function defined in the `.cpp`). Used by the driver to reject
-/// module-level free functions in `--header-only` mode, where there is no `.cpp` to
-/// hold the definition.
+/// namespace free function). Used by the driver to detect free-function name
+/// clashes and `@:abi` exports in a `--header-only` amalgamation.
 pub fn is_free_fn_global(g: &GlobalVar) -> bool {
     lambda_parts(g).is_some()
+}
+
+/// Inline definitions for a module's module-level free functions — plain
+/// `function name(...) {...}` and `final NAME = (...) -> ...` lambda forms — for a
+/// header-only amalgamation, where there is no `.cpp` to hold them. Each definition
+/// is marked `inline` (ODR-safe across the translation units that include the
+/// header). File-local (`private`) functions get an `inline` forward declaration
+/// first so a caller emitted before the definition can still reach them (public
+/// ones are already declared in the header's first pass). `@:abi` `extern "C"`
+/// exports are excluded — those need their own object file and are rejected by the
+/// driver. Returns namespace-less, one-tab-indented text plus `(warnings, errors)`;
+/// the caller wraps the module's namespace around it.
+pub fn inline_free_fn_defs(prog: &Program, mi: usize) -> SourceOutput {
+    let m = &prog.modules[mi];
+    let empty = empty_class();
+    let mut out = String::new();
+    let mut warnings: Vec<(usize, String)> = Vec::new();
+    let mut errors: Vec<(usize, String)> = Vec::new();
+
+    let lambdas: Vec<&GlobalVar> = m
+        .file
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Global(g) if lambda_parts(g).is_some() => Some(g),
+            _ => None,
+        })
+        .collect();
+    let plains: Vec<&Function> = m
+        .file
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Function(f)
+                if !f.modifiers.is_macro && !has_meta(&f.meta, "abi") && f.body.is_some() =>
+            {
+                Some(f)
+            }
+            _ => None,
+        })
+        .collect();
+    if lambdas.is_empty() && plains.is_empty() {
+        return (out, warnings, errors);
+    }
+
+    // Forward declarations for file-local (`private`) functions so calls that
+    // precede the definition resolve. Marked `inline` to match the definition.
+    let mut fwd = String::new();
+    for g in &lambdas {
+        if g.access == Access::Private {
+            let mut bg = BodyGen::new(prog, mi, &empty, prog.extract_depth, prog.no_trace);
+            if let Some(sig) = bg.free_fn_signature(g, false) {
+                let _ = writeln!(fwd, "\tinline {sig};");
+            }
+        }
+    }
+    for f in &plains {
+        if f.access == Access::Private {
+            let mut bg = BodyGen::new(prog, mi, &empty, prog.extract_depth, prog.no_trace);
+            if let Some(sig) = bg.plain_fn_signature(f, false) {
+                let _ = writeln!(fwd, "\tinline {sig};");
+            }
+        }
+    }
+    if !fwd.is_empty() {
+        out.push_str(&fwd);
+        out.push('\n');
+    }
+
+    for g in &lambdas {
+        let mut bg = BodyGen::new(prog, mi, &empty, prog.extract_depth, prog.no_trace);
+        bg.inline_defs = true;
+        out.push_str(&bg.free_fn_def(g));
+        warnings.append(&mut bg.warnings);
+        errors.append(&mut bg.errors);
+    }
+    for f in &plains {
+        let mut bg = BodyGen::new(prog, mi, &empty, prog.extract_depth, prog.no_trace);
+        bg.inline_defs = true;
+        out.push_str(&bg.plain_fn_def(f));
+        warnings.append(&mut bg.warnings);
+        errors.append(&mut bg.errors);
+    }
+
+    (out, warnings, errors)
 }
 
 /// A lightweight description of an expression's C++ type, enough to drive member

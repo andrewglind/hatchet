@@ -2,6 +2,20 @@
 
 use super::*;
 
+/// A lowering plan for a custom `Iterator`/`Iterable` `for` loop (see
+/// [`BodyGen::iter_plan`]).
+struct IterPlan {
+    /// C++ expression that initialises the iterator local.
+    init: String,
+    /// Type of the iterator local — its spelling and whether access is `.`/`->`.
+    iter_ty: Ty,
+    /// Element type bound to the loop variable (`next()`'s return type).
+    elem: Ty,
+    /// Whether the loop owns the iterator and must `delete` it when done (true only
+    /// when an `iterator()` call handed us a fresh heap pointer).
+    owns_iter: bool,
+}
+
 impl<'a> BodyGen<'a> {
     // ---- statements ----------------------------------------------------
 
@@ -460,6 +474,116 @@ impl<'a> BodyGen<'a> {
         self.pop_scope();
     }
 
+    /// How to drive a custom `Iterator`/`Iterable` loop: the C++ expression that
+    /// initialises the iterator local, that local's type (for spelling and the
+    /// `.`/`->` access operator), the element type bound to the loop variable, and
+    /// whether the loop must `delete` the iterator when it finishes (true only when
+    /// we allocated it — an `iterator()` call returning a heap pointer).
+    fn iter_plan(&self, coll_code: &str, cty: &Ty) -> Option<IterPlan> {
+        // The Haxe `Iterator` protocol: the value itself has `hasNext()`/`next()`.
+        if self.has_method(cty, "hasNext") && self.has_method(cty, "next") {
+            let elem = self.method_return_ty(cty, "next", &[]);
+            if elem.base.is_empty() {
+                return None;
+            }
+            return Some(IterPlan {
+                init: coll_code.to_string(),
+                iter_ty: cty.clone(),
+                elem,
+                owns_iter: false,
+            });
+        }
+        // The `Iterable` protocol: the value has `iterator()` returning an Iterator.
+        if self.has_method(cty, "iterator") {
+            let iter_ty = self.method_return_ty(cty, "iterator", &[]);
+            if iter_ty.base.is_empty() || !self.has_method(&iter_ty, "next") {
+                return None;
+            }
+            let elem = self.method_return_ty(&iter_ty, "next", &[]);
+            if elem.base.is_empty() {
+                return None;
+            }
+            let recv = if cty.is_ptr { "->" } else { "." };
+            let owns_iter = iter_ty.is_ptr;
+            return Some(IterPlan {
+                init: format!("{coll_code}{recv}iterator()"),
+                iter_ty,
+                elem,
+                owns_iter,
+            });
+        }
+        None
+    }
+
+    /// Whether `ty`'s class/interface *directly* declares the Iterator protocol
+    /// (`hasNext`+`next`) or the Iterable protocol (`iterator`).
+    fn has_iter_protocol(&self, ty: &Ty) -> bool {
+        (self.has_method(ty, "hasNext") && self.has_method(ty, "next"))
+            || self.has_method(ty, "iterator")
+    }
+
+    /// Whether a *base class* of `ty` declares the iteration protocol. Hatchet does
+    /// not consult inherited methods for iteration, so this only sharpens the error
+    /// message — it never makes such a type iterable.
+    fn base_has_iter_protocol(&self, ty: &Ty) -> bool {
+        let mut info = match &ty.info {
+            Some(i) => i.clone(),
+            None => return false,
+        };
+        for _ in 0..16 {
+            let extends = match self.prog.type_decl(&info) {
+                Some(Decl::Class(c)) => c.extends.clone(),
+                _ => return false,
+            };
+            let Some(Type::Named { path, .. }) = extends else {
+                return false;
+            };
+            let Some(binfo) = self.prog.resolve_type(&path, info.module_index).cloned() else {
+                return false;
+            };
+            let bty = Ty {
+                info: Some(binfo.clone()),
+                ..Default::default()
+            };
+            if self.has_iter_protocol(&bty) {
+                return true;
+            }
+            info = binfo;
+        }
+        false
+    }
+
+    /// Raise the hard error for a `for (var in ...)` over a non-iterable `cty`,
+    /// distinguishing the cases Hatchet deliberately does *not* detect — a custom
+    /// Iterator/Iterable reached only through a typedef alias, or inherited from a
+    /// base class — from a genuinely non-iterable type. `cty` is alias-resolved.
+    fn not_iterable_error(&mut self, var: &str, cty: &Ty) {
+        let base = if cty.base.is_empty() {
+            "an unknown type"
+        } else {
+            &cty.base
+        };
+        let detail = if self.has_iter_protocol(cty) {
+            // The resolved type has the protocol, yet we reached the error — so the
+            // iterated value named it through a typedef alias, which is not detected.
+            "it implements the Iterator/Iterable protocol only through a typedef alias; \
+             iterate the alias's underlying type directly (the protocol methods must be \
+             on the iterated type itself)"
+                .to_string()
+        } else if self.base_has_iter_protocol(cty) {
+            "it inherits the Iterator/Iterable protocol from a base class, which Hatchet \
+             does not consult; declare `hasNext`/`next` (or `iterator()`) on the type itself"
+                .to_string()
+        } else {
+            "only ranges, Array, Map, and types implementing the Iterator/Iterable protocol \
+             (`hasNext`/`next`, or `iterator()`) are iterable"
+                .to_string()
+        };
+        self.err(format!(
+            "cannot iterate `for ({var} in ...)` over `{base}`: {detail}"
+        ));
+    }
+
     pub(super) fn gen_for(
         &mut self,
         var: &str,
@@ -501,10 +625,18 @@ impl<'a> BodyGen<'a> {
                 let _ = writeln!(out, "{t}}}");
             }
             Iterable::Coll(coll) => {
-                let (c, cty) = self.gen_expr(coll);
+                let (c_raw, raw_ty) = self.gen_expr(coll);
                 self.flush(out);
+                // Resolve through alias typedefs (`typedef Tilesets = Array<…>`) so
+                // the container/map/iterator checks see the real C++ head, not the
+                // alias name; access still uses the original pointer-ness.
+                let cty = self.deref_alias(&raw_ty);
                 // A nullable container is a pointer — dereference it to iterate.
-                let access = if cty.is_ptr { format!("(*{c})") } else { c };
+                let access = if raw_ty.is_ptr {
+                    format!("(*{c_raw})")
+                } else {
+                    c_raw.clone()
+                };
                 if rcode_is_map(&cty) {
                     // Map iteration via a std::map iterator. `for (k => v in m)`
                     // binds both; `for (v in m)` binds the value (Haxe iterates a
@@ -557,14 +689,58 @@ impl<'a> BodyGen<'a> {
                     self.gen_block_inner(body, ind + 1, out);
                     self.emit_owned_deletes(out, ind + 1);
                     let _ = writeln!(out, "{t}}}");
-                } else {
-                    // Not a range, vector, or map: Hatchet has no general iterator
-                    // protocol, so this would otherwise emit invalid `.size()`/`[]`
-                    // access. Fail loudly instead of guessing.
+                } else if let Some(plan) = value_var
+                    .is_none()
+                    .then(|| self.iter_plan(&c_raw, &raw_ty))
+                    .flatten()
+                {
+                    // A custom `Iterator` (has `hasNext`/`next`) or `Iterable` (has
+                    // `iterator()`) → a `while (it.hasNext()) { v = it.next(); … }`
+                    // loop. The iterator local lives in its own block; when we
+                    // allocated it (`iterator()` returning a heap pointer) it is
+                    // registered owned so an early `return` frees it, and deleted
+                    // again on normal completion (mutually exclusive paths).
+                    let it = self.fresh("it");
+                    let it_spell = self.decl_spelling(&plan.iter_ty);
+                    let acc = if plan.iter_ty.is_ptr { "->" } else { "." };
+                    let elem_spell = self.decl_spelling(&plan.elem);
+                    let _ = writeln!(out, "{t}{{");
+                    // Outer scope: the iterator local, freed once *after* the loop.
+                    self.push_scope();
+                    let _ = writeln!(out, "{t}\t{it_spell} {it} = {};", plan.init);
+                    if plan.owns_iter {
+                        self.register_owned(&it);
+                    }
+                    let _ = writeln!(out, "{t}\twhile ({it}{acc}hasNext()) {{");
+                    // Inner scope: the loop variable and any heap locals the body
+                    // allocates, freed *inside* the loop on each iteration.
+                    self.push_scope();
+                    self.define_local(var, plan.elem.clone());
+                    let _ = writeln!(out, "{t}\t\t{elem_spell} {var} = {it}{acc}next();");
+                    self.gen_block_inner(body, ind + 2, out);
+                    self.emit_owned_deletes(out, ind + 2);
+                    self.pop_scope();
+                    let _ = writeln!(out, "{t}\t}}");
+                    // Free the iterator on normal loop exit (no-op unless owned). An
+                    // early `return` in the body already freed it via the
+                    // all-scopes delete, and never reaches here.
+                    self.emit_owned_deletes(out, ind + 1);
+                    self.pop_scope();
+                    let _ = writeln!(out, "{t}}}");
+                } else if value_var.is_some() && self.iter_plan(&c_raw, &raw_ty).is_some() {
+                    // The type implements the (value-only) Iterator/Iterable
+                    // protocol, but `key => value` needs the key-value protocol,
+                    // which Hatchet supports only for Map and Array (index keys).
                     self.err(format!(
-                        "cannot iterate `for ({var} in ...)` over `{}`: only ranges, Array, and Map are iterable (a custom Iterator/Iterable is unsupported)",
-                        if cty.base.is_empty() { "an unknown type" } else { &cty.base }
+                        "cannot iterate `for ({var} => {} in ...)` over `{}`: a custom Iterator/Iterable yields values only (key=>value iteration needs a Map or Array)",
+                        value_var.unwrap_or(""),
+                        cty.base
                     ));
+                } else {
+                    // Not a range, vector, map, or a type exposing the iterator
+                    // protocol — Hatchet would otherwise emit invalid `.size()`/`[]`
+                    // access. Fail loudly instead of guessing.
+                    self.not_iterable_error(var, &cty);
                 }
             }
         }
@@ -605,9 +781,17 @@ impl<'a> BodyGen<'a> {
                 )
             }
             Iterable::Coll(coll) => {
-                let (c, cty) = self.gen_expr(coll);
+                let (c_raw, raw_ty) = self.gen_expr(coll);
+                // Resolve through alias typedefs so the container/map/iterator checks
+                // see the real C++ head (see `gen_for`); access keeps the original
+                // pointer-ness.
+                let cty = self.deref_alias(&raw_ty);
                 // A nullable container is a pointer — dereference it to iterate.
-                let access = if cty.is_ptr { format!("(*{c})") } else { c };
+                let access = if raw_ty.is_ptr {
+                    format!("(*{c_raw})")
+                } else {
+                    c_raw.clone()
+                };
                 if rcode_is_map(&cty) {
                     // Map iteration via a std::map iterator. `for (k => v in m)`
                     // binds both; `for (v in m)` binds the value (Haxe iterates a
@@ -629,7 +813,31 @@ impl<'a> BodyGen<'a> {
                         let _ = writeln!(hdr, "{t}\t{vspell} {var} = {it}->second;");
                     }
                     (hdr, format!("{t}}}\n"))
-                } else {
+                } else if let Some(plan) = value_var
+                    .is_none()
+                    .then(|| self.iter_plan(&c_raw, &raw_ty))
+                    .flatten()
+                {
+                    // A custom `Iterator`/`Iterable` (see `gen_for`). A comprehension
+                    // body is a pure expression — no `break`/`return` — so the heap
+                    // iterator (if any) is freed by a literal `delete` baked into the
+                    // loop's close rather than the owned-scope machinery.
+                    let it = self.fresh("it");
+                    let it_spell = self.decl_spelling(&plan.iter_ty);
+                    let acc = if plan.iter_ty.is_ptr { "->" } else { "." };
+                    let espell = self.decl_spelling(&plan.elem);
+                    self.define_local(var, plan.elem.clone());
+                    let hdr = format!(
+                        "{t}{{\n{t}\t{it_spell} {it} = {init};\n{t}\twhile ({it}{acc}hasNext()) {{\n{t}\t\t{espell} {var} = {it}{acc}next();\n",
+                        init = plan.init
+                    );
+                    let close = if plan.owns_iter {
+                        format!("{t}\t}}\n{t}\tdelete {it};\n{t}}}\n")
+                    } else {
+                        format!("{t}\t}}\n{t}}}\n")
+                    };
+                    (hdr, close)
+                } else if is_container_ty(&cty) {
                     let idx = self.fresh("i");
                     let elem = self.element_ty(&cty);
                     let espell = self.decl_spelling(&elem);
@@ -648,6 +856,15 @@ impl<'a> BodyGen<'a> {
                         let _ = writeln!(hdr, "{t}\t{espell} {var} = {access}[{idx}];");
                     }
                     (hdr, format!("{t}}}\n"))
+                } else {
+                    // Neither a map, an Array, nor a detected Iterator/Iterable —
+                    // fail loudly rather than emit invalid `.size()`/`[]` access (the
+                    // same `for`-statement diagnostic, including the alias / base-class
+                    // hints). A `var` binding keeps the body codegen from tripping over
+                    // an unresolved loop variable while the run is already failing.
+                    self.define_local(var, Ty::default());
+                    self.not_iterable_error(var, &cty);
+                    (String::new(), String::new())
                 }
             }
         };
