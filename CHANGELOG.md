@@ -48,6 +48,15 @@ container: **iteration** and comprehensions, `new Tilesets()` (value-constructed
 owned heap pointer to `delete`), `.push`→`push_back`, `.length`→`.size()`, and `arr[i]` indexing.
 Previously these saw only the alias name and either failed to transpile (iteration) or emitted invalid C++.
 
+### Alias typedefs of containers resolve at use sites
+
+A container alias — `typedef Tileset = Array<Tile>; typedef Tilesets = Array<Tileset>;` — maps *as a name*
+to its emitted `typedef std::vector<…>`. Container operations now resolve through such aliases to the real
+`std::vector`/`std::map`/`std::string` head, so they work on aliased values exactly as on the underlying
+container: **iteration** and comprehensions, `new Tilesets()` (value-constructed, never treated as an
+owned heap pointer to `delete`), `.push`→`push_back`, `.length`→`.size()`, and `arr[i]` indexing.
+Previously these saw only the alias name and either failed to transpile (iteration) or emitted invalid C++.
+
 ### Header-only: module-level free functions
 
 `--header-only` now supports **module-level free functions** — both the plain `function name(...) {...}`
