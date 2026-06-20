@@ -19,8 +19,19 @@ the loop **owns and `delete`s it** — including on an early `return` out of the
 all-scopes delete) with no double-free on normal completion. The same lowering drives array/map
 comprehensions (`[for (x in e) …]`). A value that implements neither protocol (nor is a range/Array/Map)
 is still a hard error, as is `key => value` over a value-only custom iterator (that needs a `Map` or
-`Array`). Base-class iterator methods are not yet consulted (the protocol methods must be declared on the
-type itself).
+`Array`). The protocol methods must be declared on the iterated type **itself**: a custom iterator reached
+only through a typedef alias, or inherited from a base class, is deliberately not detected — but it now
+**fails loudly** with a message naming that cause, in both `for` statements and comprehensions (a
+comprehension over an undetected type previously emitted invalid `.size()`/`[]` access instead of erroring).
+
+### Alias typedefs of containers resolve at use sites
+
+A container alias — `typedef Tileset = Array<Tile>; typedef Tilesets = Array<Tileset>;` — maps *as a name*
+to its emitted `typedef std::vector<…>`. Container operations now resolve through such aliases to the real
+`std::vector`/`std::map`/`std::string` head, so they work on aliased values exactly as on the underlying
+container: **iteration** and comprehensions, `new Tilesets()` (value-constructed, never treated as an
+owned heap pointer to `delete`), `.push`→`push_back`, `.length`→`.size()`, and `arr[i]` indexing.
+Previously these saw only the alias name and either failed to transpile (iteration) or emitted invalid C++.
 
 ### Header-only: module-level free functions
 

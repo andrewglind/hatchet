@@ -833,9 +833,18 @@ impl<'a> Walk<'a> {
     /// Evaluate an expression in a *result* position, returning what it produces.
     /// Nested `new`s in argument positions are recorded as escaping (`Call`); if
     /// `bound` is set, a top-level `new` is recorded as bound to that local.
+    /// Alias-aware [`is_value_new`]: resolves typedefs when the program context is
+    /// available (it always is during body analysis), else falls back to syntactic.
+    fn is_value_new(&self, ty: &Type) -> bool {
+        match self.ctx {
+            Some((prog, mi)) => is_value_new_in(prog, mi, ty),
+            None => is_value_new(ty),
+        }
+    }
+
     fn value(&mut self, e: &Expr, bound: Option<&str>) -> Source {
         match e {
-            Expr::New(ty, args) if !is_value_new(ty) => {
+            Expr::New(ty, args) if !self.is_value_new(ty) => {
                 let id = self.fresh();
                 if let Some(b) = bound {
                     self.alloc_local.insert(id, b.to_string());
@@ -981,7 +990,8 @@ fn resolve(src: &Source, pt: &BTreeMap<String, BTreeSet<AllocId>>) -> BTreeSet<A
 }
 
 /// A `new Array<T>()` / `new Map<K,V>()` / `new String(x)` lowers to a value
-/// container or string — not a heap pointer the analysis tracks.
+/// container or string — not a heap pointer the analysis tracks. The check is
+/// syntactic; [`is_value_new_in`] resolves alias typedefs first.
 fn is_value_new(ty: &Type) -> bool {
     matches!(
         ty,
@@ -991,6 +1001,13 @@ fn is_value_new(ty: &Type) -> bool {
                 Some("Array") | Some("Map") | Some("String")
             )
     )
+}
+
+/// As [`is_value_new`], but first resolving alias typedefs (`typedef Tilesets =
+/// Array<…>`) so `new Tilesets()` is recognised as a value container — not a heap
+/// pointer the ownership analysis would try to `delete`.
+fn is_value_new_in(prog: &Program, mi: usize, ty: &Type) -> bool {
+    is_value_new(&prog.resolve_alias_type(ty, mi))
 }
 
 // ---- container escape: which push receivers a `new` comes to rest in ------------

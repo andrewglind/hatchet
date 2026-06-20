@@ -515,6 +515,75 @@ impl<'a> BodyGen<'a> {
         None
     }
 
+    /// Whether `ty`'s class/interface *directly* declares the Iterator protocol
+    /// (`hasNext`+`next`) or the Iterable protocol (`iterator`).
+    fn has_iter_protocol(&self, ty: &Ty) -> bool {
+        (self.has_method(ty, "hasNext") && self.has_method(ty, "next"))
+            || self.has_method(ty, "iterator")
+    }
+
+    /// Whether a *base class* of `ty` declares the iteration protocol. Hatchet does
+    /// not consult inherited methods for iteration, so this only sharpens the error
+    /// message — it never makes such a type iterable.
+    fn base_has_iter_protocol(&self, ty: &Ty) -> bool {
+        let mut info = match &ty.info {
+            Some(i) => i.clone(),
+            None => return false,
+        };
+        for _ in 0..16 {
+            let extends = match self.prog.type_decl(&info) {
+                Some(Decl::Class(c)) => c.extends.clone(),
+                _ => return false,
+            };
+            let Some(Type::Named { path, .. }) = extends else {
+                return false;
+            };
+            let Some(binfo) = self.prog.resolve_type(&path, info.module_index).cloned() else {
+                return false;
+            };
+            let bty = Ty {
+                info: Some(binfo.clone()),
+                ..Default::default()
+            };
+            if self.has_iter_protocol(&bty) {
+                return true;
+            }
+            info = binfo;
+        }
+        false
+    }
+
+    /// Raise the hard error for a `for (var in ...)` over a non-iterable `cty`,
+    /// distinguishing the cases Hatchet deliberately does *not* detect — a custom
+    /// Iterator/Iterable reached only through a typedef alias, or inherited from a
+    /// base class — from a genuinely non-iterable type. `cty` is alias-resolved.
+    fn not_iterable_error(&mut self, var: &str, cty: &Ty) {
+        let base = if cty.base.is_empty() {
+            "an unknown type"
+        } else {
+            &cty.base
+        };
+        let detail = if self.has_iter_protocol(cty) {
+            // The resolved type has the protocol, yet we reached the error — so the
+            // iterated value named it through a typedef alias, which is not detected.
+            "it implements the Iterator/Iterable protocol only through a typedef alias; \
+             iterate the alias's underlying type directly (the protocol methods must be \
+             on the iterated type itself)"
+                .to_string()
+        } else if self.base_has_iter_protocol(cty) {
+            "it inherits the Iterator/Iterable protocol from a base class, which Hatchet \
+             does not consult; declare `hasNext`/`next` (or `iterator()`) on the type itself"
+                .to_string()
+        } else {
+            "only ranges, Array, Map, and types implementing the Iterator/Iterable protocol \
+             (`hasNext`/`next`, or `iterator()`) are iterable"
+                .to_string()
+        };
+        self.err(format!(
+            "cannot iterate `for ({var} in ...)` over `{base}`: {detail}"
+        ));
+    }
+
     pub(super) fn gen_for(
         &mut self,
         var: &str,
@@ -556,10 +625,14 @@ impl<'a> BodyGen<'a> {
                 let _ = writeln!(out, "{t}}}");
             }
             Iterable::Coll(coll) => {
-                let (c_raw, cty) = self.gen_expr(coll);
+                let (c_raw, raw_ty) = self.gen_expr(coll);
                 self.flush(out);
+                // Resolve through alias typedefs (`typedef Tilesets = Array<…>`) so
+                // the container/map/iterator checks see the real C++ head, not the
+                // alias name; access still uses the original pointer-ness.
+                let cty = self.deref_alias(&raw_ty);
                 // A nullable container is a pointer — dereference it to iterate.
-                let access = if cty.is_ptr {
+                let access = if raw_ty.is_ptr {
                     format!("(*{c_raw})")
                 } else {
                     c_raw.clone()
@@ -618,7 +691,7 @@ impl<'a> BodyGen<'a> {
                     let _ = writeln!(out, "{t}}}");
                 } else if let Some(plan) = value_var
                     .is_none()
-                    .then(|| self.iter_plan(&c_raw, &cty))
+                    .then(|| self.iter_plan(&c_raw, &raw_ty))
                     .flatten()
                 {
                     // A custom `Iterator` (has `hasNext`/`next`) or `Iterable` (has
@@ -654,7 +727,7 @@ impl<'a> BodyGen<'a> {
                     self.emit_owned_deletes(out, ind + 1);
                     self.pop_scope();
                     let _ = writeln!(out, "{t}}}");
-                } else if value_var.is_some() && self.iter_plan(&c_raw, &cty).is_some() {
+                } else if value_var.is_some() && self.iter_plan(&c_raw, &raw_ty).is_some() {
                     // The type implements the (value-only) Iterator/Iterable
                     // protocol, but `key => value` needs the key-value protocol,
                     // which Hatchet supports only for Map and Array (index keys).
@@ -667,10 +740,7 @@ impl<'a> BodyGen<'a> {
                     // Not a range, vector, map, or a type exposing the iterator
                     // protocol — Hatchet would otherwise emit invalid `.size()`/`[]`
                     // access. Fail loudly instead of guessing.
-                    self.err(format!(
-                        "cannot iterate `for ({var} in ...)` over `{}`: only ranges, Array, Map, and types implementing the Iterator/Iterable protocol (`hasNext`/`next`, or `iterator()`) are iterable",
-                        if cty.base.is_empty() { "an unknown type" } else { &cty.base }
-                    ));
+                    self.not_iterable_error(var, &cty);
                 }
             }
         }
@@ -711,9 +781,13 @@ impl<'a> BodyGen<'a> {
                 )
             }
             Iterable::Coll(coll) => {
-                let (c_raw, cty) = self.gen_expr(coll);
+                let (c_raw, raw_ty) = self.gen_expr(coll);
+                // Resolve through alias typedefs so the container/map/iterator checks
+                // see the real C++ head (see `gen_for`); access keeps the original
+                // pointer-ness.
+                let cty = self.deref_alias(&raw_ty);
                 // A nullable container is a pointer — dereference it to iterate.
-                let access = if cty.is_ptr {
+                let access = if raw_ty.is_ptr {
                     format!("(*{c_raw})")
                 } else {
                     c_raw.clone()
@@ -741,7 +815,7 @@ impl<'a> BodyGen<'a> {
                     (hdr, format!("{t}}}\n"))
                 } else if let Some(plan) = value_var
                     .is_none()
-                    .then(|| self.iter_plan(&c_raw, &cty))
+                    .then(|| self.iter_plan(&c_raw, &raw_ty))
                     .flatten()
                 {
                     // A custom `Iterator`/`Iterable` (see `gen_for`). A comprehension
@@ -763,7 +837,7 @@ impl<'a> BodyGen<'a> {
                         format!("{t}\t}}\n{t}}}\n")
                     };
                     (hdr, close)
-                } else {
+                } else if is_container_ty(&cty) {
                     let idx = self.fresh("i");
                     let elem = self.element_ty(&cty);
                     let espell = self.decl_spelling(&elem);
@@ -782,6 +856,15 @@ impl<'a> BodyGen<'a> {
                         let _ = writeln!(hdr, "{t}\t{espell} {var} = {access}[{idx}];");
                     }
                     (hdr, format!("{t}}}\n"))
+                } else {
+                    // Neither a map, an Array, nor a detected Iterator/Iterable —
+                    // fail loudly rather than emit invalid `.size()`/`[]` access (the
+                    // same `for`-statement diagnostic, including the alias / base-class
+                    // hints). A `var` binding keeps the body codegen from tripping over
+                    // an unresolved loop variable while the run is already failing.
+                    self.define_local(var, Ty::default());
+                    self.not_iterable_error(var, &cty);
+                    (String::new(), String::new())
                 }
             }
         };

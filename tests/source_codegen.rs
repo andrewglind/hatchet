@@ -2026,6 +2026,70 @@ class C {
 }
 
 #[test]
+fn iterator_only_via_alias_or_base_class_fails_loudly() {
+    // The custom-iterator detection needs the protocol methods on the iterated type
+    // itself. Reaching them only through a typedef alias, or by inheriting them from
+    // a base class, is NOT detected — and must be a hard error (with a specific
+    // message), in both a `for` statement and a comprehension, never silent wrong
+    // code (a comprehension previously assumed `.size()`/`[]` for any unknown type).
+    let src = "\
+class It {
+  var n:Int;
+  public function new(s:Int) { this.n = s; }
+  public function hasNext():Bool { return this.n > 0; }
+  public function next():Int { var v = this.n; this.n -= 1; return v; }
+}
+typedef Alias = It;
+class Sub extends It {
+  public function new(s:Int) { super(s); }
+}
+class C {
+  public function new() {}
+  public function viaAliasFor():Void {
+    var a:Alias = new It(3);
+    for (x in a) {}
+  }
+  public function viaAliasCompr():Array<Int> {
+    var a:Alias = new It(3);
+    return [for (x in a) x];
+  }
+  public function viaBase():Void {
+    var s = new Sub(3);
+    for (x in s) {}
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_iter_indirect_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("C.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("C"))
+        .unwrap();
+    let (_, _, errors) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Two alias errors (the `for` and the comprehension) naming the typedef cause.
+    let alias_errs = errors
+        .iter()
+        .filter(|(_, e)| e.contains("cannot iterate") && e.contains("typedef alias"))
+        .count();
+    assert!(
+        alias_errs >= 2,
+        "expected loud alias errors for both the for-loop and the comprehension, got: {errors:?}"
+    );
+    // The base-class case is also rejected, with its own hint.
+    assert!(
+        errors
+            .iter()
+            .any(|(_, e)| e.contains("cannot iterate") && e.contains("base class")),
+        "expected a loud base-class iterator error, got: {errors:?}"
+    );
+}
+
+#[test]
 fn array_key_value_iteration_binds_the_index() {
     // `for (index => value in array)` is valid Haxe — the key is the Int index.
     // Exercised in both statement and comprehension position.
