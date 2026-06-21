@@ -398,6 +398,20 @@ struct IterAlias {
     value_ty: Ty,
 }
 
+/// An access of an `@orderedMap` field, resolved to its two parallel-vector
+/// accessors and key/value types — the basis for lowering every operation on it
+/// (`get`/`set`/`exists`/`remove`/`keys`, and iteration) without a `std::map`.
+struct OrderedMapRef {
+    /// C++ accessor for the keys vector, e.g. `this->object_keys`.
+    keys: String,
+    /// C++ accessor for the values vector, e.g. `this->object_vals`.
+    vals: String,
+    /// Key type `K` (the element type of the keys vector).
+    key_ty: Ty,
+    /// Value type `V` (the element type of the values vector).
+    val_ty: Ty,
+}
+
 struct BodyGen<'a> {
     prog: &'a Program,
     mi: usize,
@@ -455,6 +469,15 @@ struct BodyGen<'a> {
     /// flagged with a lint warning (ahead of the C++ const error). A local
     /// shadowing the name drops it from the set.
     container_params: std::collections::HashSet<String>,
+    /// Optional `String` parameters (`?s:String`), which default to `""`. For these
+    /// — and *only* these — an omitted argument genuinely reads as empty, so a
+    /// `s == null` "was it passed?" check lowers to `s.empty()`. A `== null` on any
+    /// other value `String` is a category error (a value string is never null).
+    optional_string_params: std::collections::HashSet<String>,
+    /// While generating the operands of a `== null` / `!= null` comparison: suppress
+    /// the value-deref of a `Null<String>` read, so the comparison sees the raw
+    /// pointer (`p != NULL`) instead of the dereferenced value.
+    no_nullable_deref: bool,
     /// Loop nesting depth at the statement currently being generated. Drives the
     /// `break`-in-`switch` lowering (Haxe `switch` has no break semantics — a
     /// `break` in a case body exits the enclosing *loop*).
@@ -548,6 +571,8 @@ impl<'a> BodyGen<'a> {
             escaping: std::collections::HashSet::new(),
             new_args_escape: false,
             container_params: std::collections::HashSet::new(),
+            optional_string_params: std::collections::HashSet::new(),
+            no_nullable_deref: false,
             loop_depth: 0,
             switch_break_flag: None,
             owned_fields,

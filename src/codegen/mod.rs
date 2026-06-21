@@ -1160,6 +1160,17 @@ impl<'a> HeaderGen<'a> {
             {
                 continue;
             }
+            // `@orderedMap var m:Map<K,V>` is stored as two insertion-ordered
+            // parallel vectors (`m_keys`/`m_vals`) — a VC6-safe ordered map that
+            // sidesteps `std::map` (key-sorted, and fragile on VC6).
+            if let Some((keys, vals)) = self.ordered_map_vector_decls(f) {
+                let block = match f.access {
+                    Access::Public => &mut public,
+                    _ => &mut protected,
+                };
+                let _ = writeln!(block, "{t}\t{keys};\n{t}\t{vals};");
+                continue;
+            }
             let line = format!("{t}\t{} {};\n", self.field_type(c, f, &nullable), f.name);
             let hidden_backing =
                 has_accessor(f) && (f.set != PropAccess::Default || f.get == PropAccess::Get);
@@ -1413,6 +1424,21 @@ impl<'a> HeaderGen<'a> {
     }
 
     /// The C++ type for a class field, applying the nullable-struct→pointer rule.
+    /// The two `std::vector` member declarations (without trailing `;`) for an
+    /// `@orderedMap` Map field — `std::vector<K> m_keys`, `std::vector<V> m_vals` —
+    /// or `None` when `f` is not an `@orderedMap` Map field.
+    fn ordered_map_vector_decls(&self, f: &Field) -> Option<(String, String)> {
+        let (kty, vty) = ordered_map_kv(f)?;
+        let k = self.prog.map_type_use(kty, self.mi, &self.ns);
+        let v = self.prog.map_type_use(vty, self.mi, &self.ns);
+        let kpad = if k.ends_with('>') { " " } else { "" };
+        let vpad = if v.ends_with('>') { " " } else { "" };
+        Some((
+            format!("std::vector<{k}{kpad}> {}_keys", f.name),
+            format!("std::vector<{v}{vpad}> {}_vals", f.name),
+        ))
+    }
+
     fn field_type(&self, _c: &Class, f: &Field, nullable: &BTreeSet<String>) -> String {
         let ty = match &f.ty {
             Some(t) => t,
@@ -1872,6 +1898,21 @@ pub(crate) fn accessor_ret_type(c: &Class, method: &str) -> Option<Type> {
 
 fn tabs(n: usize) -> String {
     "\t".repeat(n)
+}
+
+/// The key and value AST types of an `@orderedMap` field — `Map<K,V>` → `(K, V)` —
+/// or `None` when the field is not tagged `@orderedMap` or is not a `Map<K,V>`.
+/// `@orderedMap` stores a `Map` as two insertion-ordered parallel vectors.
+pub(crate) fn ordered_map_kv(f: &Field) -> Option<(&Type, &Type)> {
+    if !has_meta(&f.meta, "orderedMap") {
+        return None;
+    }
+    if let Some(Type::Named { path, params, .. }) = &f.ty {
+        if path.last().map(|s| s.as_str()) == Some("Map") && params.len() == 2 {
+            return Some((&params[0], &params[1]));
+        }
+    }
+    None
 }
 
 fn cap(s: &str) -> String {

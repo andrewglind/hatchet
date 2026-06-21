@@ -315,6 +315,88 @@ impl<'a> BodyGen<'a> {
         }
     }
 
+    /// Lower a `Map` operation on an `@orderedMap` field to scans over its parallel
+    /// key/value vectors (no `std::map`): linear find for `get`/`exists`, find-or-
+    /// append for `set`, paired erase for `remove`, the keys vector for `keys`.
+    /// Insertion order is preserved because both vectors only ever grow at the end.
+    /// Returns `None` for an unrecognised method (the caller then fails loudly).
+    pub(super) fn ordered_map_call(
+        &mut self,
+        om: &OrderedMapRef,
+        method: &str,
+        args: &[Expr],
+    ) -> Option<(String, Ty)> {
+        let t = "\t".repeat(self.prelude_ind);
+        let keys = om.keys.clone();
+        let vals = om.vals.clone();
+        match method {
+            // get(k) → the matching value, else a default (`NULL` / `V()`).
+            "get" => {
+                let k = self.gen_expr(&args[0]).0;
+                let i = self.fresh("i");
+                let out = self.fresh("get");
+                let vspell = self.decl_spelling(&om.val_ty);
+                let dflt = if om.val_ty.is_ptr {
+                    "NULL".to_string()
+                } else {
+                    format!("{}()", om.val_ty.base)
+                };
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}{vspell} {out} = {dflt};");
+                let _ = writeln!(pre, "{t}for (size_t {i} = 0; {i} < {keys}.size(); ++{i}) {{ if ({keys}[{i}] == {k}) {{ {out} = {vals}[{i}]; break; }} }}");
+                self.prelude.push_str(&pre);
+                Some((out, om.val_ty.clone()))
+            }
+            "exists" => {
+                let k = self.gen_expr(&args[0]).0;
+                let i = self.fresh("i");
+                let has = self.fresh("has");
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}bool {has} = false;");
+                let _ = writeln!(pre, "{t}for (size_t {i} = 0; {i} < {keys}.size(); ++{i}) {{ if ({keys}[{i}] == {k}) {{ {has} = true; break; }} }}");
+                self.prelude.push_str(&pre);
+                Some((has, bool_ty()))
+            }
+            // set(k, v) → replace in place if the key is present, else append. Void.
+            "set" => {
+                let k = self.gen_expr(&args[0]).0;
+                let v = self.gen_expr(&args[1]).0;
+                let i = self.fresh("i");
+                let found = self.fresh("found");
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}bool {found} = false;");
+                let _ = writeln!(pre, "{t}for (size_t {i} = 0; {i} < {keys}.size(); ++{i}) {{ if ({keys}[{i}] == {k}) {{ {vals}[{i}] = {v}; {found} = true; break; }} }}");
+                let _ = writeln!(pre, "{t}if (!{found}) {{ {keys}.push_back({k}); {vals}.push_back({v}); }}");
+                self.prelude.push_str(&pre);
+                Some((String::new(), Ty::default()))
+            }
+            // remove(k) → erase from both vectors; Haxe returns Bool (was it present?).
+            "remove" => {
+                let k = self.gen_expr(&args[0]).0;
+                let i = self.fresh("i");
+                let rem = self.fresh("rem");
+                let mut pre = String::new();
+                let _ = writeln!(pre, "{t}bool {rem} = false;");
+                let _ = writeln!(pre, "{t}for (size_t {i} = 0; {i} < {keys}.size(); ++{i}) {{ if ({keys}[{i}] == {k}) {{ {keys}.erase({keys}.begin() + {i}); {vals}.erase({vals}.begin() + {i}); {rem} = true; break; }} }}");
+                self.prelude.push_str(&pre);
+                Some((rem, bool_ty()))
+            }
+            // keys() → the keys vector itself (iterable via the ordinary collection
+            // `for`); it preserves insertion order.
+            "keys" => {
+                let kspell = self.decl_spelling(&om.key_ty);
+                Some((
+                    keys,
+                    Ty {
+                        base: format!("std::vector<{kspell} >"),
+                        ..Default::default()
+                    },
+                ))
+            }
+            _ => None,
+        }
+    }
+
     /// Tier-1 Haxe `String` methods on a `std::string` receiver, each mapped to a
     /// single C++98 expression. Byte/ASCII semantics (VC6 narrow `char`); an
     /// out-of-range index makes `charAt`/`charCodeAt` *throw* via `.at()`/`substr`

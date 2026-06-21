@@ -499,6 +499,7 @@ impl<'a> BodyGen<'a> {
 
     pub(super) fn bind_params(&mut self, params: &[Param]) {
         self.container_params.clear();
+        self.optional_string_params.clear();
         for p in params {
             let ty = match &p.ty {
                 Some(t) => {
@@ -528,10 +529,14 @@ impl<'a> BodyGen<'a> {
                     p.name
                 ));
             }
+            let is_optional_string = p.optional && !ty.is_ptr && ty.base == "std::string";
             self.define_local(&p.name, ty);
             // after define_local, which clears any earlier shadow bookkeeping
             if is_container {
                 self.container_params.insert(p.name.clone());
+            }
+            if is_optional_string {
+                self.optional_string_params.insert(p.name.clone());
             }
         }
     }

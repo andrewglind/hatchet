@@ -4,6 +4,7 @@
 //! intrinsics, and the sugar lowerings.
 
 use hatchet::codegen::{generate_source, generate_source_diagnostics};
+use hatchet::sema::validate::unsupported_construct_errors;
 use hatchet::sema::Program;
 
 /// Transpile a single synthetic `.hx` source and return class `stem`'s generated `.cpp`.
@@ -1488,17 +1489,16 @@ class Grid {
 }
 
 #[test]
-fn string_null_check_lowers_to_empty() {
-    // A Haxe `String` is a value-typed `std::string` with no null, so a null
-    // comparison cannot stay `s == NULL`. Optional `String` params default to `""`,
-    // so "null" ≡ empty: `s == null` → `s.empty()`, `s != null` → `!s.empty()`.
+fn optional_string_param_null_check_lowers_to_empty() {
+    // An *optional* `?s:String` param defaults to `""`, so a "was it passed?" check
+    // genuinely reads as empty: `s == null` → `s.empty()`, `s != null` → `!s.empty()`.
+    // (A non-optional value `String` compared to null is a hard error instead — see
+    // `string_vs_null_is_an_error` — since a value string is never null.)
     let src = "\
 class S {
   public function new() {}
   public function run(?palette:String):Void {
     if (palette == null) { palette = \"default\"; }
-    var s:String = \"x\";
-    if (s != null) { s = \"y\"; }
   }
 }
 ";
@@ -1516,15 +1516,43 @@ class S {
 
     assert!(
         out.contains("if (palette.empty()) {"),
-        "`== null` → `.empty()`:\n{out}"
-    );
-    assert!(
-        out.contains("if (!s.empty()) {"),
-        "`!= null` → `!...empty()`:\n{out}"
+        "`== null` on an optional String param → `.empty()`:\n{out}"
     );
     assert!(
         !out.contains("== NULL") && !out.contains("!= NULL"),
         "no NULL comparison on a string:\n{out}"
+    );
+}
+
+#[test]
+fn string_vs_null_is_an_error() {
+    // A non-optional value `String` is never null, so comparing it to `null` is a
+    // category error — Hatchet must reject it (steering to `!= ""` or `Null<String>`)
+    // rather than silently guess `!s.empty()`.
+    let src = "\
+class S {
+  var name:String;
+  public function new() { this.name = \"\"; }
+  public function run():Bool { return this.name != null; }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_strnullerr_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("S.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("S"))
+        .unwrap();
+    let (_, _, errors) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        errors
+            .iter()
+            .any(|(_, e)| e.contains("never null") && e.contains("Null<String>")),
+        "expected a String-vs-null error, got: {errors:?}"
     );
 }
 
@@ -2086,6 +2114,99 @@ class C {
             .iter()
             .any(|(_, e)| e.contains("cannot iterate") && e.contains("base class")),
         "expected a loud base-class iterator error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn ordered_map_whole_value_use_is_an_error() {
+    // An @orderedMap field has no single map object — using it as a whole value
+    // (returning it, here) must be a hard error, not silently emit `this->object`.
+    let src = "\
+class B {
+  @orderedMap public var object:Map<String, Int>;
+  public function new() {}
+  public function leak():Map<String, Int> { return this.object; }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_omwhole_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("B.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("B"))
+        .unwrap();
+    let (_, _, errors) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        errors
+            .iter()
+            .any(|(_, e)| e.contains("@orderedMap") && e.contains("whole value")),
+        "expected a whole-map-use error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn ordered_map_emits_parallel_vectors_and_set_lowering() {
+    // `@orderedMap var m:Map<K,V>` → two vectors; `set` is a find-or-append scan.
+    let src = "\
+class B {
+  @orderedMap public var m:Map<String, Int>;
+  public function new() { this.m = new Map(); }
+  public function put(k:String, v:Int):Void { this.m.set(k, v); }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_omcg_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("B.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("B"))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        out.contains("m_keys") && out.contains("m_vals") && !out.contains("std::map<"),
+        "expected parallel vectors, no std::map:\n{out}"
+    );
+    assert!(
+        out.contains("m_keys.push_back") && out.contains("m_vals.push_back"),
+        "expected a find-or-append set lowering:\n{out}"
+    );
+}
+
+#[test]
+fn anonymous_struct_container_element_is_an_error() {
+    // `Array<{anon struct}>` would lower to a useless `std::vector<void*>`; it must
+    // be rejected (a named typedef is the supported form), not silently miscompiled.
+    let src = "\
+class B {
+  public var pairs:Array<{ key:String, val:Int }>;
+  public function new() { this.pairs = []; }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_anonc_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("B.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("B"))
+        .unwrap();
+    let errs = unsupported_construct_errors(&prog, idx);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        errs.iter()
+            .any(|d| d.message.contains("anonymous struct as a container element")),
+        "expected an anonymous-struct-element error, got: {:?}",
+        errs.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
 

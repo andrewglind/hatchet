@@ -198,9 +198,11 @@ impl<'a> BodyGen<'a> {
                     let spelling = self.decl_spelling(&ety);
                     let _ = writeln!(out, "{t}{spelling} {tmp} = {code};");
                     self.register_owned(&tmp);
-                } else {
+                } else if !code.trim().is_empty() {
                     let _ = writeln!(out, "{t}{code};");
                 }
+                // else: a void op fully expressed through its hoisted prelude (e.g.
+                // an `@orderedMap` `set`) — the flushed prelude *is* the statement.
             }
             Stmt::Return(None, _) => {
                 // Free this scope's (and any enclosing scope's) owned heap locals
@@ -254,7 +256,8 @@ impl<'a> BodyGen<'a> {
                     self.expected = saved;
                     self.flush(out);
                     // A nullable (`Null<T>`) function returns a pointer; a value
-                    // result is heap-allocated to match.
+                    // result is heap-allocated to match. (A `Null<String>` read in
+                    // value position is already dereferenced at the read site.)
                     let r = if self.current_ret.is_ptr && !cty.is_ptr {
                         format!("new {}({c})", self.current_ret.base)
                     } else {
@@ -625,6 +628,36 @@ impl<'a> BodyGen<'a> {
                 let _ = writeln!(out, "{t}}}");
             }
             Iterable::Coll(coll) => {
+                // `@orderedMap` field: iterate the parallel key/value vectors. The
+                // field carries no `std::map` value, so this must precede any
+                // `gen_expr(coll)` (which would reject the whole-map use).
+                if let Some(om) = self.ordered_map_ref(coll) {
+                    self.flush(out);
+                    let idx = self.fresh("i");
+                    let vspell = self.decl_spelling(&om.val_ty);
+                    let _ = writeln!(
+                        out,
+                        "{t}for (size_t {idx} = 0; {idx} < {}.size(); ++{idx}) {{",
+                        om.keys
+                    );
+                    if let Some(vv) = value_var {
+                        // `for (k => v in m)` binds key and value.
+                        let kspell = self.decl_spelling(&om.key_ty);
+                        self.define_local(var, om.key_ty.clone());
+                        self.define_local(vv, om.val_ty.clone());
+                        let _ = writeln!(out, "{t}\t{kspell} {var} = {}[{idx}];", om.keys);
+                        let _ = writeln!(out, "{t}\t{vspell} {vv} = {}[{idx}];", om.vals);
+                    } else {
+                        // `for (v in m)` binds the value (Haxe iterates a map's values).
+                        self.define_local(var, om.val_ty.clone());
+                        let _ = writeln!(out, "{t}\t{vspell} {var} = {}[{idx}];", om.vals);
+                    }
+                    self.gen_block_inner(body, ind + 1, out);
+                    self.emit_owned_deletes(out, ind + 1);
+                    let _ = writeln!(out, "{t}}}");
+                    self.pop_scope();
+                    return;
+                }
                 let (c_raw, raw_ty) = self.gen_expr(coll);
                 self.flush(out);
                 // Resolve through alias typedefs (`typedef Tilesets = Array<…>`) so
@@ -780,7 +813,31 @@ impl<'a> BodyGen<'a> {
                     format!("{t}}}\n"),
                 )
             }
-            Iterable::Coll(coll) => {
+            Iterable::Coll(coll) => 'coll: {
+                // `@orderedMap` field: a paired index loop over the parallel key/value
+                // vectors, before any `gen_expr(coll)` (which rejects whole-map use).
+                if let Some(om) = self.ordered_map_ref(coll) {
+                    let idx = self.fresh("i");
+                    let vspell = self.decl_spelling(&om.val_ty);
+                    let mut hdr = format!(
+                        "{t}for (size_t {idx} = 0; {idx} < {}.size(); ++{idx}) {{\n",
+                        om.keys
+                    );
+                    if let Some(vv) = value_var {
+                        let kspell = self.decl_spelling(&om.key_ty);
+                        self.define_local(var, om.key_ty.clone());
+                        self.define_local(vv, om.val_ty.clone());
+                        let _ = write!(
+                            hdr,
+                            "{t}\t{kspell} {var} = {}[{idx}];\n{t}\t{vspell} {vv} = {}[{idx}];\n",
+                            om.keys, om.vals
+                        );
+                    } else {
+                        self.define_local(var, om.val_ty.clone());
+                        let _ = writeln!(hdr, "{t}\t{vspell} {var} = {}[{idx}];", om.vals);
+                    }
+                    break 'coll (hdr, format!("{t}}}\n"));
+                }
                 let (c_raw, raw_ty) = self.gen_expr(coll);
                 // Resolve through alias typedefs so the container/map/iterator checks
                 // see the real C++ head (see `gen_for`); access keeps the original
