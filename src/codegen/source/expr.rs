@@ -73,7 +73,14 @@ impl<'a> BodyGen<'a> {
                 }
             }
         }
-        self.gen_expr(target)
+        // An lvalue is the storage location, never a value read — so a `Null<String>`
+        // target stays the raw pointer (the assignment writes the pointer), not the
+        // dereferenced value.
+        let saved = self.no_nullable_deref;
+        self.no_nullable_deref = true;
+        let res = self.gen_expr(target);
+        self.no_nullable_deref = saved;
+        res
     }
 
     /// Resolve a mutation target (`x += v`, `x++`, …) that must route through a
@@ -125,6 +132,12 @@ impl<'a> BodyGen<'a> {
             value,
         } = e
         {
+            // (Re)initialising an `@orderedMap` field — `m = new Map()` / `[]` clears
+            // both vectors; a map literal clears then appends each pair in order.
+            // Any other whole-map assignment is rejected (no single map value exists).
+            if let Some(om) = self.ordered_map_ref(target) {
+                return self.gen_ordered_map_assign(&om, value);
+            }
             // `arr[i] = v` into an Array (→ std::vector): Haxe auto-extends the
             // array on an out-of-range write, so emit a grow-guard first (C++
             // `operator[]` past the end is undefined behaviour). Maps and other
@@ -191,7 +204,21 @@ impl<'a> BodyGen<'a> {
                     "'{tcode}' is assigned a Null<T> value but is not a `Null<T>`; nullable values should be held in a `Null<T>`"
                 ));
             }
-            return (format!("{tcode} = {vcode}"), tty);
+            // Assigning a value into a `Null<T>` (a heap pointer for a value `T`) heap-
+            // wraps it: `p = new T(v)`. `= null` stays `p = NULL`, and assigning an
+            // existing pointer (another `Null<T>`) copies the pointer. The previous
+            // value, if any, was freed by the delete-before-overwrite in the statement
+            // path (a `Null<T>` field is owned).
+            let rhs = if tty.is_ptr
+                && tty.nullable
+                && !vty.is_ptr
+                && !matches!(value.as_ref(), Expr::Null)
+            {
+                format!("new {}({vcode})", tty.base)
+            } else {
+                vcode
+            };
+            return (format!("{tcode} = {rhs}"), tty);
         }
         self.gen_expr(e)
     }
@@ -441,26 +468,48 @@ impl<'a> BodyGen<'a> {
                 if let Some(res) = self.try_iter_null_check(*op, lhs, rhs) {
                     return res;
                 }
+                // In a `== null` / `!= null` comparison, read a `Null<String>` operand
+                // as its raw pointer (so the check is `p != NULL`), not the value.
+                let null_cmp = matches!(*op, BinOp::Eq | BinOp::Ne)
+                    && (matches!(lhs.as_ref(), Expr::Null) || matches!(rhs.as_ref(), Expr::Null));
+                let saved_deref = self.no_nullable_deref;
+                self.no_nullable_deref = null_cmp;
                 let (l, lty) = self.gen_expr(lhs);
                 let (r, rty) = self.gen_expr(rhs);
-                // A Haxe `String` lowers to `std::string`, a value type with no
-                // null, so a null comparison cannot stay `s == NULL`. Optional
-                // `String` params default to `""`, so "null" ≡ empty: lower
-                // `s == null` → `s.empty()` and `s != null` → `!s.empty()`.
+                self.no_nullable_deref = saved_deref;
+                // A Haxe `String` lowers to a value `std::string`, which has no null
+                // state. A `Null<String>` (a pointer) compares against `NULL` as
+                // usual and falls through here. A *value* `String` compared to `null`
+                // has two faithful readings, kept distinct rather than guessed:
+                //   * an optional `?s:String` param defaults to `""`, so a "was it
+                //     passed?" check genuinely reads as `s.empty()`; and
+                //   * any other value `String` is never null — the comparison is a
+                //     category error, so fail loudly and steer to the real intent.
                 if matches!(*op, BinOp::Eq | BinOp::Ne) {
                     let l_null = matches!(lhs.as_ref(), Expr::Null);
                     let r_null = matches!(rhs.as_ref(), Expr::Null);
                     if l_null ^ r_null {
-                        let (s, sty) = if l_null { (&r, &rty) } else { (&l, &lty) };
+                        let (s, sexpr, sty) = if l_null {
+                            (&r, rhs.as_ref(), &rty)
+                        } else {
+                            (&l, lhs.as_ref(), &lty)
+                        };
                         if sty.base == "std::string" && !sty.is_ptr {
-                            let neg = if matches!(*op, BinOp::Ne) { "!" } else { "" };
-                            return (
-                                format!("{neg}{s}.empty()"),
-                                Ty {
-                                    base: "bool".into(),
-                                    ..Default::default()
-                                },
+                            let is_opt = matches!(sexpr, Expr::Ident(n)
+                                if self.optional_string_params.contains(n));
+                            if is_opt {
+                                let neg = if matches!(*op, BinOp::Ne) { "!" } else { "" };
+                                return (format!("{neg}{s}.empty()"), bool_ty());
+                            }
+                            self.err(
+                                "a `String` compared to `null` is never null in Hatchet (it is a \
+                                 value `std::string`, not a nullable reference). Use `!= \"\"` / \
+                                 `== \"\"` to test for the empty string, or declare it \
+                                 `Null<String>` for a genuinely nullable string (an optional \
+                                 `?s:String` may instead take a default, e.g. `?s:String = \"…\"`)"
+                                    .to_string(),
                             );
+                            return (format!("{l} {} {r}", binop(*op)), bool_ty());
                         }
                     }
                 }
@@ -719,7 +768,8 @@ impl<'a> BodyGen<'a> {
             if let Some(alias) = &ty.iter {
                 return (format!("{}->second", alias.it_name), alias.value_ty.clone());
             }
-            return (self.cpp_name(name), ty);
+            let code = self.cpp_name(name);
+            return self.read_nullable_string(code, ty);
         }
         // implicit `this` field?
         if let Some(f) = self.class_field(name) {
@@ -730,7 +780,7 @@ impl<'a> BodyGen<'a> {
             if f.get == PropAccess::Get && self.current_fn != format!("get_{name}") {
                 return (format!("this->get_{name}()"), ty);
             }
-            return (format!("this->{name}"), ty);
+            return self.read_nullable_string(format!("this->{name}"), ty);
         }
         // a type name (for static / enum access)?
         if let Some(info) = self
@@ -776,6 +826,99 @@ impl<'a> BodyGen<'a> {
         }
         // free function / global / unknown — pass through
         (name.to_string(), Ty::default())
+    }
+
+    /// If `e` accesses an `@orderedMap` field, resolve it to its two parallel-vector
+    /// accessors and key/value types. Handles `this.field`, a bare own `field`, and
+    /// `recv.field` on another object. Generating the receiver code can hoist a
+    /// prelude; when this turns out not to be an ordered map, that is rolled back so
+    /// the normal path regenerates the receiver cleanly.
+    pub(super) fn ordered_map_ref(&mut self, e: &Expr) -> Option<OrderedMapRef> {
+        let saved = self.prelude.len();
+        let (prefix, info, name): (String, Option<TypeInfo>, String) = match e {
+            Expr::Field(recv, name) => {
+                let (rcode, rty) = self.gen_expr(recv);
+                let op = if rty.is_ptr { "->" } else { "." };
+                (format!("{rcode}{op}"), rty.info, name.clone())
+            }
+            Expr::Ident(name) if self.lookup_local(name).is_none() => {
+                if let Some(at) = self.abstract_this.clone() {
+                    ("this->__this->".to_string(), at.info, name.clone())
+                } else {
+                    let info = self
+                        .prog
+                        .resolve_type(std::slice::from_ref(&self.class.name), self.mi)
+                        .cloned();
+                    ("this->".to_string(), info, name.clone())
+                }
+            }
+            _ => return None,
+        };
+        let kv = info
+            .as_ref()
+            .and_then(|i| self.lookup_field(i, &name))
+            .and_then(|f| crate::codegen::ordered_map_kv(f).map(|(k, v)| (k.clone(), v.clone())));
+        let Some((kty, vty)) = kv else {
+            self.prelude.truncate(saved);
+            return None;
+        };
+        Some(OrderedMapRef {
+            keys: format!("{prefix}{name}_keys"),
+            vals: format!("{prefix}{name}_vals"),
+            key_ty: self.ty_of(&kty),
+            val_ty: self.ty_of(&vty),
+        })
+    }
+
+    /// Lower an assignment to an `@orderedMap` field. An empty initialiser
+    /// (`new Map()` / `[]` / `[ ]` map literal) clears both vectors; a non-empty
+    /// map literal clears then appends each `k => v` pair in order. Assigning any
+    /// other whole-map value is a hard error (the field has no single map object).
+    fn gen_ordered_map_assign(&mut self, om: &OrderedMapRef, value: &Expr) -> (String, Ty) {
+        let is_empty_init = matches!(value, Expr::ArrayLit(v) if v.is_empty())
+            || matches!(value, Expr::MapLit(v) if v.is_empty())
+            || matches!(value, Expr::New(Type::Named { path, .. }, _)
+                if path.last().map(|s| s.as_str()) == Some("Map"));
+        if is_empty_init {
+            return (
+                format!("{}.clear(), {}.clear()", om.keys, om.vals),
+                Ty::default(),
+            );
+        }
+        if let Expr::MapLit(pairs) = value {
+            let t = "\t".repeat(self.prelude_ind);
+            let mut pre = String::new();
+            let _ = writeln!(pre, "{t}{}.clear();", om.keys);
+            let _ = writeln!(pre, "{t}{}.clear();", om.vals);
+            for (k, v) in pairs {
+                let kc = self.gen_expr(k).0;
+                let vc = self.gen_expr(v).0;
+                let _ = writeln!(pre, "{t}{}.push_back({kc});", om.keys);
+                let _ = writeln!(pre, "{t}{}.push_back({vc});", om.vals);
+            }
+            self.prelude.push_str(&pre);
+            return (String::new(), Ty::default());
+        }
+        self.err(
+            "an @orderedMap field can only be assigned an empty map (`new Map()` / `[]`) or a \
+             map literal; a whole map value cannot be assigned (the field is stored as two \
+             parallel vectors, not a single map)"
+                .to_string(),
+        );
+        (String::new(), Ty::default())
+    }
+
+    /// A `Null<T>` value (a heap pointer for a value `T`) read in *value* context:
+    /// deref it, treating `NULL` as a default-constructed `T`. Member access on a
+    /// nullable struct uses `->` directly, so in practice this is whole-value use of
+    /// a `Null<String>` (`return name`, concatenation, comparison to a string). `code`
+    /// must be side-effect-free (a field/local accessor) — it is evaluated twice.
+    pub(super) fn deref_nullable(&self, code: &str, ty: &Ty) -> String {
+        if ty.is_ptr && ty.nullable {
+            format!("({code} != NULL ? *({code}) : {}())", ty.base)
+        } else {
+            code.to_string()
+        }
     }
 
     pub(super) fn gen_field(&mut self, recv: &Expr, name: &str) -> (String, Ty) {
@@ -852,6 +995,23 @@ impl<'a> BodyGen<'a> {
             _ => self.gen_expr(recv),
         };
 
+        // An `@orderedMap` field reached here is being used as a *whole value* — every
+        // supported use (get/set/exists/remove/keys, iteration, init) is intercepted
+        // earlier. There is no single map object to read, so fail loudly.
+        if let Some(info) = &rty.info {
+            if self
+                .lookup_field(info, name)
+                .is_some_and(|f| crate::codegen::ordered_map_kv(f).is_some())
+            {
+                self.err(format!(
+                    "`{name}` is an @orderedMap field and has no single map value: use it via \
+                     `get`/`set`/`exists`/`remove`/`keys` or a `for` loop, not as a whole value \
+                     (it cannot be passed, returned, or assigned as a map)"
+                ));
+                return (format!("{rcode}->{name}"), Ty::default());
+            }
+        }
+
         // Haxe `.length` → `.size()` (Array/Map) or `.length()` (String). A nullable
         // container is a pointer (`Null<Array<T>>`), so it must be dereferenced.
         if name == "length" {
@@ -903,7 +1063,26 @@ impl<'a> BodyGen<'a> {
             .as_ref()
             .and_then(|info| self.member_field_ty(info, name))
             .unwrap_or_default();
-        (format!("{rcode}{op}{name}"), fty)
+        let access = format!("{rcode}{op}{name}");
+        self.read_nullable_string(access, fty)
+    }
+
+    /// A `Null<String>` read in value position is dereferenced to a value
+    /// `std::string` (`NULL` → `""`), so every downstream use (return, concat,
+    /// comparison, ternary) just works — *unless* `no_nullable_deref` is set, which
+    /// is the case while generating a `== null` operand, where the raw pointer is
+    /// wanted. Other `Null<T>` reads keep the pointer (struct member access uses `->`).
+    pub(super) fn read_nullable_string(&self, code: String, ty: Ty) -> (String, Ty) {
+        if !self.no_nullable_deref && ty.is_ptr && ty.nullable && ty.base == "std::string" {
+            let derefed = self.deref_nullable(&code, &ty);
+            let value = Ty {
+                is_ptr: false,
+                nullable: false,
+                ..ty
+            };
+            return (derefed, value);
+        }
+        (code, ty)
     }
 
     /// Hoist `new T(...)` (used as the receiver of a field/property access) into a
@@ -1170,6 +1349,14 @@ impl<'a> BodyGen<'a> {
                             return (format!("{prefix}{}::{method}({a})", info.cpp_name()), ret);
                         }
                     }
+                }
+            }
+            // `@orderedMap` fields carry no `std::map` value to call methods on —
+            // intercept `get`/`set`/`exists`/`remove`/`keys` and lower them to scans
+            // over the parallel key/value vectors before the normal dispatch.
+            if let Some(om) = self.ordered_map_ref(recv) {
+                if let Some(res) = self.ordered_map_call(&om, method, args) {
+                    return res;
                 }
             }
             let (rcode, rty) = self.gen_expr(recv);

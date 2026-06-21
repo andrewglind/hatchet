@@ -3,6 +3,63 @@
 All notable changes to Hatchet are documented here. Versions follow the
 project's milestones.
 
+## v0.2.3 — Ordered maps (`@orderedMap`) (2026-06-21)
+
+A minor release on top of Milestone 10: a `@orderedMap` field metadata that stores a `Map` as two
+insertion-ordered parallel vectors — a VC6-safe ordered map — plus a fail-loud fix for anonymous-struct
+container elements. No breaking changes.
+
+### `@orderedMap` — an insertion-ordered map without `std::map`
+
+`@orderedMap` on a class field of type `Map<K,V>` stores it as two parallel `std::vector`s — `m_keys`
+and `m_vals` — instead of a `std::map`:
+
+```haxe
+@orderedMap public var object:Map<String, JValue>;
+```
+
+This buys two things `std::map` cannot. First, **insertion order**: a `std::map` is key-sorted, and Haxe
+`Map` iteration order is unspecified under hxcpp, whereas the parallel vectors preserve first-seen order
+(both only ever grow at the end) — exactly what JSON-object round-tripping needs. Second, **VC6 safety**:
+the vectors hold a single key/value type each (no `std::map`, which is fragile on VC6, and no incomplete
+recursive container — a reference-typed `V` is a pointer, forward-declarable).
+
+Every operation lowers to a scan over the vectors, no `std::map` anywhere: `get`/`exists` (linear find),
+`set` (find-or-append, replacing in place to keep position), `remove` (paired erase), `keys()` (the keys
+vector), and `for (k => v in m)` / `for (v in m)` / `[for (k => v in m) …]` (a paired index loop).
+Construction is `new Map()` / `[]` (clears) or a map literal (clears, then appends each pair in order).
+Lookups are O(n) linear scans rather than `std::map`'s O(log n) — faster for the small maps this targets,
+but not for large ones.
+
+Because an `@orderedMap` field has no single map object, using it **as a whole value** — returning it,
+passing it, assigning a map into it — is a hard error naming the supported operations, rather than
+emitting code that will not compile. The hxcpp build still sees an ordinary `Map<K,V>` (so the source
+stays valid, type-checkable Haxe); the parallel-vector representation and its insertion-order guarantee
+are Hatchet's, matching the "runtime authority lives in the emitted C++98" contract.
+
+### String nullability: errors over guesses, and a working `Null<String>`
+
+A plain `String` lowers to a value `std::string`, which has no null state. Previously `s == null` /
+`s != null` on a value String was silently lowered to `s.empty()` / `!s.empty()` — a different predicate
+that conflates `null` with the empty string `""` (it would, for instance, drop a JSON key of `""`). That
+silent guess is gone:
+
+- **A value `String` compared to `null` is now a hard error**, steering to `!= ""` (emptiness) or
+  `Null<String>` (nullability). The one exception is an **optional `?s:String`** parameter, which
+  defaults to `""`, so its "was it passed?" check still reads as `s.empty()`.
+- **`Null<String>` now works end-to-end.** A `Null<T>` over a value `T` is an owned heap pointer:
+  `null` → `NULL`, assigning a value heap-wraps (`new std::string(v)`) and frees any prior value, a
+  value-position read dereferences (`NULL` → `""`), `!= null` is a real pointer check, and the
+  destructor frees it. (This also fixes the same assignment gap for other `Null<value-type>` fields,
+  which previously emitted non-compiling `T* = T`.)
+
+### Anonymous struct as a container element fails loudly
+
+`Array<{ key:String, val:T }>` (an inline anonymous struct as a container element) previously lowered to
+a useless `std::vector<void*>`. It is now a hard error pointing at the fix — give the struct a `typedef`
+and use that named type as the element — rather than a silent miscompile. (A named struct typedef as a
+container element already works.)
+
 ## v0.2.2 — Custom iterators, container-typedef resolution, header-only functions (2026-06-21)
 
 A minor release on top of Milestone 10: a general **`Iterator`/`Iterable` protocol** for `for` loops and

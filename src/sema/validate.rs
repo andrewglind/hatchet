@@ -54,6 +54,7 @@ fn collect_refs(prog: &Program, mi: usize) -> Collector {
         type_params,
         refs: Vec::new(),
         func_uses: Vec::new(),
+        anon_container_uses: Vec::new(),
     };
     for d in &m.file.decls {
         c.decl(d);
@@ -269,6 +270,20 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
                 *line,
                 format!(
                     "a function type {ctx} (first-class function values have no C++98 lowering; only a top-level `final` lambda binding is lowered, to a free function)"
+                ),
+            ));
+        }
+    }
+    // Anonymous struct as a container element/value (`Array<{x:Int}>`) — it would
+    // lower to a useless `std::vector<void*>`; a named `typedef` struct is the form.
+    let mut seen_anon: BTreeSet<String> = BTreeSet::new();
+    for (line, ctx) in &collected.anon_container_uses {
+        if seen_anon.insert(format!("{line}|{ctx}")) {
+            out.push(Diagnostic::unsupported(
+                file.clone(),
+                *line,
+                format!(
+                    "an anonymous struct as a container element {ctx} (it would lower to a useless `std::vector<void*>`; give the struct a `typedef` and use that named type as the element)"
                 ),
             ));
         }
@@ -1183,6 +1198,10 @@ struct Collector {
     /// Function-type (`A -> B`) annotations found outside the one supported
     /// position (a top-level `final` lambda binding), with line and context.
     func_uses: Vec<(usize, String)>,
+    /// A container element/value type that is an inline anonymous struct
+    /// (`Array<{x:Int}>`) — it would lower to a useless `std::vector<void*>`, so it
+    /// is flagged; a *named* struct typedef is the supported form.
+    anon_container_uses: Vec<(usize, String)>,
 }
 
 impl Collector {
@@ -1209,6 +1228,16 @@ impl Collector {
                         line: *line,
                         ctx: ctx.to_string(),
                     });
+                }
+                // A container element/value that is an inline anonymous struct lowers
+                // to `std::vector<void*>` — flag it (a named `typedef` is the form).
+                if container_template(name).is_some() {
+                    for p in params {
+                        if matches!(p, Type::Anon(fs) if !fs.is_empty()) {
+                            self.anon_container_uses
+                                .push((type_line(p), ctx.to_string()));
+                        }
+                    }
                 }
                 for p in params {
                     self.check(p, ctx);
