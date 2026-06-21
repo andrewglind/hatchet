@@ -86,6 +86,11 @@ pub fn analyze_class(prog: &Program, mi: usize, class: &Class) -> ClassEscape {
     let fields: BTreeSet<String> = class.fields.iter().map(|f| f.name.clone()).collect();
     let tagged = tagged_owned(class);
     let mut inferred = inferred_owned(class, &fields);
+    // A `Null<T>` field over a *value* `T` (String, value struct, primitive) is a heap
+    // pointer Hatchet allocates on assignment (the Null wrapper added the indirection),
+    // so the object owns it and frees it in the destructor — exactly like an inferred
+    // `new`. (A `Null<Class>` is an already-shared reference pointer, not owned here.)
+    inferred.extend(nullable_value_fields(prog, mi, class));
     // M4 aliasing/soundness guard: an inferred-owned field whose pointer is handed back
     // out of the object — returned, stored elsewhere, or passed to a call/constructor that
     // owns that argument — may be freed again or used after the destructor frees it, so
@@ -96,6 +101,32 @@ pub fn analyze_class(prog: &Program, mi: usize, class: &Class) -> ClassEscape {
     ClassEscape {
         owned_fields: owned,
     }
+}
+
+/// Fields whose type is `Null<T>` for a *value* `T` — a heap pointer Hatchet owns
+/// (allocated on assignment, freed in the destructor). A `Null<Class>` is excluded:
+/// a reference type is already a shared pointer the Null wrapper does not own.
+fn nullable_value_fields(prog: &Program, mi: usize, class: &Class) -> BTreeSet<String> {
+    class
+        .fields
+        .iter()
+        .filter(|f| is_nullable_value_type(prog, mi, f.ty.as_ref()))
+        .map(|f| f.name.clone())
+        .collect()
+}
+
+/// `true` when `ty` is `Null<T>` and `T` is a value type (so `Null<T>` lowers to an
+/// *owned* heap pointer rather than a shared reference pointer).
+pub(crate) fn is_nullable_value_type(prog: &Program, mi: usize, ty: Option<&Type>) -> bool {
+    if let Some(Type::Named { path, params, .. }) = ty {
+        if path.last().map(|s| s.as_str()) == Some("Null") && params.len() == 1 {
+            if let Type::Named { path: ip, .. } = &params[0] {
+                return !prog.is_reference(ip, mi);
+            }
+            return true;
+        }
+    }
+    false
 }
 
 /// The `@owned`-tagged field names (the explicit override set).

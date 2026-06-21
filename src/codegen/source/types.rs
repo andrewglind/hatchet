@@ -160,6 +160,7 @@ impl<'a> BodyGen<'a> {
         // A local shadowing a container parameter takes over the name — its
         // mutations are local copies, not parameter mutations.
         self.container_params.remove(name);
+        self.optional_string_params.remove(name);
         self.scopes.last_mut().unwrap().insert(name.to_string(), ty);
     }
     pub(super) fn lookup_local(&self, name: &str) -> Option<Ty> {
