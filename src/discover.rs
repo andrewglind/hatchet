@@ -196,7 +196,7 @@ mod tests {
     fn classifies_special_files() {
         assert!(is_main(Path::new("game/Main.hx")));
         assert!(is_stdafx(Path::new("modules/StdAfx.hx")));
-        assert!(!is_main(Path::new("game/AlienBeach.hx")));
+        assert!(!is_main(Path::new("game/MenuScene.hx")));
     }
 
     #[test]

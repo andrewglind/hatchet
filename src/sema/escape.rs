@@ -1129,14 +1129,23 @@ pub fn container_depth_if_pointer_leaf(
     ty: &Type,
 ) -> Option<usize> {
     let mut depth = 0;
-    let mut cur = ty;
-    while let Type::Named { path, params, .. } = cur {
-        if path.last().map(|s| s.as_str()) == Some("Array") && params.len() == 1 {
-            depth += 1;
-            cur = &params[0];
-        } else {
-            break;
+    let mut cur = ty.clone();
+    loop {
+        // Peel typedef aliases (e.g. `Tilesets` → `Array<Tileset>`).
+        let resolved = prog.resolve_alias_type(&cur, mi);
+        if resolved != cur {
+            cur = resolved;
+            continue;
         }
+        // Peel one `Array<…>` layer.
+        if let Type::Named { path, params, .. } = &cur {
+            if path.last().map(|s| s.as_str()) == Some("Array") && params.len() == 1 {
+                depth += 1;
+                cur = params[0].clone();
+                continue;
+            }
+        }
+        break;
     }
     if depth == 0 {
         return None;
@@ -1382,6 +1391,36 @@ mod tests {
         let prog = prog_of(src);
         let c = class_c(&prog);
         analyze_class(&prog, 0, c).owned_fields
+    }
+
+    #[test]
+    fn typedef_nested_container_depth_resolves() {
+        let prog = prog_of(
+            "class Widget {} typedef Row = Array<Widget>; typedef Matrix = Array<Row>; class C { var matrix:Matrix; }",
+        );
+        let c = class_c(&prog);
+        let ty = c.fields[0].ty.as_ref().expect("field type");
+        assert_eq!(
+            container_depth_if_pointer_leaf(&prog, 0, &[], ty),
+            Some(2),
+            "alias typedefs over nested Array<Widget*> must count as depth 2"
+        );
+    }
+
+    #[test]
+    fn typedef_container_local_escapes_to_field() {
+        let prog = prog_of(
+            "class Widget { public function new(v:Int) {} } \
+             typedef Row = Array<Widget>; typedef Matrix = Array<Row>; \
+             class C { var matrix:Matrix; public function new() { \
+               var row:Row = new Row(); row.push(new Widget(1)); this.matrix.push(row); \
+             } }",
+        );
+        let c = class_c(&prog);
+        assert!(
+            escaping_push_receivers(&prog, 0, c).contains("row"),
+            "a local row that flows into an owned typedef field must escape"
+        );
     }
 
     #[test]

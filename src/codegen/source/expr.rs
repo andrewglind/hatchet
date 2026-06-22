@@ -790,7 +790,7 @@ impl<'a> BodyGen<'a> {
         // A global `final` constant (`static const` inside its namespace, or a
         // `@:native` const from the C++ engine): namespace-qualify the reference
         // when it is used from a different namespace — e.g. `native::MAX_CHARACTERS`,
-        // or `game::ALIENBEACH_SCENE_ID` inside a global-scope `extern "C"` export.
+        // or `game::MENU_SCENE_ID` inside a global-scope `extern "C"` export.
         if let Some(qref) = self.prog.global_final_ref(name, self.mi, &self.ns) {
             return (qref, Ty::default());
         }

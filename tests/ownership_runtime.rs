@@ -339,7 +339,7 @@ class Scenario {
 }
 
 /// An `@owned` container of pointers: `new`s pushed in are freed element-by-element
-/// by the destructor, exactly once. (The Backdrop/Text shape.)
+/// by the destructor, exactly once. (The owned-collection-of-children shape.)
 #[test]
 fn owned_container_of_pointers_freed_once() {
     let src = "\
@@ -376,7 +376,7 @@ class Scenario {
 }
 
 /// A nested owned container (`Array<Array<T>>`) is walked and freed at every level,
-/// exactly once. (The Backdrop `tilesets` shape.)
+/// exactly once. (The nested `tilesets` shape.)
 #[test]
 fn nested_owned_container_freed_once() {
     let src = "\
