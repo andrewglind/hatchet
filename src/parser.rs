@@ -1476,37 +1476,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// An `if`/`else` reached in expression position (`var x = if (c) a else b`, a
-    /// `return if (…) …`, or an array-comprehension body). Each branch is a block
-    /// (`{ … }`), a nested `if`, or a plain value expression; codegen desugars the
-    /// whole thing to a hoisted temporary like a value `switch`.
-    fn parse_if_expr(&mut self) -> PResult<Expr> {
-        self.expect_sym_kw(Kw::If)?;
-        self.expect_sym(Sym::LParen)?;
-        let cond = Box::new(self.parse_expr()?);
-        self.expect_sym(Sym::RParen)?;
-        let then = Box::new(self.parse_branch_expr()?);
-        self.eat_sym(Sym::Semi);
-        let els = if self.eat_kw(Kw::Else) {
-            Some(Box::new(self.parse_branch_expr()?))
-        } else {
-            None
-        };
-        Ok(Expr::If { cond, then, els })
-    }
-
-    /// A single branch of a value `if`: a `{ … }` block, a chained `else if`, or a
-    /// plain value expression.
-    fn parse_branch_expr(&mut self) -> PResult<Expr> {
-        if self.at_sym(Sym::LBrace) {
-            Ok(Expr::Block(self.parse_block()?))
-        } else if self.at_kw(Kw::If) {
-            self.parse_if_expr()
-        } else {
-            self.parse_expr()
-        }
-    }
-
     /// Parse `try <stmt> (catch (name[:Type]) <block>)*`. The structure is captured
     /// so the validation pass can flag it as unsupported with a location (Hatchet
     /// does not transpile exception handling yet).

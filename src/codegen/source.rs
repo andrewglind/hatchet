@@ -1063,14 +1063,6 @@ fn size_ty() -> Ty {
     }
 }
 
-/// A Haxe `Int`-typed value backed by an unsigned C++ `size_t` (`.length` →
-/// `.size()`/`.length()`). Modelled as `int` for member lookup and arithmetic, but
-/// flagged `unsigned` so a comparison against a signed `int` gets the explicit
-/// `(size_t)` cast that silences MSVC's C4018.
-fn size_ty() -> Ty {
-    Ty { base: "int".into(), unsigned: true, ..Default::default() }
-}
-
 fn bool_ty() -> Ty {
     Ty {
         base: "bool".into(),
