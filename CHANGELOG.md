@@ -3,6 +3,30 @@
 All notable changes to Hatchet are documented here. Versions follow the
 project's milestones.
 
+## v0.2.4 — Typedef-alias containers & method visibility (2026-06-23)
+
+A correctness release: escape analysis now sees through typedef aliases to the containers they name,
+and class methods land in the right C++ visibility section. No breaking changes.
+
+### Escape analysis sees through typedef alias containers
+
+Escape analysis now peels typedef aliases (`typedef Matrix = Array<Row>`) before counting `Array` nesting,
+so aliased containers are tracked at their true depth. A local container of owned (`new`-d) elements that
+flows into an owned alias-typed field is recognised as escaping and is no longer freed at end of scope.
+
+A nullable alias container (`Null<Indicies>` where `typedef Indicies = Array<Int>`) also keeps its
+pointer-ness through alias resolution, so container methods on it dereference correctly — `indices.map(…)`
+lowers to `(*indices).size()` / `(*indices)[i]`.
+
+### Class methods lower to the correct C++ visibility
+
+A class method lands in the C++ `public` section only when it is explicitly `public`; everything else —
+including Haxe's default (no modifier) access, which is private — lowers to `protected`, mirroring how
+fields are grouped.
+
+Custom property accessors are the exception: a `get_x` / `set_x` backing a `public` property is promoted to
+`public` even when the accessor itself is private, keeping it at least as visible as the property it serves.
+
 ## v0.2.3 — Ordered maps (`@orderedMap`) (2026-06-21)
 
 A minor release on top of Milestone 10: a `@orderedMap` field metadata that stores a `Map` as two

@@ -309,6 +309,9 @@ impl<'a> BodyGen<'a> {
             Expr::If { cond, then, els } => {
                 self.gen_if_expr(cond, then, els.as_deref())
             }
+            Expr::Switch { subject, cases, default } => {
+                self.gen_switch_expr(subject, cases, default.as_deref())
+            }
             Expr::Block(stmts) => self.gen_block_expr(stmts),
             Expr::Str { raw, interpolated } => self.gen_string(raw, *interpolated),
             // In an `abstract` newtype's method, `this` is the underlying value,

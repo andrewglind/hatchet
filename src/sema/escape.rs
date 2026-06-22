@@ -1150,7 +1150,7 @@ pub fn container_depth_if_pointer_leaf(
     if depth == 0 {
         return None;
     }
-    prog.map_type_use(cur, mi, ns)
+    prog.map_type_use(&cur, mi, ns)
         .ends_with('*')
         .then_some(depth)
 }
