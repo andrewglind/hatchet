@@ -876,6 +876,57 @@ class Maths {
 }
 
 #[test]
+fn cpp_code_intrinsic_injects_verbatim_with_transpiled_arg_substitution() {
+    // Haxe's `__cpp__("fmt", a, b)` raw-injection intrinsic: the format string is
+    // emitted verbatim, `{N}` placeholders are replaced by the *transpiled* args, and
+    // it is recognised both bare and under the (C++-redundant) `untyped` wrapper.
+    let src = "\
+class Native {
+  public function new() {}
+  public function Clamp(v:Float, lo:Float):Float {
+    return untyped __cpp__(\"::fmaxf({0}, {1})\", v, lo);
+  }
+  public function Now():Float {
+    return __cpp__(\"(double)::clock() / CLOCKS_PER_SEC\");
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_cppcode_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Native.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Native"))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // `{0}`/`{1}` are replaced by the transpiled argument expressions (the params
+    // `v`/`lo`), and the surrounding C++ is emitted verbatim.
+    assert!(
+        out.contains("return ::fmaxf(v, lo);"),
+        "`__cpp__` substitutes transpiled args into the verbatim string:\n{out}"
+    );
+    // The bare (un-`untyped`) form is recognised too.
+    assert!(
+        out.contains("return (double)::clock() / CLOCKS_PER_SEC;"),
+        "bare `__cpp__` is recognised without an `untyped` wrapper:\n{out}"
+    );
+    // Neither the intrinsic name nor the `untyped` keyword survives.
+    assert!(
+        !out.contains("__cpp__") && !out.contains("untyped"),
+        "the `__cpp__`/`untyped` spelling must not survive into C++:\n{out}"
+    );
+    // Placeholders are fully resolved.
+    assert!(
+        !out.contains("{0}") && !out.contains("{1}"),
+        "all `{{N}}` placeholders must be substituted:\n{out}"
+    );
+}
+
+#[test]
 fn plain_dollar_interpolation_is_supported() {
     // `'$name'` shorthand interpolates the identifier, exactly like `'${name}'`.
     // A `$` not followed by an identifier (here `$5`) stays a literal dollar.

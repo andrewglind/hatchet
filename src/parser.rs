@@ -28,7 +28,7 @@ impl std::error::Error for ParseError {}
 pub fn parse(src: &str) -> Result<File, ParseError> {
     // Strip a leading UTF-8 BOM (U+FEFF) that some editors prepend — it is not source.
     // Done here (not in `lex`) so the lexer and the parser's source slice — used to
-    // capture `untyped`/verbatim spans — share the same byte offsets.
+    // capture raw metadata-argument spans verbatim — share the same byte offsets.
     let src = src.strip_prefix('\u{FEFF}').unwrap_or(src);
     let tokens = lex(src).map_err(|e| ParseError {
         message: e.message,
@@ -246,43 +246,6 @@ impl<'a> Parser<'a> {
                 return Ok(());
             }
         }
-    }
-
-    /// Capture the raw source of an `untyped` operand: everything up to the end
-    /// of the current statement — the next top-level `;`, `,`, or an unmatched
-    /// closing `)`/`]`/`}`. The text is returned exactly as written (no
-    /// transpilation), so it must already be valid C++.
-    fn capture_verbatim_operand(&mut self) -> PResult<String> {
-        if self.at_eof() {
-            return Err(self.err("`untyped` must be followed by an expression"));
-        }
-        let from = self.toks[self.pos].start;
-        let mut last_end = from;
-        let mut depth = 0i32;
-        loop {
-            match self.peek() {
-                TokKind::Eof => break,
-                TokKind::Sym(Sym::Semi) if depth == 0 => break,
-                TokKind::Sym(Sym::Comma) if depth == 0 => break,
-                TokKind::Sym(Sym::LParen | Sym::LBracket | Sym::LBrace) => depth += 1,
-                TokKind::Sym(Sym::RParen | Sym::RBracket | Sym::RBrace) => {
-                    if depth == 0 {
-                        break;
-                    }
-                    depth -= 1;
-                }
-                _ => {}
-            }
-            last_end = self.toks[self.pos].end;
-            self.bump();
-        }
-        let raw = String::from_utf8_lossy(&self.src[from..last_end])
-            .trim()
-            .to_string();
-        if raw.is_empty() {
-            return Err(self.err("`untyped` must be followed by an expression"));
-        }
-        Ok(raw)
     }
 
     // ---- metadata -------------------------------------------------------
@@ -1755,10 +1718,12 @@ impl<'a> Parser<'a> {
 
     fn parse_unary(&mut self) -> PResult<Expr> {
         if self.eat_kw(Kw::Untyped) {
-            // `untyped <rest of statement>` — capture the operand as raw source
-            // and pass it straight through to C++ (no transpilation).
-            let code = self.capture_verbatim_operand()?;
-            return Ok(Expr::Verbatim(code));
+            // `untyped EXPR` — Haxe's typer escape hatch. The operand is a normal
+            // expression (still transpiled); `untyped` only marks its type as opaque.
+            // Binds as a unary prefix to the following expression. Raw C++ injection
+            // is the separate `__cpp__(…)` intrinsic, handled in codegen.
+            let expr = self.parse_unary()?;
+            return Ok(Expr::Untyped(Box::new(expr)));
         }
         if self.eat_kw(Kw::Cast) {
             // cast(expr, Type) | cast expr
@@ -2292,8 +2257,8 @@ mod tests {
     #[test]
     fn parses_conditional_compilation_into_verbatim_statements() {
         // `#if FLAG`/`#else`/`#end` and a statement-level `@:include` lower to
-        // `Stmt::Verbatim` carrying the C++ preprocessor lines; `untyped` captures
-        // its operand verbatim to the end of the statement.
+        // `Stmt::Verbatim` carrying the C++ preprocessor lines; `untyped` wraps its
+        // operand (a real, transpiled expression) in `Expr::Untyped`.
         let f = file(
             "package p;\nclass X {\n\
                function f(d:Float):Float {\n\
@@ -2327,10 +2292,16 @@ mod tests {
                 "#endif"
             ]
         );
-        // The DREAMCAST `return` carries the verbatim `untyped` operand.
+        // The DREAMCAST `return` carries the `untyped` operand as a real call expr.
         match &body[2] {
-            Stmt::Return(Some(Expr::Verbatim(code)), _) => assert_eq!(code, "fsqrtf(d * d)"),
-            other => panic!("expected verbatim return, got {other:?}"),
+            Stmt::Return(Some(Expr::Untyped(inner)), _) => match &**inner {
+                Expr::Call(target, args) => {
+                    assert_eq!(**target, Expr::Ident("fsqrtf".into()));
+                    assert_eq!(args.len(), 1);
+                }
+                other => panic!("expected untyped call, got {other:?}"),
+            },
+            other => panic!("expected untyped return, got {other:?}"),
         }
     }
 
@@ -2338,8 +2309,8 @@ mod tests {
     fn strips_a_leading_utf8_bom_keeping_offsets_aligned() {
         // A leading UTF-8 BOM (U+FEFF) some editors prepend is stripped before lexing.
         // Because it is stripped in `parse` (not `lex`), the parser's source slice stays
-        // byte-aligned with the token offsets, so a verbatim `untyped` capture — which
-        // slices the raw source — comes out exact, not shifted by the 3 BOM bytes.
+        // byte-aligned with the token offsets, so raw metadata-argument spans come out
+        // exact, not shifted by the 3 BOM bytes.
         let f = file(
             "\u{FEFF}package p;\nclass X {\n  function f(d:Float):Float { return untyped fsqrtf(d * d); }\n}",
         );
@@ -2350,8 +2321,10 @@ mod tests {
         };
         let body = cls.methods[0].body.as_ref().expect("body");
         match &body[0] {
-            Stmt::Return(Some(Expr::Verbatim(code)), _) => assert_eq!(code, "fsqrtf(d * d)"),
-            other => panic!("expected verbatim return, got {other:?}"),
+            Stmt::Return(Some(Expr::Untyped(inner)), _) => {
+                assert!(matches!(&**inner, Expr::Call(..)), "got {inner:?}");
+            }
+            other => panic!("expected untyped return, got {other:?}"),
         }
     }
 

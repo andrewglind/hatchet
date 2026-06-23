@@ -62,7 +62,7 @@ Full documentation lives in the **[Hatchet Wiki](https://github.com/andrewglind/
 - **[Members & Access](https://github.com/andrewglind/hatchet/wiki/Members-and-Access)** — access mapping, property accessors, `@:overload`, abstract classes
 - **[Statements & Expressions](https://github.com/andrewglind/hatchet/wiki/Statements-and-Expressions)** — control flow, `switch`, containers, strings, lambdas, exceptions
 - **[Types & Nullability](https://github.com/andrewglind/hatchet/wiki/Types-and-Nullability)** — `Float`/`Single`, division semantics, shifts, `Null<T>`
-- **[Conditional Compilation](https://github.com/andrewglind/hatchet/wiki/Conditional-Compilation)** — `#if`, `untyped`, `@:include`, `@:cppFileCode`
+- **[Conditional Compilation](https://github.com/andrewglind/hatchet/wiki/Conditional-Compilation)** — `#if`, `__cpp__`, `untyped`, `@:include`, `@:cppFileCode`
 - **[Memory Ownership](https://github.com/andrewglind/hatchet/wiki/Memory-Ownership)** — escape analysis, `@owned` / `@sink` / `@delete`
 
 **Semantics & interop**
