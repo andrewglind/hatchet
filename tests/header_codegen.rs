@@ -337,11 +337,11 @@ fn custom_accessor_of_public_property_stays_public() {
     let _ = std::fs::remove_dir_all(&dir);
 
     let getter = out.find("get_area()").expect("get_area() is emitted");
-    match out.find("protected:") {
-        Some(prot) => assert!(
+    // No `protected:` block at all → everything public, also fine.
+    if let Some(prot) = out.find("protected:") {
+        assert!(
             getter < prot,
             "accessor of a public property must stay public:\n{out}"
-        ),
-        None => {} // no protected block at all → everything public, also fine
+        );
     }
 }
