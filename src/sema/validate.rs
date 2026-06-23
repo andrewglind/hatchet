@@ -1165,6 +1165,8 @@ impl<'a> UnsupportedWalker<'a> {
                     self.stmt(s);
                 }
             }
+            // `untyped EXPR` is still a real, transpiled expression — recurse into it.
+            Expr::Untyped(inner) => self.expr(inner),
             Expr::Int(_)
             | Expr::Float(_)
             | Expr::Str { .. }
@@ -1172,7 +1174,6 @@ impl<'a> UnsupportedWalker<'a> {
             | Expr::Null
             | Expr::This
             | Expr::Super
-            | Expr::Verbatim(_)
             | Expr::Ident(_) => {}
         }
     }
@@ -1566,6 +1567,8 @@ impl Collector {
                     self.stmt(s, ctx);
                 }
             }
+            // `untyped EXPR` is still a real, transpiled expression — recurse into it.
+            Expr::Untyped(inner) => self.expr(inner, ctx),
             // Leaves with no nested expressions or types.
             Expr::Int(_)
             | Expr::Float(_)
@@ -1574,7 +1577,6 @@ impl Collector {
             | Expr::Null
             | Expr::This
             | Expr::Super
-            | Expr::Verbatim(_)
             | Expr::Regex { .. }
             | Expr::Ident(_) => {}
         }

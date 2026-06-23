@@ -286,8 +286,14 @@ impl<'a> BodyGen<'a> {
                 },
             ),
             Expr::Null => ("NULL".into(), Ty::default()),
-            // `untyped X` — emit X verbatim; its type is opaque to Hatchet.
-            Expr::Verbatim(code) => (code.clone(), Ty::default()),
+            // `untyped EXPR` — transpile EXPR normally, but report its type as
+            // opaque (`Dynamic`) so type-driven decisions downstream are relaxed,
+            // mirroring Haxe's typer escape hatch. (Raw C++ injection is the
+            // separate `__cpp__(…)` intrinsic, recognised in `gen_call`.)
+            Expr::Untyped(inner) => {
+                let (code, _) = self.gen_expr(inner);
+                (code, Ty::default())
+            }
             // Regex literals are flagged `Unsupported` in validation, so a module
             // using one is never generated; this arm only keeps the match total.
             Expr::Regex { .. } => {
@@ -1274,7 +1280,37 @@ impl<'a> BodyGen<'a> {
         Some((format!("{}({a})", self.enum_value_ctor(&info, &vname)), ty))
     }
 
+    /// Recognise Haxe's `__cpp__(fmt, args…)` raw-injection intrinsic. The format
+    /// string is emitted verbatim, with `{N}` placeholders replaced by the
+    /// *transpiled* code of `args[N]` (so real Hatchet locals/expressions can be
+    /// spliced into hand-written C++). Returns `None` when `target` isn't `__cpp__`.
+    fn try_cpp_code(&mut self, target: &Expr, args: &[Expr]) -> Option<(String, Ty)> {
+        let Expr::Ident(name) = target else {
+            return None;
+        };
+        if name != "__cpp__" {
+            return None;
+        }
+        let Some(Expr::Str { raw, .. }) = args.first() else {
+            self.err("`__cpp__` expects a string-literal first argument".to_string());
+            return Some(("/* __cpp__ */".into(), Ty::default()));
+        };
+        let mut code = unescape_cpp_code(raw);
+        for (i, a) in args[1..].iter().enumerate() {
+            let (acode, _) = self.gen_expr(a);
+            code = code.replace(&format!("{{{i}}}"), &acode);
+        }
+        Some((code, Ty::default()))
+    }
+
     pub(super) fn gen_call(&mut self, target: &Expr, args: &[Expr]) -> (String, Ty) {
+        // `__cpp__("literal", a, b)` (Haxe's `cpp.Syntax.code`) — raw C++ injection.
+        // Recognised with or without an enclosing `untyped`: Hatchet only ever
+        // targets C++, so the wrapper Haxe needs to silence the unknown-identifier
+        // error on `__cpp__` is redundant here.
+        if let Some(res) = self.try_cpp_code(target, args) {
+            return res;
+        }
         // `recv?.method(args)` → NULL-guarded call (comma operator keeps it usable
         // as a discardable expression even when the method returns void).
         if let Expr::SafeField(recv, method) = target {
@@ -1655,4 +1691,30 @@ impl<'a> BodyGen<'a> {
         };
         retains.then_some(value)
     }
+}
+
+/// Resolve string escapes in a `__cpp__` format string. The lexer keeps the inner
+/// text raw, but for `__cpp__` it is emitted as literal C++, so the common escapes
+/// (`\"`, `\\`, `\n`, `\t`) are decoded; any other backslash sequence is preserved.
+fn unescape_cpp_code(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }

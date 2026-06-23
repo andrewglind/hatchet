@@ -3,6 +3,38 @@
 All notable changes to Hatchet are documented here. Versions follow the
 project's milestones.
 
+## v0.2.5 — Haxe-aligned `untyped` & `cpp.ConstCharStar` (2026-06-24)
+
+A correctness release: `untyped` now matches Haxe's actual semantics, raw C++ injection moves to the
+`__cpp__` intrinsic it belongs to, and the `cpp.ConstCharStar` interop type lowers. No breaking changes
+for the supported `untyped` idiom — see below.
+
+### `untyped` and `__cpp__` aligned with Haxe
+
+Previously `untyped <expr>` was a *lexical* construct: it sliced the raw source to the end of the
+statement and emitted it verbatim, bypassing all transpilation. That conflated two separate Haxe
+mechanisms and meant the canonical escape hatch `untyped __cpp__("…")` was broken (it emitted the literal
+text `__cpp__("…")`).
+
+The two concepts are now distinct, matching Haxe:
+
+- **`untyped <expr>`** is the typer escape hatch. The operand is parsed and transpiled like any other
+  expression; the only effect is that its static type is treated as opaque (`Dynamic`), so type-driven
+  checks relax. It binds as a normal unary prefix rather than swallowing to the next `;`.
+- **`__cpp__("…", a, b)`** (Haxe's `cpp.Syntax.code`) is the raw-injection intrinsic. The format string
+  is emitted verbatim, with `{0}`, `{1}`, … placeholders replaced by the **transpiled** arguments — so
+  real Hatchet expressions can be spliced into hand-written C++ (`__cpp__("::fmaxf({0}, {1})", v, lo)` →
+  `::fmaxf(v, lo)`). Because Hatchet only ever targets C++, the call is recognised **with or without** the
+  `untyped` wrapper Haxe needs to silence its unknown-identifier error.
+
+The common existing idiom `untyped someCName(args)` is unaffected: the call is now transpiled normally and
+produces identical output.
+
+### `cpp.ConstCharStar` lowers to `const char*`
+
+hxcpp's `cpp.ConstCharStar` interop type now maps to `const char*` (joining `cpp.StdString` → `std::string`
+and the rest of the primitive mappings).
+
 ## v0.2.4 — Typedef-alias containers & method visibility (2026-06-23)
 
 A correctness release: escape analysis now sees through typedef aliases to the containers they name,

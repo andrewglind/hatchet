@@ -208,11 +208,14 @@ pub enum Expr {
     /// Parenthesised expression (grouping preserved for fidelity).
     Paren(Box<Expr>),
 
-    /// `untyped <rest of statement>` — the operand is captured as raw source and
-    /// emitted to C++ verbatim, bypassing all type checking and transpilation.
-    /// Used to drop down to C/C++ APIs the Haxe side cannot see (e.g. a
-    /// platform intrinsic inside a `#if`/`#end` block).
-    Verbatim(String),
+    /// `untyped EXPR` — Haxe's type-system escape hatch. The operand is parsed and
+    /// transpiled like any other expression; the only effect is that its static type
+    /// is treated as opaque (`Dynamic`), so type-driven checks downstream are relaxed.
+    /// Raw C++ injection is a *separate* mechanism — the `__cpp__("…", args…)`
+    /// intrinsic (Haxe's `cpp.Syntax.code`) — which is what `untyped __cpp__(…)`
+    /// actually leans on; in Hatchet that intrinsic is recognised directly during
+    /// codegen, with or without the (here-redundant) `untyped` wrapper.
+    Untyped(Box<Expr>),
 
     /// A regular-expression literal `~/pattern/flags`. Hatchet does not transpile
     /// regex; this is carried only so the validation pass can flag it as
