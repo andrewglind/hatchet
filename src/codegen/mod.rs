@@ -1101,9 +1101,13 @@ impl<'a> HeaderGen<'a> {
             } else {
                 format!("{t}\t{virt}{stat}{sig};\n")
             };
-            match m.access {
-                Access::Private => protected.push_str(&line),
-                _ => public.push_str(&line),
+            // Haxe's default (no modifier) access is private, so only an explicit
+            // `public` (or a custom accessor backing a public property) lands in the
+            // public block; everything else is hidden (C++ `protected`, mirroring
+            // the field grouping below).
+            match method_access(c, m) {
+                Access::Public => public.push_str(&line),
+                _ => protected.push_str(&line),
             }
             // `@:op(...)` on an abstract method → an additive C++ operator that
             // forwards to the named method (so the value reads as `a[k]` / `a + b`
@@ -1878,22 +1882,42 @@ fn custom_setter(c: &Class, f: &Field) -> bool {
             .any(|m| m.name.as_deref() == Some(&format!("set_{}", f.name)))
 }
 
-/// The return type Haxe infers for a property accessor whose signature omits
-/// it: `get_x` and `set_x` both return the property's type (the common shape
-/// `function set_x(v:T) { return this.x = v; }` relies on this — defaulting to
-/// `void` would emit a value `return` from a void C++ function). `None` when
-/// `method` is not an accessor of a matching declared property.
-pub(crate) fn accessor_ret_type(c: &Class, method: &str) -> Option<Type> {
+/// The property field a `get_x`/`set_x` method is the custom accessor for, if
+/// `method` matches a declared `(get, …)`/`(…, set)` property. `None` when
+/// `method` is an ordinary method (no matching property of the right kind).
+fn accessor_field<'a>(c: &'a Class, method: &str) -> Option<&'a Field> {
     let field = method
         .strip_prefix("get_")
         .or_else(|| method.strip_prefix("set_"))?;
     let f = c.fields.iter().find(|f| f.name == field)?;
     let matches_kind = (method.starts_with("get_") && f.get == PropAccess::Get)
         || (method.starts_with("set_") && f.set == PropAccess::Set);
-    if !matches_kind {
-        return None;
+    matches_kind.then_some(f)
+}
+
+/// The return type Haxe infers for a property accessor whose signature omits
+/// it: `get_x` and `set_x` both return the property's type (the common shape
+/// `function set_x(v:T) { return this.x = v; }` relies on this — defaulting to
+/// `void` would emit a value `return` from a void C++ function). `None` when
+/// `method` is not an accessor of a matching declared property.
+pub(crate) fn accessor_ret_type(c: &Class, method: &str) -> Option<Type> {
+    accessor_field(c, method).and_then(|f| f.ty.clone())
+}
+
+/// The C++ visibility group a method belongs in. Haxe's default (no modifier)
+/// access is private, which maps to C++ `protected` (see the field grouping and
+/// the note where `protected` is declared). A custom property accessor is the
+/// exception: Haxe governs property access by the *property's* visibility, not
+/// the accessor's, and Hatchet lowers external reads/writes to direct
+/// `get_x()`/`set_x()` calls — so the accessor must be at least as visible as
+/// the property it backs.
+fn method_access(c: &Class, m: &Function) -> Access {
+    let own = m.access;
+    match m.name.as_deref().and_then(|n| accessor_field(c, n)) {
+        Some(f) if f.access == Access::Public || own == Access::Public => Access::Public,
+        Some(_) => own,
+        None => own,
     }
-    f.ty.clone()
 }
 
 fn tabs(n: usize) -> String {

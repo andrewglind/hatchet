@@ -426,7 +426,7 @@ impl Program {
     /// namespace-qualified C++ reference. `final`s lower to `static const` inside
     /// their module's namespace, so a reference from a different namespace —
     /// notably a global-scope `extern "C"` export, e.g.
-    /// `case game::ALIENBEACH_SCENE_ID:` — must be qualified, exactly like a type
+    /// `case game::MENU_SCENE_ID:` — must be qualified, exactly like a type
     /// reference is. `@:native` renames the symbol but the constant is still
     /// emitted in this module's namespace. A `final` whose value is a
     /// function/lambda is a free function, not a constant, and is left alone.
@@ -676,7 +676,7 @@ impl Program {
                         .map(|u| self.map_type_base(&u, ti.module_index, current_ns))
                         .unwrap_or_else(|| qualify(ti, current_ns)),
                     // A *produce* `@proxy` (an `abstract class`) is spelled as the
-                    // native base it stands for — `Scene` → `mucus::IScene` — at
+                    // native base it stands for — `Scene` → `eng::IScene` — at
                     // `extends`/`super`/variable sites. A *consume* proxy was already
                     // redirected to its extern by `resolve_type`, so `ti` there is the
                     // extern itself and falls through to `qualify`.
@@ -941,7 +941,7 @@ fn native_target(meta: &[Meta]) -> (Option<Vec<String>>, Option<String>) {
     (ns, name)
 }
 
-/// A type's fully-qualified C++ native name from its `@:native` (`mucus::IScene`),
+/// A type's fully-qualified C++ native name from its `@:native` (`eng::IScene`),
 /// or `None` if it has no explicit `@:native`. Used to match a `@proxy` argument to
 /// the extern it names.
 fn qualified_native(t: &TypeInfo) -> Option<String> {

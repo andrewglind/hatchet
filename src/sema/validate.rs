@@ -333,7 +333,7 @@ fn flag_proxy(prog: &Program, d: &Decl, file: &str, out: &mut Vec<Diagnostic>) {
         out.push(Diagnostic::error(
             file.to_string(),
             line,
-            "`@proxy` requires the fully-qualified native C++ class name as a string argument, e.g. `@proxy(\"mucus::IScene\")`".to_string(),
+            "`@proxy` requires the fully-qualified native C++ class name as a string argument, e.g. `@proxy(\"eng::IScene\")`".to_string(),
         ));
         return;
     }

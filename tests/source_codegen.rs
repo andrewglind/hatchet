@@ -1080,6 +1080,82 @@ class Grid {
 }
 
 #[test]
+fn typedef_container_push_new_is_not_scope_deleted() {
+    // Nested alias typedefs over `Array<…>` with pointer elements: a `new` pushed
+    // into a local container that later flows into an owned class field must be
+    // emitted inline — not hoisted into a scope-owned temporary and deleted.
+    let src = "\
+class Widget {
+  public function new(id:Int, band:Int) {}
+}
+
+typedef Row = Array<Widget>;
+typedef Matrix = Array<Row>;
+
+class Shelf {
+  private var matrix:Matrix;
+  public function new() {
+    this.matrix = new Matrix();
+    for (rack in 0...3) {
+      var row:Row = new Row();
+      for (slot in 0...5) {
+        for (tier in 0...2) {
+          row.push(new Widget(slot, tier));
+        }
+      }
+      this.matrix.push(row);
+    }
+  }
+}
+";
+    let dir = std::env::temp_dir().join(format!("hatchet_typpush_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("S.hx"), src).unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("S"))
+        .unwrap();
+    let body = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        body.contains("row.push_back(new Widget("),
+        "nested-loop push should be inline:\n{body}"
+    );
+    assert!(
+        !body.contains("delete "),
+        "the constructor must not delete a pushed `new`:\n{body}"
+    );
+}
+
+#[test]
+fn nullable_alias_container_map_dereferences_the_pointer() {
+    // A `Null<Indicies>` where `typedef Indicies = Array<Int>` is a *pointer* to the
+    // resolved `std::vector<int>`. Resolving the alias for container-method dispatch
+    // (`.map`) must preserve the use-site pointer-ness, so the generated loop
+    // dereferences the receiver (`(*indices).size()` / `(*indices)[i]`) rather than
+    // calling `.size()` / `[]` on the bare pointer.
+    let out = gen_one(
+        "typedef Indicies = Array<Int>;\nclass M {\n  public var xs:Array<Int>;\n  public function new() { xs = []; }\n  public function f(indices:Null<Indicies>):Array<Int> {\n    return indices.map((i) -> this.xs[i]);\n  }\n}\n",
+        "M",
+    );
+    assert!(
+        out.contains("(*indices).size()"),
+        "the map loop bound dereferences the nullable alias pointer:\n{out}"
+    );
+    assert!(
+        out.contains("(*indices)["),
+        "the map loop indexes the dereferenced container:\n{out}"
+    );
+    assert!(
+        !out.contains("indices.size()"),
+        "must not call .size() on the bare pointer:\n{out}"
+    );
+}
+
+#[test]
 fn bare_field_assigned_new_behaves_like_qualified() {
     // `field = new X(new Y())` with `this.` omitted must be treated the same as
     // `this.field = new X(...)`: the field owns the allocation, so the nested
@@ -3162,13 +3238,13 @@ fn switch_case_on_final_constants_is_supported() {
     // is a constant pattern — it lowers to the constant as a C++ case label, not
     // a Haxe capture variable. Regression guard for the switch-pattern validator.
     let src = "\
-final ALIENBEACH_SCENE_ID:Int = 0;
+final MENU_SCENE_ID:Int = 0;
 final POINTS_SCENE_ID:Int = 1;
 class Factory {
   public function new() {}
   public function make(sceneId:Int):Int {
     switch sceneId {
-      case ALIENBEACH_SCENE_ID: return 10;
+      case MENU_SCENE_ID: return 10;
       case POINTS_SCENE_ID: return 20;
       default: return -1;
     }
@@ -3177,7 +3253,7 @@ class Factory {
 ";
     let out = gen_one(src, "Factory");
     assert!(
-        out.contains("case ALIENBEACH_SCENE_ID:"),
+        out.contains("case MENU_SCENE_ID:"),
         "final constant is a valid case label:\n{out}"
     );
     assert!(
@@ -3193,13 +3269,13 @@ fn value_position_switch_uses_the_expected_type_not_the_first_arm() {
     // subclass — otherwise assigning a sibling subclass to it is nonsense C++.
     let src = "\
 class Scene { public function new() {} }
-class AlienBeach extends Scene { public function new() { super(); } }
+class MenuScene extends Scene { public function new() { super(); } }
 class Points extends Scene { public function new() { super(); } }
 class Factory {
   public function new() {}
   public function make(id:Int):Scene {
     return switch id {
-      case 0: new AlienBeach();
+      case 0: new MenuScene();
       case 1: new Points();
       default: null;
     }
@@ -3565,12 +3641,12 @@ class User {
 fn produce_proxy_abstract_class_is_a_native_base_subclasses_derive_from() {
     // `@proxy("native")` on an `abstract class` is the produced-base form: the base
     // is never emitted, but a subclass `extends` it as the native base
-    // (`: public mucus::IScene`) and its `super(...)` routes to the native ctor.
+    // (`: public eng::IScene`) and its `super(...)` routes to the native ctor.
     let src = "\
-@:include(\"mucus.h\") @:native(\"mucus::IScene\") @:structAccess
+@:include(\"engine.h\") @:native(\"eng::IScene\") @:structAccess
 extern class IScene {}
 
-@proxy(\"mucus::IScene\")
+@proxy(\"eng::IScene\")
 abstract class Scene {
   private var id:Int;
   public function new(id:Int) {}
@@ -3588,13 +3664,17 @@ class Title extends Scene {
         "produce-proxy base is not emitted:\n{head}"
     );
     assert!(
-        head.contains(": public mucus::IScene"),
+        !head.contains("class Scene"),
+        "produce-proxy base is not emitted:\n{head}"
+    );
+    assert!(
+        head.contains(": public eng::IScene"),
         "subclass derives from the native base:\n{head}"
     );
 
     let out = gen_one(src, "Title");
     assert!(
-        out.contains("mucus::IScene(7)"),
+        out.contains("eng::IScene(7)"),
         "super(...) routes to the native base constructor:\n{out}"
     );
 }
@@ -3602,7 +3682,7 @@ class Title extends Scene {
 #[test]
 fn proxy_without_argument_is_an_error() {
     let src = "\
-@:native(\"mucus::IScene\") extern class IScene {}
+@:native(\"eng::IScene\") extern class IScene {}
 @proxy
 abstract class Scene { public function new() {} }
 ";
@@ -3617,8 +3697,8 @@ abstract class Scene { public function new() {} }
 #[test]
 fn proxy_on_non_abstract_declaration_is_an_error() {
     let src = "\
-@:native(\"mucus::IScene\") extern class IScene {}
-@proxy(\"mucus::IScene\")
+@:native(\"eng::IScene\") extern class IScene {}
+@proxy(\"eng::IScene\")
 class Scene { public function new() {} }
 ";
     let errs = validation_errors(src, "Scene");
@@ -3632,7 +3712,7 @@ class Scene { public function new() {} }
 #[test]
 fn proxy_naming_an_undeclared_native_is_an_error() {
     let src = "\
-@proxy(\"mucus::IScene\")
+@proxy(\"eng::IScene\")
 abstract class Scene { public function new() {} }
 ";
     let errs = validation_errors(src, "Scene");

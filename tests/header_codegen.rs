@@ -281,3 +281,67 @@ fn mutually_recursive_classes_get_targeted_forward_declarations() {
         "forward declaration must precede the referring class:\n{out}"
     );
 }
+
+#[test]
+fn default_access_methods_are_hidden() {
+    // Haxe's default (no modifier) member access is private, which maps to C++
+    // `protected` — the same grouping member variables already get. Only an
+    // explicit `public` method belongs in the `public:` block.
+    let dir = std::env::temp_dir().join(format!("hatchet_methvis_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Calc.hx"),
+        "package demo;\nclass Calc {\n  public function new() {}\n  \
+         public function run():Int { return helper(); }\n  \
+         function helper():Int { return 1; }\n}\n",
+    )
+    .unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let out = header(&prog, "Calc");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // `helper()` (no modifier) lands after the `protected:` divider; `run()` (an
+    // explicit `public`) lands before it.
+    let prot = out
+        .find("protected:")
+        .expect("a hidden method forces a protected: block");
+    let helper = out.find("helper()").expect("helper() is emitted");
+    let run = out.find("run()").expect("run() is emitted");
+    assert!(
+        helper > prot,
+        "default-access method must be protected, not public:\n{out}"
+    );
+    assert!(
+        run < prot,
+        "explicit public method must stay public:\n{out}"
+    );
+}
+
+#[test]
+fn custom_accessor_of_public_property_stays_public() {
+    // A custom property accessor (`get_x`/`set_x`) has no access modifier (so it
+    // is private by Haxe's default), but external property access routes through
+    // it and Hatchet lowers those reads to a direct `get_x()` call — so the
+    // accessor of a *public* property must be emitted `public`, not `protected`.
+    let dir = std::env::temp_dir().join(format!("hatchet_acc_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Box.hx"),
+        "package demo;\nclass Box {\n  public function new() {}\n  \
+         public var area(get, never):Int;\n  \
+         function get_area():Int { return 42; }\n}\n",
+    )
+    .unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let out = header(&prog, "Box");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let getter = out.find("get_area()").expect("get_area() is emitted");
+    match out.find("protected:") {
+        Some(prot) => assert!(
+            getter < prot,
+            "accessor of a public property must stay public:\n{out}"
+        ),
+        None => {} // no protected block at all → everything public, also fine
+    }
+}

@@ -27,7 +27,7 @@ fn find_gxx() -> Option<String> {
 
 const SRC: &str = r#"package lib;
 
-final ALIENBEACH_SCENE_ID:Int = 0;
+final MENU_SCENE_ID:Int = 0;
 final POINTS_SCENE_ID:Int = 1;
 
 class Scene {
@@ -35,14 +35,14 @@ class Scene {
 	public function new() { id = -1; }
 	public function tag():Int { return id; }
 }
-class AlienBeach extends Scene { public function new() { super(); id = 100; } }
+class MenuScene extends Scene { public function new() { super(); id = 100; } }
 class Points extends Scene { public function new() { super(); id = 200; } }
 
 class Factory {
 	public function new() {}
 	public function make(sceneId:Int):Scene {
 		return switch sceneId {
-			case ALIENBEACH_SCENE_ID: new AlienBeach();
+			case MENU_SCENE_ID: new MenuScene();
 			case POINTS_SCENE_ID: new Points();
 			default: null;
 		}

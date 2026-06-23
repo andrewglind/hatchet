@@ -377,10 +377,17 @@ impl<'a> BodyGen<'a> {
             let TypedefTarget::Alias(target) = &td.target else {
                 break;
             };
-            let next = self.ty_of_in(target, info.module_index);
+            let mut next = self.ty_of_in(target, info.module_index);
             if next.base == cur.base {
                 break;
             }
+            // Resolving an alias only changes *which container* it names — not
+            // whether this use is a pointer. A `Null<Indicies>` is a pointer to the
+            // resolved `std::vector<int>`, so the use-site pointer/nullable flags
+            // must survive the rewrite (otherwise `.map`/`[]`/`.size()` lower as if
+            // the receiver were a value, emitting `indices.size()` on a pointer).
+            next.is_ptr |= cur.is_ptr;
+            next.nullable |= cur.nullable;
             cur = next;
         }
         cur
