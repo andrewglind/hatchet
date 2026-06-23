@@ -2101,7 +2101,11 @@ impl<'a> Parser<'a> {
         // value expression (every iteration yields a value), so it stays the body.
         let (guard, key_or_val) = if self.at_kw(Kw::If) {
             match self.parse_if_expr()? {
-                Expr::If { cond, then, els: None } => (Some(cond), *then),
+                Expr::If {
+                    cond,
+                    then,
+                    els: None,
+                } => (Some(cond), *then),
                 other => (None, other),
             }
         } else {

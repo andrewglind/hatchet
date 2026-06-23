@@ -407,7 +407,9 @@ impl Program {
         if let Some(t) = self.resolve_type(&owned, ctx_module) {
             return Some(t);
         }
-        self.types.iter().find(|t| t.proxy_native.is_none() && t.cpp_name() == bare)
+        self.types
+            .iter()
+            .find(|t| t.proxy_native.is_none() && t.cpp_name() == bare)
     }
 
     /// The `extern` type a `@proxy("native::Name")` stands for: the (non-proxy)

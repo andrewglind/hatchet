@@ -306,12 +306,12 @@ impl<'a> BodyGen<'a> {
                     },
                 )
             }
-            Expr::If { cond, then, els } => {
-                self.gen_if_expr(cond, then, els.as_deref())
-            }
-            Expr::Switch { subject, cases, default } => {
-                self.gen_switch_expr(subject, cases, default.as_deref())
-            }
+            Expr::Switch {
+                subject,
+                cases,
+                default,
+            } => self.gen_switch_expr(subject, cases, default.as_deref()),
+            Expr::If { cond, then, els } => self.gen_if_expr(cond, then, els.as_deref()),
             Expr::Block(stmts) => self.gen_block_expr(stmts),
             Expr::Str { raw, interpolated } => self.gen_string(raw, *interpolated),
             // In an `abstract` newtype's method, `this` is the underlying value,
@@ -560,7 +560,10 @@ impl<'a> BodyGen<'a> {
                 // `arr.length`) warns under MSVC (C4018). Make the conversion C++
                 // already performs explicit with a `(size_t)` cast on the signed side.
                 let (mut l, mut r) = (l, r);
-                if matches!(*op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge | BinOp::Eq | BinOp::Ne) {
+                if matches!(
+                    *op,
+                    BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge | BinOp::Eq | BinOp::Ne
+                ) {
                     cast_signed_for_unsigned_cmp(&mut l, &lty, &mut r, &rty);
                 }
                 let ty = binop_result_ty(*op, lty);
@@ -655,9 +658,13 @@ impl<'a> BodyGen<'a> {
                 self.prelude.push_str(&buf);
                 (tmp, ty)
             }
-            Expr::Comprehension { var, value_var, iter, guard, body } => {
-                self.gen_comprehension(var, value_var.as_deref(), iter, guard.as_deref(), body)
-            }
+            Expr::Comprehension {
+                var,
+                value_var,
+                iter,
+                guard,
+                body,
+            } => self.gen_comprehension(var, value_var.as_deref(), iter, guard.as_deref(), body),
             Expr::Lambda { .. } => ("/* lambda */".into(), Ty::default()),
             Expr::Cast { expr, ty } => {
                 let (c, cty) = self.gen_expr(expr);

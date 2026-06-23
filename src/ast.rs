@@ -184,13 +184,21 @@ pub enum Expr {
     /// A `switch` used in value position (`var x = switch (e) { … }`). Carries the
     /// same shape as the statement form; codegen desugars it to a hoisted temporary
     /// plus a statement `switch` whose arms assign their trailing value to the temp.
-    Switch { subject: Box<Expr>, cases: Vec<Case>, default: Option<Vec<Stmt>> },
+    Switch {
+        subject: Box<Expr>,
+        cases: Vec<Case>,
+        default: Option<Vec<Stmt>>,
+    },
 
     /// An `if`/`else` used in value position (`var x = if (c) a else b`, or an
     /// `if`-expression as an array-comprehension body). Each branch is a block or a
     /// nested value `if`; codegen desugars it like a value `switch` — a hoisted
     /// temporary plus a statement `if` whose branches assign their trailing value.
-    If { cond: Box<Expr>, then: Box<Expr>, els: Option<Box<Expr>> },
+    If {
+        cond: Box<Expr>,
+        then: Box<Expr>,
+        els: Option<Box<Expr>>,
+    },
 
     /// A brace-delimited block used in value position. Its value is the trailing
     /// expression statement (`{ … ; v }` → `v`). Codegen hoists the statements and

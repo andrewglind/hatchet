@@ -17,7 +17,11 @@ fn find_gxx() -> Option<String> {
         Some(r"C:\msys64\mingw32\bin\g++.exe".to_string()),
     ];
     candidates.into_iter().flatten().find(|c| {
-        Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+        Command::new(c)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     })
 }
 
@@ -118,9 +122,16 @@ fn key_value_iteration_compiles_and_runs() {
         .unwrap_or(false);
     assert!(gen_ok, "transpiling the key-value demo failed");
 
-    let exe = out.join(if cfg!(windows) { "kviter.exe" } else { "kviter" });
+    let exe = out.join(if cfg!(windows) {
+        "kviter.exe"
+    } else {
+        "kviter"
+    });
     let mut cmd = Command::new(&gxx);
-    cmd.args(["-std=c++98", "-pedantic", "-Wall"]).arg("-I").arg(&out).arg(&main_cpp);
+    cmd.args(["-std=c++98", "-pedantic", "-Wall"])
+        .arg("-I")
+        .arg(&out)
+        .arg(&main_cpp);
     for f in cpp_files(&out) {
         cmd.arg(f);
     }
@@ -136,8 +147,20 @@ fn key_value_iteration_compiles_and_runs() {
     let stdout = String::from_utf8_lossy(&run.stdout);
     let _ = std::fs::remove_dir_all(&root);
 
-    assert!(stdout.contains("sumIndexed=80"), "statement Array key-value wrong:\n{stdout}");
-    assert!(stdout.contains("sumValues=3"), "statement Map key-value wrong:\n{stdout}");
-    assert!(stdout.contains("indices=2,0,1"), "comprehension Array key-value wrong:\n{stdout}");
-    assert!(stdout.contains("incremented=2,3"), "comprehension Map key-value wrong:\n{stdout}");
+    assert!(
+        stdout.contains("sumIndexed=80"),
+        "statement Array key-value wrong:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("sumValues=3"),
+        "statement Map key-value wrong:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("indices=2,0,1"),
+        "comprehension Array key-value wrong:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("incremented=2,3"),
+        "comprehension Map key-value wrong:\n{stdout}"
+    );
 }

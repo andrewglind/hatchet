@@ -16,7 +16,11 @@ fn find_gxx() -> Option<String> {
         Some(r"C:\msys64\mingw32\bin\g++.exe".to_string()),
     ];
     candidates.into_iter().flatten().find(|c| {
-        Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+        Command::new(c)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     })
 }
 
@@ -113,9 +117,16 @@ fn value_if_expressions_compile_and_run() {
         .unwrap_or(false);
     assert!(gen_ok, "transpiling the value-if demo failed");
 
-    let exe = out.join(if cfg!(windows) { "ifexpr.exe" } else { "ifexpr" });
+    let exe = out.join(if cfg!(windows) {
+        "ifexpr.exe"
+    } else {
+        "ifexpr"
+    });
     let mut cmd = Command::new(&gxx);
-    cmd.args(["-std=c++98", "-pedantic", "-Wall"]).arg("-I").arg(&out).arg(&main_cpp);
+    cmd.args(["-std=c++98", "-pedantic", "-Wall"])
+        .arg("-I")
+        .arg(&out)
+        .arg(&main_cpp);
     for f in cpp_files(&out) {
         cmd.arg(f);
     }
@@ -131,7 +142,16 @@ fn value_if_expressions_compile_and_run() {
     let stdout = String::from_utf8_lossy(&run.stdout);
     let _ = std::fs::remove_dir_all(&root);
 
-    assert!(stdout.contains("classify=-1,0,6"), "if/else-if/else comprehension body wrong:\n{stdout}");
-    assert!(stdout.contains("positives=1,3"), "no-else filter wrong:\n{stdout}");
-    assert!(stdout.contains("pick=yes,no"), "value if-expression wrong:\n{stdout}");
+    assert!(
+        stdout.contains("classify=-1,0,6"),
+        "if/else-if/else comprehension body wrong:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("positives=1,3"),
+        "no-else filter wrong:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("pick=yes,no"),
+        "value if-expression wrong:\n{stdout}"
+    );
 }

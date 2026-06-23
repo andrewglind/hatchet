@@ -86,7 +86,10 @@ impl<'a> BodyGen<'a> {
             // (via the C++ leaf name, so a `@:native`-renamed type resolves too).
             let bare = e.base.rsplit("::").next().unwrap_or(&e.base);
             if let Some(info) = self.prog.resolve_type_by_cpp(bare, self.mi).cloned() {
-                return Ty { info: Some(info), ..e };
+                return Ty {
+                    info: Some(info),
+                    ..e
+                };
             }
         }
         e

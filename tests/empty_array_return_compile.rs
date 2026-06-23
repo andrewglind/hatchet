@@ -16,7 +16,11 @@ fn find_gxx() -> Option<String> {
         Some(r"C:\msys64\mingw32\bin\g++.exe".to_string()),
     ];
     candidates.into_iter().flatten().find(|c| {
-        Command::new(c).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+        Command::new(c)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     })
 }
 
@@ -93,9 +97,16 @@ fn empty_array_return_compiles_and_runs() {
         .unwrap_or(false);
     assert!(gen_ok, "transpiling the empty-array demo failed");
 
-    let exe = out.join(if cfg!(windows) { "emptyarr.exe" } else { "emptyarr" });
+    let exe = out.join(if cfg!(windows) {
+        "emptyarr.exe"
+    } else {
+        "emptyarr"
+    });
     let mut cmd = Command::new(&gxx);
-    cmd.args(["-std=c++98", "-pedantic", "-Wall"]).arg("-I").arg(&out).arg(&main_cpp);
+    cmd.args(["-std=c++98", "-pedantic", "-Wall"])
+        .arg("-I")
+        .arg(&out)
+        .arg(&main_cpp);
     for f in cpp_files(&out) {
         cmd.arg(f);
     }
@@ -107,10 +118,18 @@ fn empty_array_return_compiles_and_runs() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    let run = Command::new(&exe).output().expect("run the empty-array demo");
+    let run = Command::new(&exe)
+        .output()
+        .expect("run the empty-array demo");
     let stdout = String::from_utf8_lossy(&run.stdout);
     let _ = std::fs::remove_dir_all(&root);
 
-    assert!(stdout.contains("empty=0"), "empty array return wrong:\n{stdout}");
-    assert!(stdout.contains("some=3,3"), "populated array return wrong:\n{stdout}");
+    assert!(
+        stdout.contains("empty=0"),
+        "empty array return wrong:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("some=3,3"),
+        "populated array return wrong:\n{stdout}"
+    );
 }

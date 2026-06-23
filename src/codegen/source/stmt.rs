@@ -617,7 +617,11 @@ impl<'a> BodyGen<'a> {
                 let lv = self.loop_var(var);
                 // `0...arr.length` compares an `int` counter against `size()` (size_t);
                 // cast the counter to silence MSVC's C4018, as the body comparisons do.
-                let lcmp = if ety.unsigned { format!("(size_t){lv}") } else { lv.clone() };
+                let lcmp = if ety.unsigned {
+                    format!("(size_t){lv}")
+                } else {
+                    lv.clone()
+                };
                 let _ = writeln!(out, "{t}for (int {lv} = {s}; {lcmp} < {e}; ++{lv}) {{");
                 self.gen_block_inner(body, ind + 1, out);
                 self.emit_owned_deletes(out, ind + 1);
@@ -799,7 +803,11 @@ impl<'a> BodyGen<'a> {
                 let (e, ety) = self.gen_expr(end);
                 self.define_local(var, int_ty());
                 let lv = self.loop_var(var);
-                let lcmp = if ety.unsigned { format!("(size_t){lv}") } else { lv.clone() };
+                let lcmp = if ety.unsigned {
+                    format!("(size_t){lv}")
+                } else {
+                    lv.clone()
+                };
                 (
                     format!("{t}for (int {lv} = {s}; {lcmp} < {e}; ++{lv}) {{\n"),
                     format!("{t}}}\n"),
@@ -896,7 +904,10 @@ impl<'a> BodyGen<'a> {
                         // `for (index => value in array)`: the key is the Int index.
                         self.define_local(var, int_ty());
                         self.define_local(vv, elem);
-                        let _ = write!(hdr, "{t}\tint {var} = (int){idx};\n{t}\t{espell} {vv} = {access}[{idx}];\n");
+                        let _ = write!(
+                            hdr,
+                            "{t}\tint {var} = (int){idx};\n{t}\t{espell} {vv} = {access}[{idx}];\n"
+                        );
                     } else {
                         self.define_local(var, elem);
                         let _ = writeln!(hdr, "{t}\t{espell} {var} = {access}[{idx}];");
@@ -928,8 +939,15 @@ impl<'a> BodyGen<'a> {
                 self.expected = elem_hint.clone();
                 let (bcode, bty) = self.gen_expr(e);
                 self.expected = None;
-                let inner = if bty.base.is_empty() { "int".to_string() } else { self.decl_spelling(&bty) };
-                (format!("{t}\t{tmp}.push_back({bcode});\n"), format!("std::vector<{inner} >"))
+                let inner = if bty.base.is_empty() {
+                    "int".to_string()
+                } else {
+                    self.decl_spelling(&bty)
+                };
+                (
+                    format!("{t}\t{tmp}.push_back({bcode});\n"),
+                    format!("std::vector<{inner} >"),
+                )
             }
             ComprBody::KeyValue(k, v) => {
                 let (kcode, _) = self.gen_expr(k);
@@ -1505,7 +1523,9 @@ impl<'a> BodyGen<'a> {
     /// The result type of a value-position `if`: the type of the first branch's
     /// trailing value expression, inferred without emitting.
     fn if_expr_ty(&mut self, then: &Expr, els: Option<&Expr>) -> Ty {
-        let value = branch_value_expr(then).or_else(|| els.and_then(branch_value_expr)).cloned();
+        let value = branch_value_expr(then)
+            .or_else(|| els.and_then(branch_value_expr))
+            .cloned();
         match value {
             Some(e) => self.dry_ty(&e),
             None => Ty::default(),

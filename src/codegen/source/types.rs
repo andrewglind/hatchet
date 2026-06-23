@@ -99,7 +99,15 @@ impl<'a> BodyGen<'a> {
                 let base = v.trim_end_matches('*').trim().to_string();
                 let bare = base.rsplit("::").next().unwrap_or(&base);
                 let info = self.prog.resolve_type_by_cpp(bare, self.mi).cloned();
-                return (key, Ty { base, is_ptr, info, ..Default::default() });
+                return (
+                    key,
+                    Ty {
+                        base,
+                        is_ptr,
+                        info,
+                        ..Default::default()
+                    },
+                );
             }
         }
         (Ty::default(), Ty::default())
@@ -266,7 +274,14 @@ impl<'a> BodyGen<'a> {
             }
             _ => None,
         };
-        Ty { base, is_ptr, info, nullable: false, unsigned: false, iter: None }
+        Ty {
+            base,
+            is_ptr,
+            info,
+            nullable: false,
+            unsigned: false,
+            iter: None,
+        }
     }
 
     /// The `Ty` of a callee parameter, folding in optionality. `param_decl`
@@ -393,7 +408,12 @@ impl<'a> BodyGen<'a> {
             // the C++ leaf name so a `@:native`-renamed element type is found too.
             let bare = base.rsplit("::").next().unwrap_or(&base);
             let info = self.prog.resolve_type_by_cpp(bare, self.mi).cloned();
-            return Ty { base, is_ptr, info, ..Default::default() };
+            return Ty {
+                base,
+                is_ptr,
+                info,
+                ..Default::default()
+            };
         }
         Ty::default()
     }

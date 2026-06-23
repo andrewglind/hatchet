@@ -24,14 +24,14 @@ C++98, then copy the generated `.h`/`.cpp` to the target and build them with the
 ## Status
 
 Hatchet is a working transpiler with a real lexer, recursive-descent parser, typed AST, semantic
-model, and C++ code generator. A bundled [standalone example](examples/shapes) is transpiled, compiled
-under `g++ -std=c++98`, run, and output-checked by the test suite, and the generated output has been
-**built with Visual C++ 6.0 and run on Windows 98** — the primary target — closing the loop from Haxe
-source to a running legacy binary. Hatchet has additionally been validated against a larger,
-real-world C++ codebase.
+model, and C++ code generator. [**anachrjsonistic**](https://github.com/andrewglind/anachrjsonistic) — a
+small, standalone JSON parser — has been implemented in Haxe and transpiled with Hatchet. The generated 
+output has been **built with Visual C++ 6.0 and run on Windows 98** — the primary target — closing the loop from Haxe
+source to a running legacy binary. Hatchet has additionally been validated against a larger, 
+real-world (closed source) C++ game engine.
 
 Hatchet **fails loudly rather than guessing** — an unresolvable type or an unsupported idiom is a hard
-error that skips that module and fails the run — and it **always generates the `StdAfx.h` prelude**, so
+error that skips that module and fails the run — and it **always generates the prelude**, so
 a standalone project compiles with no boilerplate.
 
 ## Quick start
@@ -40,11 +40,7 @@ a standalone project compiles with no boilerplate.
 cargo build --release      # optimized binary at target/release/hatchet
 
 # Transpile a whole project — Hatchet crawls --src recursively for .hx
-hatchet --src path/to/project --out path/to/output --force
-
-# Preview on stdout, or validate without writing anything
-hatchet --src src/Button.hx --stdout
-hatchet --src . --dry-run
+hatchet --src path/to/project --out path/to/output
 ```
 
 Requirements: **Rust** (stable, via [rustup](https://rustup.rs)) and a **C++98 toolchain** to build the
@@ -80,7 +76,6 @@ Full documentation lives in the **[Hatchet Wiki](https://github.com/andrewglind/
 - **[Architecture](https://github.com/andrewglind/hatchet/wiki/Architecture)** — the pipeline and `src/` module map
 - **[Diagnostics](https://github.com/andrewglind/hatchet/wiki/Diagnostics)** — fail-loud behaviour and currently-unsupported idioms
 - **[The Prelude](https://github.com/andrewglind/hatchet/wiki/The-Prelude)** — standalone projects and the generated `StdAfx.h`
-- **[Validation](https://github.com/andrewglind/hatchet/wiki/Validation)** — the test suite, anachrjsonistic, the native boundary contract
 
 ## License
 

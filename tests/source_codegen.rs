@@ -2000,8 +2000,14 @@ class M {
     let out = generate_source(&prog, idx).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(out.contains("std::map<std::string, int>::const_iterator"), "map iterator type:\n{out}");
-    assert!(out.contains(".begin();") && out.contains(".end();"), "iterator bounds:\n{out}");
+    assert!(
+        out.contains("std::map<std::string, int>::const_iterator"),
+        "map iterator type:\n{out}"
+    );
+    assert!(
+        out.contains(".begin();") && out.contains(".end();"),
+        "iterator bounds:\n{out}"
+    );
     // `for (v in m)` binds the value only.
     assert!(
         out.contains("int v = ") && out.contains("->second;"),
@@ -3653,6 +3659,10 @@ class Title extends Scene {
 }
 ";
     let head = gen_header(src, "Title");
+    assert!(
+        !head.contains("class Scene"),
+        "produce-proxy base is not emitted:\n{head}"
+    );
     assert!(
         !head.contains("class Scene"),
         "produce-proxy base is not emitted:\n{head}"
