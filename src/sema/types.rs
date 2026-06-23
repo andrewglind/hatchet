@@ -31,6 +31,8 @@ pub fn map_primitive(name: &str) -> Option<&'static str> {
         "StringBuf" => "std::string",
         // hxcpp's `cpp.StdString` interop type is a `std::string`.
         "StdString" => "std::string",
+        // hxcpp's `cpp.ConstCharStar` interop type is a C string.
+        "ConstCharStar" => "const char*",
         "UInt8" => "uint8_t",
         "UInt16" => "uint16_t",
         "UInt32" => "uint32_t",
@@ -81,6 +83,7 @@ mod tests {
         assert_eq!(map_primitive("Single"), Some("float"));
         assert_eq!(map_primitive("Float64"), Some("double"));
         assert_eq!(map_primitive("String"), Some("std::string"));
+        assert_eq!(map_primitive("ConstCharStar"), Some("const char*"));
         assert_eq!(map_primitive("UInt32"), Some("uint32_t"));
         // `Dynamic`/`Any` are no longer primitives — they are the overload marker.
         assert_eq!(map_primitive("Dynamic"), None);
