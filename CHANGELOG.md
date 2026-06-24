@@ -3,6 +3,36 @@
 All notable changes to Hatchet are documented here. Versions follow the
 project's milestones.
 
+## v0.2.6 — Scalar type ascriptions (2026-06-25)
+
+A correctness release: a scalar-numeric type-check expression now emits a real C++ cast, so the ascribed
+arithmetic type is honoured at the value level instead of being silently narrowed. No breaking changes.
+
+### `(expr : Type)` pins the C++ arithmetic type
+
+A type-check / ascription expression `(expr : Type)` was treated as a pure compile-time hint: the inner
+expression was emitted unchanged and only its *internal* type was relabelled. For a scalar-numeric target
+that lost the developer's intent — `(Std.parseFloat(s) : cpp.Float32)` still emitted a `double` (`atof`),
+and `(0.0 : cpp.Float32)` a `double` literal, so a `cpp.Float32`-returning function silently narrowed its
+result on `return`.
+
+When the ascribed type is a built-in arithmetic scalar (`Int`, `Float`, `Single`/`cpp.Float32`, `Bool`,
+the fixed-width integers, …), Hatchet now emits an explicit C cast to that type, matching what hxcpp
+generates:
+
+```haxe
+function toFloat(s:String):cpp.Float32 {
+  return (s != null) ? (Std.parseFloat(s) : cpp.Float32) : (0.0 : cpp.Float32);
+}
+```
+
+now lowers both arms to `float` — `((float) atof(s.c_str()))` and `((float) 0.0)` — so the ternary type
+matches the `float` return with no implicit narrowing.
+
+Non-scalar ascriptions keep the existing no-op behaviour: a class-typed `null` (`(null : Widget)`), an
+empty container literal (`([] : Array<Int>)`), or a `String` adopt the ascribed type without an unwanted
+or unbuildable cast.
+
 ## v0.2.5 — Haxe-aligned `untyped` & `cpp.ConstCharStar` (2026-06-24)
 
 A correctness release: `untyped` now matches Haxe's actual semantics, raw C++ injection moves to the
