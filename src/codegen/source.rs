@@ -1051,6 +1051,26 @@ fn int_ty() -> Ty {
     }
 }
 
+/// Whether a `Ty` is a built-in arithmetic scalar (an integral or floating C++
+/// type) — the set for which a type ascription `(expr : T)` is honoured with a
+/// real C cast rather than a no-op. `std::string`, `const char*`, pointers,
+/// containers, and user/native types are excluded (casting those is either
+/// unnecessary or unbuildable).
+fn is_arith_scalar(ty: &Ty) -> bool {
+    !ty.is_ptr
+        && matches!(
+            ty.base.as_str(),
+            "int"
+                | "unsigned int"
+                | "float"
+                | "double"
+                | "bool"
+                | "uint8_t"
+                | "uint16_t"
+                | "uint32_t"
+        )
+}
+
 /// A Haxe `Int`-typed value backed by an unsigned C++ `size_t` (`.length` →
 /// `.size()`/`.length()`). Modelled as `int` for member lookup and arithmetic, but
 /// flagged `unsigned` so a comparison against a signed `int` gets the explicit

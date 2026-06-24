@@ -682,13 +682,23 @@ impl<'a> BodyGen<'a> {
                     None => (c, cty),
                 }
             }
-            // `(expr : Type)` is a compile-time type ascription with no runtime
-            // effect — emit the inner expression unchanged, but honor the ascribed
-            // type (it is exactly the hint for cases like `([] : Array<Int>)` or
-            // `(null : Foo)`, where the inner expression's own type is uninformative).
+            // `(expr : Type)` is a compile-time type ascription. For a scalar-numeric
+            // target (`(Std.parseFloat(s) : cpp.Float32)`, `(0 : Float)`) it is the
+            // developer pinning the value's C++ arithmetic type, so emit a real C cast —
+            // otherwise the value keeps its own type (e.g. a `double` ternary) and
+            // silently narrows/ignores the hint. For non-scalar targets (a class-typed
+            // `null`, an empty `Array<Int>` literal, a `String`) it stays a no-op:
+            // adopt the ascribed type, emit the inner expression unchanged (a cast there
+            // would be unnecessary or unbuildable).
             Expr::TypeCheck { expr, ty } => {
-                let (c, _) = self.gen_expr(expr);
-                (c, self.ty_of(ty))
+                let (c, cty) = self.gen_expr(expr);
+                let aty = self.ty_of(ty);
+                if is_arith_scalar(&aty) && cty.base != aty.base {
+                    let target = self.prog.map_type_use(ty, self.mi, &self.ns);
+                    (format!("(({target}) {c})"), aty)
+                } else {
+                    (c, aty)
+                }
             }
         }
     }

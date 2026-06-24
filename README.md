@@ -1,38 +1,44 @@
-# Hatchet
+# Hatchet 🪓
 
-**Hatchet** is a transpiler from [Haxe](https://haxe.org) 4.x to **C++98** — portable source that
-compiles under **Visual C++ 6.0**, and therefore targets legacy platforms such as **Windows 9x** and
-older Unix toolchains. It is a *transpiler*, not a compiler: it emits C++ source you then build on the
-target, and it never produces a custom C++ runtime. Supported Haxe constructs map to an equivalent,
-hand-writable C++ idiom. Hatchet implements a focused subset of Haxe 4.x; it is **not** a drop-in for hxcpp.
+### Write modern [Haxe](https://haxe.org). Run it on Windows 98.
 
-> **hxcpp compatibility is compile-time only.** A guiding principle of Hatchet is that the Haxe you
-> write always *compiles* under hxcpp (Haxe's official C++ backend), so the source stays valid,
-> portable Haxe you can keep editing and type-checking with normal Haxe tooling. Hatchet makes **no
-> guarantee that the hxcpp build runs** or behaves identically — the supported, authoritative runtime
-> is the **C++98 that Hatchet emits**. The two targets can diverge at runtime (most notably value vs.
-> reference semantics: a Hatchet value class / `abstract` is a flat value, while under hxcpp the same
-> type may be a heap object). Validate behaviour on the transpiled C++98, never on an hxcpp build.
+**Hatchet transpiles Haxe 4.x to portable C++98** — source so old-school it builds under **Visual C++ 6.0** and runs on **Windows 9x** and vintage Unix toolchains. Develop on a 2026 machine with full Haxe tooling; ship a binary to a 1998 one.
 
-## Motivation
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
+[![Latest release](https://img.shields.io/github/v/release/andrewglind/hatchet?sort=semver)](https://github.com/andrewglind/hatchet/releases)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Target: VC++ 6.0 / Win98](https://img.shields.io/badge/target-VC%2B%2B%206.0%20%2F%20Win98-9cf)](https://github.com/andrewglind/hatchet/wiki)
 
-hxcpp (Haxe's official C++ backend) cannot target C++ revisions older than C++11, which has
-traditionally put Haxe 4.x out of reach for retro and embedded platforms — Windows 98 + VC6, early
-Linux, and similar. Hatchet bridges that gap: develop in Haxe on a modern machine, transpile to
-C++98, then copy the generated `.h`/`.cpp` to the target and build them with the old toolchain.
+![Haxe, transpiled by Hatchet, running on Windows 98](demo.png)
 
-## Status
+<p align="center"><em>Everything on screen — cursor, dialog box, actor, backdrop, walkbox, A&#42; pathfinding — is game logic written in Haxe and transpiled to C++98 by Hatchet, layered over a hand-written C++ engine. Built with Visual&nbsp;C++&nbsp;6.0, running on real period hardware. No emulator.</em></p>
 
-Hatchet is a working transpiler with a real lexer, recursive-descent parser, typed AST, semantic
-model, and C++ code generator. [**anachrjsonistic**](https://github.com/andrewglind/anachrjsonistic) — a
-small, standalone JSON parser — has been implemented in Haxe and transpiled with Hatchet. The generated 
-output has been **built with Visual C++ 6.0 and run on Windows 98** — the primary target — closing the loop from Haxe
-source to a running legacy binary. Hatchet has additionally been validated against a larger, 
-real-world (closed source) C++ game engine.
+> **Is this for you?**
+> **Yes** — if you want to ship Haxe to retro or embedded targets that hxcpp can't reach.
+> **No** — it's not a drop-in hxcpp replacement; it implements a focused subset of Haxe 4.x.
 
-Hatchet **fails loudly rather than guessing** — an unresolvable type or an unsupported idiom is a hard
-error that skips that module and fails the run — and it **always generates the prelude**, so
-a standalone project compiles with no boilerplate.
+## Why?
+
+hxcpp — Haxe's official C++ backend — can't target anything older than C++11. That has always
+put Haxe out of reach for retro and embedded platforms: Windows 98 + VC6, early Linux, and friends.
+
+Hatchet bridges the gap. It's a *transpiler*, not a compiler: it emits readable C++ source that maps
+each supported Haxe construct to an equivalent, hand-writable C++98 idiom — no custom runtime, no
+magic. You copy the generated `.h`/`.cpp` to the target and build them with the old toolchain.
+
+## It actually runs
+
+This isn't a toy. Hatchet has a real lexer, recursive-descent parser, typed AST, semantic model, and
+C++ code generator — and the loop is closed end to end:
+
+- 🧩 **[anachrjsonistic](https://github.com/andrewglind/anachrjsonistic)** — a small, standalone JSON
+  parser — was written in Haxe, transpiled by Hatchet, **built with Visual C++ 6.0, and run on
+  Windows 98**.
+- 🎮 Drives the **game-logic module layer of a real, closed-source C++ game engine** — the cursor,
+  dialogue, actors, walkboxes, and A&#42; pathfinding in the screenshot above are all transpiled Haxe.
+- 🔊 **Fails loudly, never guesses** — an unresolvable type or unsupported idiom is a hard error that
+  skips the module and fails the run, so you never ship silently-wrong output.
+- 📦 **Always generates the prelude** — a standalone project compiles with zero boilerplate.
 
 ## Quick start
 
@@ -43,10 +49,20 @@ cargo build --release      # optimized binary at target/release/hatchet
 hatchet --src path/to/project --out path/to/output
 ```
 
-Requirements: **Rust** (stable, via [rustup](https://rustup.rs)) and a **C++98 toolchain** to build the
-generated output (development gate uses `g++ -std=c++98`; the production target is Visual C++ 6.0 up).
-See **[Building & Usage](https://github.com/andrewglind/hatchet/wiki/Building-and-Usage)** for the full
+**Requirements:** [Rust](https://rustup.rs) (stable) and a C++98 toolchain to build the output (the
+dev gate uses `g++ -std=c++98`; the production target is Visual C++ 6.0 and up). See
+**[Building & Usage](https://github.com/andrewglind/hatchet/wiki/Building-and-Usage)** for the full
 CLI and flag table.
+
+## The one caveat worth reading first
+
+> **hxcpp compatibility is compile-time only.** A guiding principle of Hatchet is that the Haxe you
+> write always *compiles* under hxcpp, so the source stays valid, portable Haxe you can keep editing
+> and type-checking with normal Haxe tooling. But Hatchet makes **no guarantee that the hxcpp build
+> runs** or behaves identically — the supported, authoritative runtime is the **C++98 that Hatchet
+> emits**. The two can diverge at runtime (most notably value vs. reference semantics: a Hatchet value
+> class / `abstract` is a flat value, while under hxcpp the same type may be a heap object).
+> **Validate behaviour on the transpiled C++98, never on an hxcpp build.**
 
 ## Documentation
 
@@ -81,6 +97,6 @@ Full documentation lives in the **[Hatchet Wiki](https://github.com/andrewglind/
 
 This project is licensed under the MIT License — see the [LICENSE](LICENSE.md) file for details.
 
-![Hatchy - the Hatchet mascot!](hatchy.png)
+![Hatchy — the Hatchet mascot!](hatchy.png)
 
 (c) 2026 Andrew Grant Lind

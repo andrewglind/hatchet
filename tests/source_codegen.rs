@@ -1751,6 +1751,11 @@ class A {
     var w = (null : Widget);
     var xs = ([] : Array<Int>);
   }
+  // A scalar ascription pins the C++ arithmetic type with a real cast, so the
+  // value does not keep its own (here `double`) type and silently narrow.
+  public function asFloat(s:String):cpp.Float32 {
+    return (Std.parseFloat(s) : cpp.Float32);
+  }
 }
 ";
     let dir = std::env::temp_dir().join(format!("hatchet_ascr_{}", std::process::id()));
@@ -1773,6 +1778,12 @@ class A {
     assert!(
         out.contains("std::vector<int> xs"),
         "empty array literal follows the ascription:\n{out}"
+    );
+    // A scalar ascription emits a real C cast to the ascribed arithmetic type, so a
+    // `double` (here `atof`) is pinned to `float` rather than narrowed implicitly.
+    assert!(
+        out.contains("(float) atof("),
+        "scalar ascription casts to the ascribed arithmetic type:\n{out}"
     );
 }
 
