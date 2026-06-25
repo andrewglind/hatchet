@@ -1,4 +1,4 @@
-# Hatchet 🪓
+# Hatchet
 
 ### Write modern [Haxe](https://haxe.org). Run it on Windows 98.
 
