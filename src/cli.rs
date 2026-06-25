@@ -245,6 +245,18 @@ fn run(args: Args) -> Result<(), String> {
             processed += 1;
             cfg.info(&format!("[{processed}/{total}] {}", module_rel(m, "hx")));
 
+            // Nudge off the legacy `@:decl` / `@:abi` export metadata (now
+            // `@libexport` / `@cexport`) — non-fatal, and emitted before the error
+            // gate so it shows even for a module that later fails validation.
+            let rel_hx = m.path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            for (line, w) in sema::validate::deprecated_meta_warnings(&prog, i) {
+                if line > 0 {
+                    eprintln!("warning: {rel_hx}:{line}: {w}");
+                } else {
+                    eprintln!("warning: {rel_hx}: {w}");
+                }
+            }
+
             // Fail loudly rather than guess: a module that references a type Hatchet
             // cannot resolve — or uses a construct Hatchet does not yet support — is not
             // generated (its output would be silently wrong or non-compiling). Clean
@@ -359,7 +371,7 @@ fn run(args: Args) -> Result<(), String> {
         ));
 
         // Validate each module, and reject the one construct that still needs a
-        // `.cpp`: an `@:abi` `extern "C"` export, whose whole point is a single
+        // `.cpp`: an `@cexport` `extern "C"` export, whose whole point is a single
         // exported symbol in an object file. Plain module-level functions and
         // `final NAME = lambda` free functions are emitted `inline` into the header.
         //
@@ -377,14 +389,22 @@ fn run(args: Args) -> Result<(), String> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
+            // Legacy `@:decl` / `@:abi` deprecation nudge (now `@libexport` / `@cexport`).
+            for (line, w) in sema::validate::deprecated_meta_warnings(&prog, i) {
+                if line > 0 {
+                    eprintln!("warning: {rel}:{line}: {w}");
+                } else {
+                    eprintln!("warning: {rel}: {w}");
+                }
+            }
             let mut me = sema::validate::unresolved_type_errors(&prog, i);
             me.extend(sema::validate::unsupported_construct_errors(&prog, i));
             for d in &m.file.decls {
-                if matches!(d, Decl::Function(f) if crate::ast::has_meta(&f.meta, "abi")) {
+                if matches!(d, Decl::Function(f) if crate::ast::has_meta(&f.meta, "cexport")) {
                     me.push(diag::Diagnostic::error(
                         &rel,
                         0,
-                        "@:abi extern \"C\" exports are not supported in --header-only mode \
+                        "@cexport extern \"C\" exports are not supported in --header-only mode \
                          (an exported symbol needs a .cpp/object file)"
                             .to_string(),
                     ));
@@ -393,7 +413,7 @@ fn run(args: Args) -> Result<(), String> {
                 let name = match d {
                     Decl::Function(f)
                         if !f.modifiers.is_macro
-                            && !crate::ast::has_meta(&f.meta, "abi")
+                            && !crate::ast::has_meta(&f.meta, "cexport")
                             && f.body.is_some() =>
                     {
                         f.name.clone()

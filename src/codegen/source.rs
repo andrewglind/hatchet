@@ -62,18 +62,18 @@ pub fn generate_source_diagnostics(
             _ => None,
         })
         .collect();
-    // `@:abi` functions → `extern "C"` exports defined at global scope.
+    // `@cexport` functions → `extern "C"` exports defined at global scope.
     let extern_fns: Vec<&Function> = m
         .file
         .decls
         .iter()
         .filter_map(|d| match d {
-            Decl::Function(f) if has_meta(&f.meta, "abi") => Some(f),
+            Decl::Function(f) if has_meta(&f.meta, "cexport") => Some(f),
             _ => None,
         })
         .collect();
     // Plain module-level `function name(...) {...}` → namespace free functions
-    // (unlike the lambda form, these have a real signature and body). A `@:abi`
+    // (unlike the lambda form, these have a real signature and body). A `@cexport`
     // function is *not* one of these — it is a global `extern "C"` export.
     let plain_fns: Vec<&Function> = m
         .file
@@ -81,7 +81,7 @@ pub fn generate_source_diagnostics(
         .iter()
         .filter_map(|d| match d {
             Decl::Function(f)
-                if !f.modifiers.is_macro && !has_meta(&f.meta, "abi") && f.body.is_some() =>
+                if !f.modifiers.is_macro && !has_meta(&f.meta, "cexport") && f.body.is_some() =>
             {
                 Some(f)
             }
@@ -272,7 +272,7 @@ pub fn inline_class_defs(prog: &Program, mi: usize, class: &Class) -> SourceOutp
 
 /// `true` if this module-level `final` binds a function/lambda (so it lowers to a
 /// namespace free function). Used by the driver to detect free-function name
-/// clashes and `@:abi` exports in a `--header-only` amalgamation.
+/// clashes and `@cexport` exports in a `--header-only` amalgamation.
 pub fn is_free_fn_global(g: &GlobalVar) -> bool {
     lambda_parts(g).is_some()
 }
@@ -283,7 +283,7 @@ pub fn is_free_fn_global(g: &GlobalVar) -> bool {
 /// is marked `inline` (ODR-safe across the translation units that include the
 /// header). File-local (`private`) functions get an `inline` forward declaration
 /// first so a caller emitted before the definition can still reach them (public
-/// ones are already declared in the header's first pass). `@:abi` `extern "C"`
+/// ones are already declared in the header's first pass). `@cexport` `extern "C"`
 /// exports are excluded — those need their own object file and are rejected by the
 /// driver. Returns namespace-less, one-tab-indented text plus `(warnings, errors)`;
 /// the caller wraps the module's namespace around it.
@@ -309,7 +309,7 @@ pub fn inline_free_fn_defs(prog: &Program, mi: usize) -> SourceOutput {
         .iter()
         .filter_map(|d| match d {
             Decl::Function(f)
-                if !f.modifiers.is_macro && !has_meta(&f.meta, "abi") && f.body.is_some() =>
+                if !f.modifiers.is_macro && !has_meta(&f.meta, "cexport") && f.body.is_some() =>
             {
                 Some(f)
             }

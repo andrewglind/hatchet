@@ -6,7 +6,7 @@
 //! pass must forward-declare it), and (c) the `final NAME = lambda` free-fn form.
 //!
 //! Two further tests need no C++ compiler: a free-function **name clash** across
-//! two modules in one package, and an `@:abi` `extern "C"` export — both must be
+//! two modules in one package, and a `@cexport` `extern "C"` export — both must be
 //! rejected (the amalgamation shares one namespace per package, and an exported
 //! symbol still needs an object file).
 //!
@@ -202,17 +202,17 @@ fn header_only_free_function_name_clash_is_rejected() {
     );
 }
 
-/// An `@:abi` `extern "C"` export needs its own object file, so it stays
+/// A `@cexport` `extern "C"` export needs its own object file, so it stays
 /// unsupported in `--header-only` mode and must be rejected.
 #[test]
-fn header_only_abi_export_is_rejected() {
-    let root = std::env::temp_dir().join(format!("hatchet_honly_abi_{}", std::process::id()));
+fn header_only_cexport_export_is_rejected() {
+    let root = std::env::temp_dir().join(format!("hatchet_honly_cexport_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let lib = root.join("lib");
     std::fs::create_dir_all(&lib).unwrap();
     std::fs::write(
         lib.join("Abi.hx"),
-        "package lib;\n\n@:abi\nfunction exported(x:Int):Int { return x + 1; }\n",
+        "package lib;\n\n@cexport\nfunction exported(x:Int):Int { return x + 1; }\n",
     )
     .unwrap();
 
@@ -230,9 +230,12 @@ fn header_only_abi_export_is_rejected() {
     let stderr = String::from_utf8_lossy(&result.stderr).to_string();
     let _ = std::fs::remove_dir_all(&root);
 
-    assert!(!result.status.success(), "an @:abi export must fail the run");
     assert!(
-        stderr.contains("@:abi") && stderr.contains("--header-only"),
-        "expected an @:abi rejection diagnostic, got:\n{stderr}"
+        !result.status.success(),
+        "a @cexport export must fail the run"
+    );
+    assert!(
+        stderr.contains("@cexport") && stderr.contains("--header-only"),
+        "expected a @cexport rejection diagnostic, got:\n{stderr}"
     );
 }

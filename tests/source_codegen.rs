@@ -481,7 +481,7 @@ fn bare_enum_constant_is_qualified_in_expression_position() {
 fn final_constant_references_are_namespace_qualified() {
     // A public `final` is a `static const` inside its module's namespace, so a
     // reference from another namespace is qualified (`native::MAX_CHARS`), and a
-    // global-scope `@:abi` export qualifies a same-module ref too
+    // global-scope `@cexport` export qualifies a same-module ref too
     // (`game::SCENE_ID`), while a reference from within the same namespace stays
     // bare.
     let native = "\
@@ -499,7 +499,7 @@ class Scene {
   public function id():Int { return SCENE_ID; }          // same ns → bare
 }
 
-@:abi function Pick(n:Int):Int {
+@cexport function Pick(n:Int):Int {
   switch (n) {
     case SCENE_ID: return 1;                              // global scope → game::
     default: return 0;
@@ -3851,17 +3851,17 @@ class User {
 }
 
 #[test]
-fn abi_meta_exports_a_c_abi_function_and_plain_does_not() {
-    // `@:abi` is the C-ABI export (the export/calling-convention macros at
+fn cexport_meta_exports_a_c_abi_function_and_plain_does_not() {
+    // `@cexport` is the C-ABI export (the export/calling-convention macros at
     // global scope); a plain `function` stays a namespace free function.
     let src = "\
-@:abi function pick(n:Int):Int { return n; }
+@cexport function pick(n:Int):Int { return n; }
 function helper(n:Int):Int { return n + 1; }
 ";
     let head = gen_header(src, "Api");
     assert!(
         head.contains("HATCHET_EXPORT int HATCHET_CALL pick(int n)"),
-        "@:abi → a macro-wrapped global export:\n{head}"
+        "@cexport → a macro-wrapped global export:\n{head}"
     );
     assert!(
         head.contains("int helper(int n)"),
@@ -3871,6 +3871,40 @@ function helper(n:Int):Int { return n + 1; }
     assert!(
         !head.contains("HATCHET_EXPORT int HATCHET_CALL helper"),
         "plain fn is not exported:\n{head}"
+    );
+}
+
+#[test]
+fn real_haxe_decl_and_abi_metas_are_inert() {
+    // Haxe's *real* `@:decl` and `@:abi` are inbound-only and do nothing here:
+    // `@:abi` only sets the calling convention of a `cpp.Function<T,Abi>` callback
+    // type (unsupported in C++98 — no `std::function`), and `@:decl` is vestigial
+    // in the Haxe compiler (never read, filtered out of RTTI). Hatchet's outbound
+    // shared-library / `extern "C"` export behaviours moved to `@libexport` / `@cexport`,
+    // so these colon-forms must now be parsed-and-ignored: a plain free function and
+    // a plain class, with no export decoration and no error.
+    let src = "\
+@:abi function pick(n:Int):Int { return n; }
+@:decl class Widget { public function new() {} }
+";
+    let head = gen_header(src, "Inert");
+    // `@:abi` → ordinary namespace free function, NOT a global `extern \"C\"` export.
+    assert!(
+        head.contains("int pick(int n)"),
+        "@:abi fn stays a plain free function:\n{head}"
+    );
+    assert!(
+        !head.contains("HATCHET_EXPORT") && !head.contains("HATCHET_CALL"),
+        "@:abi must not emit the @cexport export macros:\n{head}"
+    );
+    // `@:decl` → ordinary class, NOT a DLL-exported one.
+    assert!(
+        head.contains("class Widget"),
+        "@:decl class is still emitted as a plain class:\n{head}"
+    );
+    assert!(
+        !head.contains("HATCHET_CLASS") && !head.contains("_CLASS Widget"),
+        "@:decl must not emit the @libexport class macro:\n{head}"
     );
 }
 

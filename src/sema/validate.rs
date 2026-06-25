@@ -300,6 +300,73 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
     out
 }
 
+/// Deprecation warnings for the legacy `@:decl` / `@:abi` metadata. Hatchet's
+/// outbound shared-library export and `extern "C"` export behaviours moved to `@libexport`
+/// and `@cexport`; the bare `@:decl` / `@:abi` are now inert (matching Haxe, where
+/// both are inbound-only and `@:decl` is in fact vestigial). This nudges the user
+/// to migrate before the legacy tokens are removed.
+///
+/// Returned as `(line, message)` for the CLI's non-fatal `warning:` channel rather
+/// than a hard [`Diagnostic`] — using them is valid, just outdated. `Meta` carries
+/// no source line, so the location is the enclosing declaration's line when known
+/// (classes/interfaces), else `0` (file-level).
+pub fn deprecated_meta_warnings(prog: &Program, mi: usize) -> Vec<(usize, String)> {
+    let m = &prog.modules[mi];
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let scan = |meta: &[Meta], line: usize, out: &mut Vec<(usize, String)>| {
+        for dep in meta {
+            if let Some(replacement) = deprecated_meta_replacement(&dep.name) {
+                out.push((
+                    line,
+                    format!(
+                        "`@:{}` is deprecated and now ignored — use `@{replacement}` instead",
+                        dep.name
+                    ),
+                ));
+            }
+        }
+    };
+    for d in &m.file.decls {
+        match d {
+            Decl::Class(c) => {
+                scan(&c.meta, c.line, &mut out);
+                for f in c.methods.iter().chain(c.ctor.iter()) {
+                    scan(&f.meta, c.line, &mut out);
+                }
+                for fld in &c.fields {
+                    scan(&fld.meta, c.line, &mut out);
+                }
+            }
+            Decl::Interface(i) => {
+                scan(&i.meta, i.line, &mut out);
+                for f in &i.methods {
+                    scan(&f.meta, i.line, &mut out);
+                }
+                for fld in &i.fields {
+                    scan(&fld.meta, i.line, &mut out);
+                }
+            }
+            Decl::Enum(e) => scan(&e.meta, 0, &mut out),
+            Decl::Typedef(t) => scan(&t.meta, 0, &mut out),
+            Decl::Global(g) => scan(&g.meta, 0, &mut out),
+            Decl::Function(f) => scan(&f.meta, 0, &mut out),
+            Decl::Unsupported { .. } => {}
+        }
+    }
+    out
+}
+
+/// The replacement for a deprecated metadata name (`decl` → `libexport`,
+/// `abi` → `cexport`), or `None` if `name` is not deprecated. The lexer strips the
+/// leading `:`, so this matches both the `@:decl` and `@decl` spellings.
+fn deprecated_meta_replacement(name: &str) -> Option<&'static str> {
+    match name {
+        "decl" => Some("libexport"),
+        "abi" => Some("cexport"),
+        _ => None,
+    }
+}
+
 /// Validate `@proxy("native::Name")` usage: the fully-qualified native C++
 /// class name is a mandatory string argument, it applies only to an `abstract`
 /// newtype or an `abstract class`, and it must name a type declared `extern` with
