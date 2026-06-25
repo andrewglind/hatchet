@@ -137,7 +137,7 @@ pub struct Program {
     /// project can name it e.g. `MyGame`, producing `MyGame.h`).
     pub stdafx_stem: String,
     /// Prefix for the platform export/calling-convention macros emitted around
-    /// `@:abi` functions (default `HATCHET` → `HATCHET_EXPORT`/`HATCHET_CALL`;
+    /// `@cexport` functions (default `HATCHET` → `HATCHET_EXPORT`/`HATCHET_CALL`;
     /// configurable via `--export-macro`).
     pub export_macro: String,
     /// When generated files are written somewhere other than in-place, the
@@ -755,7 +755,7 @@ impl Program {
             // to its `@:native`/namespace-qualified name).
             Decl::Global(g) => !g.is_extern,
             // A function is emitted if it has a body (a free function or a
-            // `@:abi` C-ABI export); a bodyless declaration is not.
+            // `@cexport` C-ABI export); a bodyless declaration is not.
             Decl::Function(f) => f.body.is_some() && !f.modifiers.is_macro,
             // Parsed-and-skipped; nothing to emit (it is flagged unsupported).
             Decl::Unsupported { .. } => false,

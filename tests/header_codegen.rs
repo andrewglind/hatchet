@@ -17,15 +17,15 @@ fn header(prog: &Program, stem: &str) -> String {
 }
 
 #[test]
-fn decl_class_uses_the_portable_export_macro() {
-    // `@:decl class X {}` exports the class from the DLL via the portable
-    // `<PREFIX>_CLASS` macro (default `HATCHET_CLASS`) — never the raw, MSVC-only
-    // `__declspec(dllexport)` token. The prefix is configurable on `Program`.
-    let dir = std::env::temp_dir().join(format!("hatchet_decl_{}", std::process::id()));
+fn libexport_class_uses_the_portable_export_macro() {
+    // `@libexport class X {}` exports the class from the shared library via the
+    // portable `<PREFIX>_CLASS` macro (default `HATCHET_CLASS`) — never the raw,
+    // MSVC-only `__declspec(dllexport)` token. The prefix is configurable on `Program`.
+    let dir = std::env::temp_dir().join(format!("hatchet_libexport_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("Widget.hx"),
-        "package ui;\n@:decl class Widget {\n  public function new() {}\n}\n",
+        "package ui;\n@libexport class Widget {\n  public function new() {}\n}\n",
     )
     .unwrap();
     let mut prog = Program::from_src_dir(&dir).expect("build program");
@@ -36,7 +36,7 @@ fn decl_class_uses_the_portable_export_macro() {
 
     assert!(
         out.contains("class NATIVE_CLASS Widget"),
-        "@:decl → macro-decorated class:\n{out}"
+        "@libexport → macro-decorated class:\n{out}"
     );
     assert!(
         !out.contains("__declspec"),

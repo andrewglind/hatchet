@@ -1,7 +1,28 @@
 # Changelog
 
-All notable changes to Hatchet are documented here. Versions follow the
-project's milestones.
+All notable changes to Hatchet are documented here. Versions follow the project's milestones.
+
+## v0.2.7 — Export metadata `@libexport` / `@cexport` (2026-06-26)
+
+A metadata-correctness release with **a breaking rename** (deprecation path is provided).
+
+### Haxe-faithful `@:decl` / `@:abi`; export behaviours move to `@libexport` / `@cexport`
+
+Hatchet repurposed `@:decl` and `@:abi` for *outbound* (producing) C++:
+`@:decl` decorated a class for shared-library export (`<PREFIX>_CLASS`), and `@:abi`
+turned a free function into a global `extern "C"` export. The Haxe compiler
+source shows both metadata are **inbound-only** and unrelated to that, So the two 
+Hatchet behaviours have been renamed to dedicated custom metadata,
+and `@:decl` / `@:abi` are now **parsed and ignored**.
+
+Using `@:decl` / `@:abi` tokens now emits a non-fatal **deprecation
+warning** naming the replacement.
+
+Bare `@:decl` / `@:abi` now have no effect beyond the warning, and will be removed in a future release.
+
+#### Migration steps
+- replace `@:decl` on an exported class with `@libexport`
+- replace `@:abi` on an exported function with `@cexport`
 
 ## v0.2.6 — Scalar type ascriptions (2026-06-25)
 

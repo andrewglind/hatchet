@@ -3,7 +3,9 @@
 //! errors.
 
 use hatchet::diag::Severity;
-use hatchet::sema::validate::{unresolved_type_errors, unsupported_construct_errors};
+use hatchet::sema::validate::{
+    deprecated_meta_warnings, unresolved_type_errors, unsupported_construct_errors,
+};
 use hatchet::sema::Program;
 
 /// Build a `Program` from a single synthetic `.hx` file in a fresh temp dir.
@@ -19,6 +21,47 @@ fn program_from(stem: &str, src: &str) -> (Program, usize) {
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     (prog, idx)
+}
+
+#[test]
+fn legacy_decl_and_abi_metas_warn_with_replacement() {
+    // The legacy export metadata `@:decl` (class shared-library export) and `@:abi`
+    // (`extern "C"` function export) were renamed to `@libexport` / `@cexport`. Using
+    // the old tokens must emit a non-fatal deprecation warning naming the replacement
+    // — the class hit carries its source line (1), the free function is file-level (0).
+    let (prog, idx) = program_from(
+        "Legacy",
+        "@:decl class Widget {\n  public function new() {}\n}\n@:abi function pick(n:Int):Int { return n; }\n",
+    );
+    let warns = deprecated_meta_warnings(&prog, idx);
+
+    let decl = warns
+        .iter()
+        .find(|(_, w)| w.contains("@:decl"))
+        .unwrap_or_else(|| panic!("no @:decl warning in {warns:?}"));
+    assert!(
+        decl.1.contains("@libexport") && decl.1.contains("deprecated") && decl.0 == 1,
+        "@:decl should point to @libexport on line 1: {decl:?}"
+    );
+
+    let abi = warns
+        .iter()
+        .find(|(_, w)| w.contains("@:abi"))
+        .unwrap_or_else(|| panic!("no @:abi warning in {warns:?}"));
+    assert!(
+        abi.1.contains("@cexport") && abi.1.contains("deprecated"),
+        "@:abi should point to @cexport: {abi:?}"
+    );
+
+    // The *new* spellings must NOT warn.
+    let (prog2, idx2) = program_from(
+        "Modern",
+        "@libexport class Widget {\n  public function new() {}\n}\n@cexport function pick(n:Int):Int { return n; }\n",
+    );
+    assert!(
+        deprecated_meta_warnings(&prog2, idx2).is_empty(),
+        "@libexport / @cexport must not be flagged as deprecated"
+    );
 }
 
 #[test]

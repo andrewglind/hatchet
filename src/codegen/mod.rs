@@ -445,7 +445,7 @@ impl<'a> HeaderGen<'a> {
     /// The namespace-wrapped body of the header: forward declarations, public
     /// `final` constants, the type declarations (with inline constructor/method
     /// bodies when `inline_bodies` is set), the free-function declarations, then any
-    /// global-scope `@:abi` `extern "C"` declarations. `build` wraps this in the
+    /// global-scope `@cexport` `extern "C"` declarations. `build` wraps this in the
     /// guard + includes for a standalone per-module header; the header-only
     /// amalgamation concatenates one `section` per module under a single guard.
     fn section(&self) -> HeaderOutput {
@@ -566,7 +566,7 @@ impl<'a> HeaderGen<'a> {
             }
         }
 
-        // `@:abi` functions become `extern "C"` exports at **global scope**
+        // `@cexport` functions become `extern "C"` exports at **global scope**
         // (an `extern "C"` symbol cannot be namespaced), declared with the portable
         // export/calling-convention macros.
         let mut extern_decls = String::new();
@@ -646,12 +646,12 @@ impl<'a> HeaderGen<'a> {
         (out, warnings, errors)
     }
 
-    /// Global-scope declaration for a `@:abi` function:
+    /// Global-scope declaration for a `@cexport` function:
     /// `<P>_EXPORT <ret> <P>_CALL name(params)` (no trailing `;`). Emitted outside
     /// any namespace, so every referenced type is fully qualified (empty namespace
-    /// context). Returns `None` for non-`@:abi` functions.
+    /// context). Returns `None` for non-`@cexport` functions.
     fn extern_fn_decl(&self, f: &Function) -> Option<String> {
-        if !has_meta(&f.meta, "abi") {
+        if !has_meta(&f.meta, "cexport") {
             return None;
         }
         let name = f.name.as_ref()?;
@@ -1013,11 +1013,13 @@ impl<'a> HeaderGen<'a> {
             }
         }
 
-        // `@:decl` exports the class from the DLL. Like `extern inline`, the
-        // platform-specific attribute is emitted via a prelude macro (just the
-        // visibility attribute — no `extern "C"`/calling convention, which would be
-        // invalid on a class) so the output stays portable across compilers.
-        let decl_mod = if has_meta(&c.meta, "decl") {
+        // `@libexport` exports the class from the shared library. Like `extern
+        // inline`, the platform-specific attribute is emitted via a prelude macro
+        // (just the visibility attribute — no `extern "C"`/calling convention, which
+        // would be invalid on a class): `__declspec(dllexport)` on MSVC,
+        // `__attribute__((visibility("default")))` on GCC/Clang, nothing elsewhere —
+        // so the output stays portable across Windows DLLs and Unix `.so`/`.dylib`.
+        let decl_mod = if has_meta(&c.meta, "libexport") {
             format!("{}_CLASS ", self.prog.export_macro)
         } else {
             String::new()
@@ -1351,11 +1353,11 @@ impl<'a> HeaderGen<'a> {
 
     /// Declaration (`ret name(params)`) for a public top-level free function.
     /// Header declaration for a plain module-level `function name(...) {...}`:
-    /// `ret name(params)`. Skips a `@:abi` function (declared as a global
+    /// `ret name(params)`. Skips a `@cexport` function (declared as a global
     /// `extern "C"` export instead) and the bodyless / `macro` forms. Defaults are
     /// kept on the declaration.
     fn plain_fn_decl(&self, f: &Function) -> Option<String> {
-        if f.modifiers.is_macro || has_meta(&f.meta, "abi") {
+        if f.modifiers.is_macro || has_meta(&f.meta, "cexport") {
             return None;
         }
         f.body.as_ref()?;
