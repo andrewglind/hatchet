@@ -230,15 +230,14 @@ impl<'a> BodyGen<'a> {
                 self.prelude_ind = ind;
                 // Returning `cpp.Pointer.ofArray(...).raw` hands back a raw pointer into
                 // a Haxe array that does not outlive the call — it dangles (and a
-                // `const`-ref array parameter won't even compile). Such a "wrap an array
-                // and return its `.raw`" helper also bypasses the fixed-array copy that
-                // the *inline* idiom gets. Warn and point at inlining at the use site.
+                // `const`-ref array parameter won't even compile). Warn and point at
+                // inlining at the use site.
                 if super::expr::as_of_array_raw(super::expr::unwrap_ascription(e)).is_some() {
                     self.warn(
                         "returning `cpp.Pointer.ofArray(...).raw` yields a pointer into a Haxe \
                          array that does not outlive this function — it dangles. Inline \
-                         `cpp.Pointer.ofArray(...).raw` at the use site instead (so the array's \
-                         lifetime covers the pointer, and a fixed C-array field gets a copy)"
+                         `cpp.Pointer.ofArray(...).raw` at the use site instead, so the array's \
+                         lifetime covers the pointer"
                             .to_string(),
                     );
                 }

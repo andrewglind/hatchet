@@ -144,8 +144,8 @@ class Builder {
 #[test]
 fn returning_of_array_raw_warns_about_dangling() {
     // A helper that wraps a Haxe array and returns `cpp.Pointer.ofArray(...).raw`
-    // hands back a pointer into an array that dies with the call — it dangles, and
-    // bypasses the fixed-array copy the inline idiom gets. Returning it must warn.
+    // hands back a pointer into an array that dies with the call — it dangles.
+    // Returning it must warn.
     let src = "\
 class Lib {
   public function new() {}
@@ -218,10 +218,10 @@ class A {
 
 #[test]
 fn of_array_raw_into_bare_local_pointer_warns_not_copies() {
-    // A bare `cpp.RawPointer<T>` local has no backing storage, so the fixed-array copy
-    // must NOT fire (it would write through an uninitialised pointer). It stays a
-    // pointer assignment, and — since a fresh array can only mean "fill fixed storage"
-    // — Hatchet warns and points at inlining.
+    // A bare `cpp.RawPointer<T>` local has no backing storage: `ofArray(...).raw` stays
+    // an ordinary pointer assignment and no element-copy is synthesised (which would
+    // write through an uninitialised pointer). Since a fresh array can only mean "fill
+    // fixed storage", Hatchet warns and points at inlining.
     let src = "\
 class Lib {
   public function new() {}
