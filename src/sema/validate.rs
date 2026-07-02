@@ -55,6 +55,7 @@ fn collect_refs(prog: &Program, mi: usize) -> Collector {
         refs: Vec::new(),
         func_uses: Vec::new(),
         anon_container_uses: Vec::new(),
+        empty_anon_uses: Vec::new(),
     };
     for d in &m.file.decls {
         c.decl(d);
@@ -300,71 +301,34 @@ pub fn unsupported_construct_errors(prog: &Program, mi: usize) -> Vec<Diagnostic
     out
 }
 
-/// Deprecation warnings for the legacy `@:decl` / `@:abi` metadata. Hatchet's
-/// outbound shared-library export and `extern "C"` export behaviours moved to `@libexport`
-/// and `@cexport`; the bare `@:decl` / `@:abi` are now inert (matching Haxe, where
-/// both are inbound-only and `@:decl` is in fact vestigial). This nudges the user
-/// to migrate before the legacy tokens are removed.
+/// Non-fatal deprecation warnings for the module. Currently the only one: using the
+/// empty structure `{}` as a type. It still lowers to `void*`, but that is a Hatchet
+/// invention — in hxcpp `{}` is a structure object, not a raw pointer — and it is now
+/// redundant with the faithful spellings (`Dynamic` for an opaque value, or
+/// `cpp.RawPointer<cpp.Void>` for an opaque pointer). The `void*` lowering will be
+/// removed in a future release; this nudges the user to migrate.
 ///
-/// Returned as `(line, message)` for the CLI's non-fatal `warning:` channel rather
-/// than a hard [`Diagnostic`] — using them is valid, just outdated. `Meta` carries
-/// no source line, so the location is the enclosing declaration's line when known
-/// (classes/interfaces), else `0` (file-level).
-pub fn deprecated_meta_warnings(prog: &Program, mi: usize) -> Vec<(usize, String)> {
-    let m = &prog.modules[mi];
-    let mut out: Vec<(usize, String)> = Vec::new();
-    let scan = |meta: &[Meta], line: usize, out: &mut Vec<(usize, String)>| {
-        for dep in meta {
-            if let Some(replacement) = deprecated_meta_replacement(&dep.name) {
-                out.push((
-                    line,
-                    format!(
-                        "`@:{}` is deprecated and now ignored — use `@{replacement}` instead",
-                        dep.name
-                    ),
-                ));
-            }
-        }
-    };
-    for d in &m.file.decls {
-        match d {
-            Decl::Class(c) => {
-                scan(&c.meta, c.line, &mut out);
-                for f in c.methods.iter().chain(c.ctor.iter()) {
-                    scan(&f.meta, c.line, &mut out);
-                }
-                for fld in &c.fields {
-                    scan(&fld.meta, c.line, &mut out);
-                }
-            }
-            Decl::Interface(i) => {
-                scan(&i.meta, i.line, &mut out);
-                for f in &i.methods {
-                    scan(&f.meta, i.line, &mut out);
-                }
-                for fld in &i.fields {
-                    scan(&fld.meta, i.line, &mut out);
-                }
-            }
-            Decl::Enum(e) => scan(&e.meta, 0, &mut out),
-            Decl::Typedef(t) => scan(&t.meta, 0, &mut out),
-            Decl::Global(g) => scan(&g.meta, 0, &mut out),
-            Decl::Function(f) => scan(&f.meta, 0, &mut out),
-            Decl::Unsupported { .. } => {}
-        }
-    }
-    out
-}
-
-/// The replacement for a deprecated metadata name (`decl` → `libexport`,
-/// `abi` → `cexport`), or `None` if `name` is not deprecated. The lexer strips the
-/// leading `:`, so this matches both the `@:decl` and `@decl` spellings.
-fn deprecated_meta_replacement(name: &str) -> Option<&'static str> {
-    match name {
-        "decl" => Some("libexport"),
-        "abi" => Some("cexport"),
-        _ => None,
-    }
+/// Returned as `(line, message)` for the CLI's non-fatal `warning:` channel. An
+/// anonymous-structure type carries no usable source line, so the location is `0`
+/// (file-level) and the context label identifies the use site instead.
+///
+/// (The legacy `@:decl` / `@:abi` metadata no longer warn — they are real Haxe,
+/// inbound-only metadata that Hatchet simply parses and ignores.)
+pub fn deprecation_warnings(prog: &Program, mi: usize) -> Vec<(usize, String)> {
+    collect_refs(prog, mi)
+        .empty_anon_uses
+        .iter()
+        .map(|ctx| {
+            (
+                0,
+                format!(
+                    "the empty structure `{{}}` ({ctx}) is deprecated as a `void*` spelling and \
+                     will stop lowering to `void*` in a future release — use `Dynamic` for an \
+                     opaque value, or `cpp.RawPointer<cpp.Void>` for an opaque pointer"
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Validate `@proxy("native::Name")` usage: the fully-qualified native C++
@@ -1270,6 +1234,10 @@ struct Collector {
     /// (`Array<{x:Int}>`) — it would lower to a useless `std::vector<void*>`, so it
     /// is flagged; a *named* struct typedef is the supported form.
     anon_container_uses: Vec<(usize, String)>,
+    /// Uses of the empty structure `{}` as a type. It still lowers to `void*`, but
+    /// that is a deprecated Hatchet-ism (in hxcpp `{}` is a structure, not a raw
+    /// pointer); the context label is surfaced as a deprecation warning.
+    empty_anon_uses: Vec<String>,
 }
 
 impl Collector {
@@ -1286,8 +1254,9 @@ impl Collector {
                 let known = map_primitive(name).is_some()
                     || container_template(name).is_some()
                     || name == "Null"
-                    // `cpp.Pointer<T>` lowers to `T*`; its param is still checked below.
-                    || name == "Pointer"
+                    // hxcpp raw-pointer interop types lower to `T*` / `const T*`; the
+                    // param `T` is still checked below.
+                    || matches!(name, "Pointer" | "RawPointer" | "Star" | "ConstStar")
                     || matches!(name, "Dynamic" | "Any")
                     || self.type_params.contains(name);
                 if !known {
@@ -1312,6 +1281,10 @@ impl Collector {
                 }
             }
             Type::Anon(fields) => {
+                if fields.is_empty() {
+                    // `{}` still lowers to `void*`, but that spelling is deprecated.
+                    self.empty_anon_uses.push(ctx.to_string());
+                }
                 for f in fields {
                     self.check(&f.ty, ctx);
                 }

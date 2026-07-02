@@ -245,11 +245,11 @@ fn run(args: Args) -> Result<(), String> {
             processed += 1;
             cfg.info(&format!("[{processed}/{total}] {}", module_rel(m, "hx")));
 
-            // Nudge off the legacy `@:decl` / `@:abi` export metadata (now
-            // `@libexport` / `@cexport`) — non-fatal, and emitted before the error
-            // gate so it shows even for a module that later fails validation.
+            // Non-fatal deprecation nudges (e.g. `{}` as a `void*` spelling), emitted
+            // before the error gate so they show even for a module that later fails
+            // validation.
             let rel_hx = m.path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            for (line, w) in sema::validate::deprecated_meta_warnings(&prog, i) {
+            for (line, w) in sema::validate::deprecation_warnings(&prog, i) {
                 if line > 0 {
                     eprintln!("warning: {rel_hx}:{line}: {w}");
                 } else {
@@ -389,8 +389,8 @@ fn run(args: Args) -> Result<(), String> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            // Legacy `@:decl` / `@:abi` deprecation nudge (now `@libexport` / `@cexport`).
-            for (line, w) in sema::validate::deprecated_meta_warnings(&prog, i) {
+            // Non-fatal deprecation nudges (e.g. `{}` as a `void*` spelling).
+            for (line, w) in sema::validate::deprecation_warnings(&prog, i) {
                 if line > 0 {
                     eprintln!("warning: {rel}:{line}: {w}");
                 } else {

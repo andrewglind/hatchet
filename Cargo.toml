@@ -1,6 +1,6 @@
 [package]
 name = "hatchet"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 description = "Hatchet - a Haxe 4.x to C++98 transpiler for legacy platforms (Visual C++ 6.0, Windows 9x, older Unix)"
 license = "MIT"
