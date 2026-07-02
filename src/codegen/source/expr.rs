@@ -125,7 +125,26 @@ impl<'a> BodyGen<'a> {
         None
     }
 
+    /// A value-struct parameter is lowered to `const T&`, so an assignment whose root
+    /// lvalue is such a parameter (`r = …`, `r.field = …`, `r.field[i] = …`) cannot
+    /// compile — and silently differs from Haxe, where structs are by-reference and
+    /// the caller *would* see the mutation. Fail loudly rather than emit broken C++.
+    pub(super) fn flag_const_param_write(&mut self, target: &Expr) {
+        if let Some(root) = lvalue_root_ident(target) {
+            if self.value_struct_params.contains(root) {
+                self.err(format!(
+                    "cannot assign to `{root}` or its fields: a value-struct parameter is lowered \
+                     to C++ `const&` and cannot be mutated in place. Copy it into a local first, \
+                     or — if the caller should see the change — pass it as a class or `Null<T>`"
+                ));
+            }
+        }
+    }
+
     pub(super) fn gen_assign_or_expr(&mut self, e: &Expr) -> (String, Ty) {
+        if let Expr::Assign { target, .. } = e {
+            self.flag_const_param_write(target);
+        }
         if let Expr::Assign {
             op: None,
             target,
@@ -189,6 +208,31 @@ impl<'a> BodyGen<'a> {
                 if tty.info.is_some() && !tty.base.is_empty() {
                     let tmp = self.hoist_object(fields, tty);
                     return (format!("{tcode} = {tmp}"), Ty::default());
+                }
+            }
+            // `dest = cpp.Pointer.ofArray(SRC).raw` does NOT fill fixed C-array storage.
+            // A bare `.raw` is just a pointer (`&SRC[0]`), good only for an immediate
+            // native call: it cannot populate a native `T[N]` field (a C array is
+            // non-assignable), and into a genuine `T*` field it merely aliases SRC's
+            // buffer. The portable way to fill fixed storage is an explicit element loop:
+            // `for (i in 0...src.length) dest[i] = src[i];`. Warn when this reads as a
+            // fill — a non-local target (a struct field/element) or a *fresh* source
+            // (literal/comprehension, which can only mean "fill") — then let `.raw` lower
+            // to its ordinary pointer assignment below (illegal/dangling for fixed storage,
+            // so the C++ compiler rejects it too — fail loud).
+            if let Some(src) = as_of_array_raw(value) {
+                let into_storage = !matches!(&**target, Expr::Ident(_));
+                let fresh_src = matches!(
+                    unwrap_ascription(src),
+                    Expr::ArrayLit(_) | Expr::Comprehension { .. }
+                );
+                if into_storage || fresh_src {
+                    self.warn(
+                        "`cpp.Pointer.ofArray(...).raw` does not fill fixed C-array storage; \
+                         populate a native `T[N]` field with an explicit element loop instead: \
+                         `for (i in 0...src.length) dest[i] = src[i];`"
+                            .to_string(),
+                    );
                 }
             }
             // plain reassignment: warn when a nullable value lands in a
@@ -625,8 +669,15 @@ impl<'a> BodyGen<'a> {
             Expr::NullCoalesce(a, b) => self.gen_null_coalesce(a, b),
             Expr::SafeField(recv, field) => self.gen_safe_field(recv, field),
             Expr::ArrayLit(elems) => {
-                // Inline array literal → hoisted vector temporary.
-                let vec_ty = self.infer_array(elems);
+                // Inline array literal → hoisted vector temporary. A contextual element
+                // type (an ascription `[…] : Array<cpp.UInt8>`, or an assignment target)
+                // pins the element type — honour it so the literal builds with that type
+                // rather than inferring `int`/`double` from its members and clashing.
+                let vec_ty = self
+                    .expected
+                    .clone()
+                    .filter(|t| t.base.starts_with("std::vector"))
+                    .unwrap_or_else(|| self.infer_array(elems));
                 let elem = self.element_ty(&vec_ty);
                 let tmp = self.fresh("arr");
                 let mut buf = String::new();
@@ -691,8 +742,21 @@ impl<'a> BodyGen<'a> {
             // adopt the ascribed type, emit the inner expression unchanged (a cast there
             // would be unnecessary or unbuildable).
             Expr::TypeCheck { expr, ty } => {
-                let (c, cty) = self.gen_expr(expr);
                 let aty = self.ty_of(ty);
+                // A container ascription (`[…] : Array<cpp.UInt8>`) pins the element type,
+                // so make it the contextual hint while the inner literal is lowered —
+                // otherwise the literal infers its element type from its members and the
+                // vector types clash. Scalar ascriptions keep their existing cast path.
+                let (c, cty) = if aty.base.starts_with("std::vector")
+                    || aty.base.starts_with("std::map")
+                {
+                    let prev = self.expected.replace(aty.clone());
+                    let r = self.gen_expr(expr);
+                    self.expected = prev;
+                    r
+                } else {
+                    self.gen_expr(expr)
+                };
                 if is_arith_scalar(&aty) && cty.base != aty.base {
                     let target = self.prog.map_type_use(ty, self.mi, &self.ns);
                     (format!("(({target}) {c})"), aty)
@@ -938,6 +1002,16 @@ impl<'a> BodyGen<'a> {
     }
 
     pub(super) fn gen_field(&mut self, recv: &Expr, name: &str) -> (String, Ty) {
+        // hxcpp pointer-unwrap idiom in value position: `cpp.Pointer.fromStar(X).raw`
+        // / `cpp.Pointer.ofArray(A).raw` yield a raw `T*` (passed or read). The
+        // array→fixed-storage *copy* form of `ofArray(...).raw` is intercepted earlier
+        // in assignment / object-literal position; reaching here it is a plain pointer.
+        if name == "raw" {
+            if let Some(res) = self.try_pointer_raw(recv) {
+                return res;
+            }
+        }
+
         // Enum constant: `EnumType.Variant` (a plain/Int enum, or a non-integral
         // `enum abstract` whose member is the underlying type).
         if let Expr::Ident(tname) = recv {
@@ -1311,6 +1385,33 @@ impl<'a> BodyGen<'a> {
             code = code.replace(&format!("{{{i}}}"), &acode);
         }
         Some((code, Ty::default()))
+    }
+
+    /// Lower the `.raw` of a `cpp.Pointer.fromStar(X)` / `cpp.Pointer.ofArray(A)`
+    /// call to a raw pointer value. `fromStar(X)` → `X` when `X` is already a pointer
+    /// (a reference-type instance or an existing `cpp.Star`/`cpp.Pointer`), else
+    /// `&(X)` (address of a value lvalue). `ofArray(A)` → `&(A)[0]`, a pointer into
+    /// the vector's storage. The resulting `T*` converts implicitly to `void*`.
+    fn try_pointer_raw(&mut self, recv: &Expr) -> Option<(String, Ty)> {
+        let (method, arg) = as_cpp_pointer_call(recv)?;
+        match method {
+            "fromStar" => {
+                let (code, ty) = self.gen_expr(arg);
+                if ty.is_ptr {
+                    Some((code, ty))
+                } else {
+                    Some((format!("&({code})"), Ty { is_ptr: true, ..ty }))
+                }
+            }
+            "ofArray" => {
+                let (code, ty) = self.gen_expr(arg);
+                let cty = self.deref_alias(&ty);
+                let mut elem = self.element_ty(&cty);
+                elem.is_ptr = true;
+                Some((format!("&({code})[0]"), elem))
+            }
+            _ => None,
+        }
     }
 
     pub(super) fn gen_call(&mut self, target: &Expr, args: &[Expr]) -> (String, Ty) {
@@ -1700,6 +1801,64 @@ impl<'a> BodyGen<'a> {
             _ => false,
         };
         retains.then_some(value)
+    }
+}
+
+/// Recognise a `cpp.Pointer.<method>(arg)` call (the receiver spelled either
+/// `cpp.Pointer` or a bare imported `Pointer`), returning `(method, arg)` for the
+/// single-argument forms Hatchet lowers (`fromStar`, `ofArray`).
+fn as_cpp_pointer_call(e: &Expr) -> Option<(&str, &Expr)> {
+    let Expr::Call(callee, args) = e else {
+        return None;
+    };
+    if args.len() != 1 {
+        return None;
+    }
+    let Expr::Field(inner, method) = &**callee else {
+        return None;
+    };
+    let is_pointer = match &**inner {
+        Expr::Field(_, n) => n == "Pointer",
+        Expr::Ident(n) => n == "Pointer",
+        _ => false,
+    };
+    is_pointer.then(|| (method.as_str(), &args[0]))
+}
+
+/// `cpp.Pointer.ofArray(SRC).raw` → `Some(SRC)` (the array expression). Used to spot
+/// the fixed C-array initialisation idiom in assignment / object-literal position.
+pub(super) fn as_of_array_raw(e: &Expr) -> Option<&Expr> {
+    let Expr::Field(recv, name) = e else {
+        return None;
+    };
+    if name != "raw" {
+        return None;
+    }
+    match as_cpp_pointer_call(recv)? {
+        ("ofArray", src) => Some(src),
+        _ => None,
+    }
+}
+
+/// The base identifier an lvalue is rooted at: `r` for `r`, `r.f`, `r.f[i]`. Used to
+/// tell whether an assignment ultimately writes through a (const-ref) parameter.
+/// `this.f`, index/field on a call result, etc. have no plain-identifier root.
+fn lvalue_root_ident(target: &Expr) -> Option<&str> {
+    match target {
+        Expr::Ident(n) => Some(n),
+        Expr::Field(recv, _) | Expr::Index(recv, _) | Expr::Paren(recv) => lvalue_root_ident(recv),
+        _ => None,
+    }
+}
+
+/// Strip grouping / ascription wrappers (`(e)`, `cast(e, T)`, `(e : T)`) to reach the
+/// underlying expression — e.g. the `[..]` inside `([..] : Array<cpp.UInt8>)`.
+pub(super) fn unwrap_ascription(e: &Expr) -> &Expr {
+    match e {
+        Expr::Paren(inner) | Expr::Cast { expr: inner, .. } | Expr::TypeCheck { expr: inner, .. } => {
+            unwrap_ascription(inner)
+        }
+        _ => e,
     }
 }
 

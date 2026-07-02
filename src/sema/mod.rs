@@ -646,10 +646,26 @@ impl Program {
                 if name == "Null" && params.len() == 1 {
                     return self.map_type_base(&params[0], ctx_module, current_ns);
                 }
-                // `cpp.Pointer<T>` is hxcpp's raw pointer interop type — emit `T*`.
-                if name == "Pointer" && params.len() == 1 {
+                // hxcpp's raw-pointer interop types all lower to a C pointer:
+                // `cpp.Pointer<T>` / `cpp.RawPointer<T>` / `cpp.Star<T>` → `T*`,
+                // `cpp.ConstStar<T>` → `const T*`. `cpp.Void` maps to `void`, so
+                // `cpp.RawPointer<cpp.Void>` / `cpp.Star<cpp.Void>` give `void*`.
+                if params.len() == 1 && matches!(name, "Pointer" | "RawPointer" | "Star" | "ConstStar")
+                {
                     let inner = self.map_type_base(&params[0], ctx_module, current_ns);
-                    return format!("{inner}*");
+                    return if name == "ConstStar" {
+                        format!("const {inner}*")
+                    } else {
+                        format!("{inner}*")
+                    };
+                }
+                // `Dynamic`/`Any` in an *emitted* position erase to `void*` — an
+                // opaque pointer that holds anything (`Any` is `abstract Any(Dynamic)`,
+                // so both are Dynamic-backed at runtime). They still serve as the
+                // `@:overload` marker on native methods, whose signatures are never
+                // emitted, so this erasure only ever affects real generated code.
+                if params.is_empty() && matches!(name, "Dynamic" | "Any") {
+                    return "void*".to_string();
                 }
                 if params.is_empty() {
                     if let Some(prim) = map_primitive(name) {
@@ -689,6 +705,10 @@ impl Program {
                     None => name.to_string(),
                 }
             }
+            // The empty structure `{}` lowers to `void*` — *deprecated* (see
+            // `validate::deprecation_warnings`): unlike hxcpp, where `{}` is a structure
+            // object, and now redundant with `Dynamic` / `cpp.RawPointer<cpp.Void>`.
+            // Still emitted so existing sources keep working through the deprecation.
             Type::Anon(fields) if fields.is_empty() => "void*".to_string(),
             // A non-empty anonymous structure used in type position is treated as
             // opaque (`void*`); named struct typedefs are the supported form.
@@ -1054,10 +1074,12 @@ mod tests {
         assert_eq!(p.map_type_use(&array_float, 0, &ns), "std::vector<double>");
         assert_eq!(p.map_type_use(&named(&["UInt32"]), 0, &ns), "uint32_t");
         assert_eq!(p.map_type_use(&named(&["String"]), 0, &ns), "std::string");
-        // Only the empty structure `{}` erases to `void*`; `Dynamic`/`Any` no longer
-        // do (they are the overload marker, resolved at the call site, not spelled).
+        // `Dynamic`/`Any` (both `Dynamic`-backed) and the empty structure `{}` all
+        // erase to `void*` in an emitted position. `Dynamic` remains the `@:overload`
+        // marker on native methods, whose signatures are never spelled.
         assert_eq!(p.map_type_use(&Type::Anon(vec![]), 0, &ns), "void*");
-        assert_eq!(p.map_type_use(&named(&["Dynamic"]), 0, &ns), "Dynamic");
+        assert_eq!(p.map_type_use(&named(&["Dynamic"]), 0, &ns), "void*");
+        assert_eq!(p.map_type_use(&named(&["Any"]), 0, &ns), "void*");
     }
 
     #[test]
