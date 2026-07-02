@@ -4,10 +4,9 @@ All notable changes to Hatchet are documented here. Versions follow the project'
 
 ## v0.2.8 — C-style arrays & raw-pointer interop (2026-07-02)
 
-A native-interop release: hxcpp's raw-pointer types now lower, `.raw` pointer intrinsics
-are recognised, and filling a native fixed C-array (`T[N]`) field is a first-class idiom.
-`Dynamic` / `Any` become the faithful spelling for an opaque `void*` and `{}` for that role
-is deprecated. Several latent miscompiles around raw pointers and cast-ascriptions are fixed.
+A native-interop release: hxcpp's raw-pointer types now lower and the `.raw` pointer
+intrinsics are recognised. `Dynamic` / `Any` become the faithful spelling for an opaque
+`void*` and `{}` for that role is deprecated. A latent cast-ascription miscompile is fixed.
 Internally the parser and code generator were split into focused modules with a reorganised
 test suite. The `@:decl` / `@:abi` deprecation warnings added in v0.2.7 are removed (those
 metadata are now silently parsed-and-ignored).
@@ -46,24 +45,6 @@ The `cpp.Pointer` `.raw` accessors used to satisfy hxcpp are recognised and lowe
   (`this.data = cpp.Pointer.fromStar(data).raw;`).
 - **`cpp.Pointer.ofArray(a).raw`** — a pointer to the first element, `&(a)[0]`.
 
-### Filling a native fixed C-array (`T[N]`) field
-
-A native struct field that is a fixed C array (`uint8_t table[64]`, bound as
-`cpp.RawPointer<cpp.UInt8>`) cannot be assigned a pointer — a C array is non-assignable and a
-pointer into a Haxe array dangles. Hatchet now recognises the fill idiom
-`field = cpp.Pointer.ofArray([...]).raw` — as an object-literal field, an assignment
-statement, or into fixed storage — and emits an **element-wise copy** into the C array using
-the destination's element type.
-
-- An **array comprehension** source is **fused** into the copy loop when it is passed
-  straight to `cpp.Pointer.ofArray(...).raw`, skipping the intermediate `std::vector`:
-  `cpp.Pointer.ofArray([for (e in xs) (e : cpp.Float32)]).raw` copies each converted element
-  directly into the target. A standalone comprehension still materialises a vector as before.
-- **Unsupported / dangling shapes fail loudly** rather than miscompiling: returning
-  `cpp.Pointer.ofArray(...).raw` from a helper (the pointer dangles past the function), or
-  filling a bare local `cpp.RawPointer<T>` from a fresh array literal (a raw pointer is not
-  fixed storage), now warn and point at inlining the idiom in the field initialiser.
-
 ### Reference semantics: mutable-reference getters, const-ref parameter writes
 
 - **Write-restricted getters return `T&`.** A generated getter for a container
@@ -80,9 +61,6 @@ the destination's element type.
   `std::vector<int>` and then assigned it to a `std::vector<uint8_t>` — a type clash that
   would not compile. A container ascription now pins the element type through the literal, so
   the vector is built as `std::vector<uint8_t>` directly.
-- **Local raw-pointer copy-through-uninitialised-pointer.** Filling a bare local
-  `cpp.RawPointer<T>` via `ofArray(...).raw` used to emit a loop writing through an
-  uninitialised pointer (undefined behaviour); it now warns instead of emitting that write.
 
 ### `@:decl` / `@:abi` deprecation warnings removed
 
