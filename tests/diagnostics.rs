@@ -4,7 +4,7 @@
 
 use hatchet::diag::Severity;
 use hatchet::sema::validate::{
-    deprecated_meta_warnings, unresolved_type_errors, unsupported_construct_errors,
+    deprecation_warnings, unresolved_type_errors, unsupported_construct_errors,
 };
 use hatchet::sema::Program;
 
@@ -24,43 +24,45 @@ fn program_from(stem: &str, src: &str) -> (Program, usize) {
 }
 
 #[test]
-fn legacy_decl_and_abi_metas_warn_with_replacement() {
-    // The legacy export metadata `@:decl` (class shared-library export) and `@:abi`
-    // (`extern "C"` function export) were renamed to `@libexport` / `@cexport`. Using
-    // the old tokens must emit a non-fatal deprecation warning naming the replacement
-    // — the class hit carries its source line (1), the free function is file-level (0).
+fn legacy_decl_and_abi_metas_are_now_silent() {
+    // `@:decl` / `@:abi` are real Haxe, inbound-only metadata; Hatchet parses and
+    // ignores them with no effect. They must NOT emit a deprecation warning (the
+    // export behaviours live on `@libexport` / `@cexport`, which are unrelated tokens).
     let (prog, idx) = program_from(
         "Legacy",
         "@:decl class Widget {\n  public function new() {}\n}\n@:abi function pick(n:Int):Int { return n; }\n",
     );
-    let warns = deprecated_meta_warnings(&prog, idx);
-
-    let decl = warns
-        .iter()
-        .find(|(_, w)| w.contains("@:decl"))
-        .unwrap_or_else(|| panic!("no @:decl warning in {warns:?}"));
     assert!(
-        decl.1.contains("@libexport") && decl.1.contains("deprecated") && decl.0 == 1,
-        "@:decl should point to @libexport on line 1: {decl:?}"
+        deprecation_warnings(&prog, idx).is_empty(),
+        "@:decl / @:abi must be parsed-and-ignored, with no deprecation warning: {:?}",
+        deprecation_warnings(&prog, idx)
+    );
+}
+
+#[test]
+fn empty_structure_type_is_deprecated() {
+    // `{}` as a type still lowers to `void*`, but that spelling is deprecated — it
+    // must emit a non-fatal warning pointing at `Dynamic` / `cpp.RawPointer<cpp.Void>`.
+    let (prog, idx) = program_from(
+        "Opaque",
+        "class Holder {\n  public var data:{};\n  public function new() {}\n}\n",
+    );
+    let warns = deprecation_warnings(&prog, idx);
+    assert!(
+        warns.iter().any(|(_, w)| w.contains("{}")
+            && w.contains("deprecated")
+            && w.contains("cpp.RawPointer<cpp.Void>")),
+        "an empty-structure field type must warn with the migration hint: {warns:?}"
     );
 
-    let abi = warns
-        .iter()
-        .find(|(_, w)| w.contains("@:abi"))
-        .unwrap_or_else(|| panic!("no @:abi warning in {warns:?}"));
-    assert!(
-        abi.1.contains("@cexport") && abi.1.contains("deprecated"),
-        "@:abi should point to @cexport: {abi:?}"
-    );
-
-    // The *new* spellings must NOT warn.
+    // A field whose type is `Dynamic` (the migration target) must NOT warn.
     let (prog2, idx2) = program_from(
         "Modern",
-        "@libexport class Widget {\n  public function new() {}\n}\n@cexport function pick(n:Int):Int { return n; }\n",
+        "class Holder {\n  public var data:Dynamic;\n  public function new() {}\n}\n",
     );
     assert!(
-        deprecated_meta_warnings(&prog2, idx2).is_empty(),
-        "@libexport / @cexport must not be flagged as deprecated"
+        deprecation_warnings(&prog2, idx2).is_empty(),
+        "`Dynamic` is the migration target and must not warn"
     );
 }
 

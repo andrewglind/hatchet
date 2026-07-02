@@ -60,6 +60,21 @@ impl<'a> BodyGen<'a> {
                     let _ = writeln!(out, "{t}{name}.{key} = {tmp};");
                 }
                 _ => {
+                    // `field: cpp.Pointer.ofArray(SRC).raw` does not fill fixed C-array
+                    // storage (a native `T[N]`): a C array is non-assignable, and a pointer
+                    // into the source vector dangles once the literal is built. The portable
+                    // fill is to make the field optional (so the literal can omit it) and
+                    // populate it after construction with an explicit element loop. Warn, then
+                    // let `.raw` lower to its ordinary pointer below (illegal/dangling for
+                    // fixed storage — fails loud at the C++ compiler).
+                    if super::expr::as_of_array_raw(value).is_some() {
+                        self.warn(
+                            "`cpp.Pointer.ofArray(...).raw` does not fill fixed C-array storage; \
+                             make the field optional and populate it after construction with an \
+                             explicit element loop: `for (i in 0...src.length) dest.field[i] = src[i];`"
+                                .to_string(),
+                        );
+                    }
                     let field_ptr = member.as_ref().map(|m| m.is_ptr).unwrap_or(false);
                     let (vcode, vty) = self.gen_expr(value);
                     self.flush(out);

@@ -16,9 +16,11 @@ use crate::ast::*;
 use crate::sema::{Program, TypeInfo, TypeKind};
 
 mod builtins;
+mod control;
 mod decls;
 mod expr;
 mod literals;
+mod loops;
 mod stmt;
 mod types;
 
@@ -469,6 +471,12 @@ struct BodyGen<'a> {
     /// flagged with a lint warning (ahead of the C++ const error). A local
     /// shadowing the name drops it from the set.
     container_params: std::collections::HashSet<String>,
+    /// Value-struct parameters of the current function. A non-optional value struct
+    /// (a user struct typedef or an `@:native` struct) is lowered to `const T&`, so
+    /// any assignment through it would not compile *and* would silently differ from
+    /// Haxe's by-reference struct semantics — such a write is a hard error. A local
+    /// shadowing the name drops it from the set.
+    value_struct_params: std::collections::HashSet<String>,
     /// Optional `String` parameters (`?s:String`), which default to `""`. For these
     /// — and *only* these — an omitted argument genuinely reads as empty, so a
     /// `s == null` "was it passed?" check lowers to `s.empty()`. A `== null` on any
@@ -571,6 +579,7 @@ impl<'a> BodyGen<'a> {
             escaping: std::collections::HashSet::new(),
             new_args_escape: false,
             container_params: std::collections::HashSet::new(),
+            value_struct_params: std::collections::HashSet::new(),
             optional_string_params: std::collections::HashSet::new(),
             no_nullable_deref: false,
             loop_depth: 0,
