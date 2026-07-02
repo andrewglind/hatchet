@@ -2,6 +2,80 @@
 
 All notable changes to Hatchet are documented here. Versions follow the project's milestones.
 
+## v0.2.8 — C-style arrays & raw-pointer interop (2026-07-02)
+
+A native-interop release: hxcpp's raw-pointer types now lower and the `.raw` pointer
+intrinsics are recognised. `Dynamic` / `Any` become the faithful spelling for an opaque
+`void*` and `{}` for that role is deprecated. A latent cast-ascription miscompile is fixed.
+Internally the parser and code generator were split into focused modules with a reorganised
+test suite. The `@:decl` / `@:abi` deprecation warnings added in v0.2.7 are removed (those
+metadata are now silently parsed-and-ignored).
+
+### hxcpp raw-pointer interop types lower to C pointers
+
+The hxcpp pointer interop family now maps to native C++ pointers, joining `cpp.Pointer<T>`:
+
+- `cpp.RawPointer<T>` and `cpp.Star<T>` → `T*`
+- `cpp.ConstStar<T>` → `const T*`
+- `cpp.Void` → `void`, so `cpp.RawPointer<cpp.Void>` / `cpp.Star<cpp.Void>` give `void*`
+
+These resolve at every use site (field, parameter, local, return) and index as C pointers
+(`p[i]`), so a Haxe binding to a native struct with a `T*` / `const T*` / `void*` member
+transpiles faithfully.
+
+### `Dynamic` / `Any` are the opaque `void*`; `{}` for that role is deprecated
+
+`Dynamic` and `Any` in an *emitted* position now erase to `void*` — an opaque pointer that
+carries anything (`Any` is `abstract Any(Dynamic)`, so both are Dynamic-backed at runtime).
+`Dynamic` also keeps its existing `@:overload`-marker role.
+
+Because `Dynamic` (opaque value) and `cpp.RawPointer<cpp.Void>` (opaque pointer) are now the
+faithful spellings, using the empty structure **`{}` as a `void*` type is deprecated**. It
+still lowers to `void*` so existing sources keep working, but now emits a non-fatal
+deprecation warning naming the replacement; the `void*` lowering will be removed in a future
+release. (In hxcpp `{}` is a structure object, not a raw pointer — this was a Hatchet-ism.)
+
+### `.raw` pointer intrinsics
+
+The `cpp.Pointer` `.raw` accessors used to satisfy hxcpp are recognised and lowered:
+
+- **`cpp.Pointer.fromStar(x).raw`** — the developer's intent to view `x` as a raw pointer:
+  emits `x` when `x` is already a pointer, else takes its address `&(x)`. This is the
+  supported way to accept a `?data:Dynamic` argument and store it as `void*`
+  (`this.data = cpp.Pointer.fromStar(data).raw;`).
+- **`cpp.Pointer.ofArray(a).raw`** — a pointer to the first element, `&(a)[0]`.
+
+### Reference semantics: mutable-reference getters, const-ref parameter writes
+
+- **Write-restricted getters return `T&`.** A generated getter for a container
+  (`std::vector` / `std::map`) or value-struct field now returns a mutable reference (`T&`)
+  rather than a `const T` copy, so Haxe's reference-type mutation through a getter works:
+  `obj.items[k] = v;` and in-place struct mutation compile and take effect.
+- **Assigning through a `const&` value-struct parameter is a hard error.** A value-struct
+  parameter lowers to `const T&`; writing through it is now reported up front instead of
+  emitting non-compiling C++.
+
+### Fixes
+
+- **Array-literal cast-ascription element type.** `([...] : Array<cpp.UInt8>)` built a
+  `std::vector<int>` and then assigned it to a `std::vector<uint8_t>` — a type clash that
+  would not compile. A container ascription now pins the element type through the literal, so
+  the vector is built as `std::vector<uint8_t>` directly.
+
+### `@:decl` / `@:abi` deprecation warnings removed
+
+v0.2.7 renamed the export behaviours to `@libexport` / `@cexport` and made `@:decl` / `@:abi`
+emit a deprecation warning. Those warnings are now **removed**: `@:decl` / `@:abi` are Haxe
+inbound-only metadata and are purely parsed-and-ignored, with no diagnostic.
+
+### Internal
+
+- The monolithic `parser.rs` and `codegen/mod.rs` were split into focused submodules
+  (`parser/{decls,expr,stmt,types}`, `codegen/{header,amalgam}`, `codegen/source/{control,loops}`),
+  and the single `tests/source_codegen.rs` was reorganised into topic-scoped files
+  (`codegen_core`, `codegen_control`, `codegen_intrinsics`, `codegen_ownership`, `codegen_proxy`,
+  `codegen_rawptr`, `codegen_types`) sharing a `tests/common` helper module. No behavioural change.
+
 ## v0.2.7 — Export metadata `@libexport` / `@cexport` (2026-06-26)
 
 A metadata-correctness release with **a breaking rename** (deprecation path is provided).

@@ -168,6 +168,7 @@ impl<'a> BodyGen<'a> {
         // A local shadowing a container parameter takes over the name — its
         // mutations are local copies, not parameter mutations.
         self.container_params.remove(name);
+        self.value_struct_params.remove(name);
         self.optional_string_params.remove(name);
         self.scopes.last_mut().unwrap().insert(name.to_string(), ty);
     }
@@ -257,9 +258,17 @@ impl<'a> BodyGen<'a> {
                 inner.nullable = was_value;
                 return inner;
             }
-            // `cpp.Pointer<T>` → `T*`, carrying `T`'s info so member access on the
-            // result resolves (method lookup, parameter types) and dispatches `->`.
-            if path.last().map(|s| s.as_str()) == Some("Pointer") && params.len() == 1 {
+            // hxcpp raw-pointer interop types → `T*`, carrying `T`'s info so member
+            // access on the result resolves (method lookup, parameter types) and
+            // dispatches `->`. `cpp.Pointer`/`cpp.RawPointer`/`cpp.Star`/`cpp.ConstStar`
+            // all share this shape (the `const` of `ConstStar` lives in the declaration
+            // spelling from `map_type_base`, not in the dispatch `Ty`).
+            if params.len() == 1
+                && matches!(
+                    path.last().map(|s| s.as_str()),
+                    Some("Pointer") | Some("RawPointer") | Some("Star") | Some("ConstStar")
+                )
+            {
                 let mut inner = self.ty_of_in(&params[0], ctx);
                 inner.is_ptr = true;
                 return inner;
