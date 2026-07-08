@@ -86,7 +86,7 @@ Full documentation lives in the **[Hatchet Wiki](https://github.com/andrewglind/
 - **[Container Semantics](https://github.com/andrewglind/hatchet/wiki/Container-Semantics)** — `Array` and `Map` as value types (the largest divergence from Haxe)
 - **[Metadata](https://github.com/andrewglind/hatchet/wiki/Metadata)** — the `@:` and `@` metadata Hatchet honours, and `extern`
 - **[Interop via `@proxy`](https://github.com/andrewglind/hatchet/wiki/Interop-via-@proxy)** — binding to hand-written native C++
-- **[Raw-Pointer Interop](https://github.com/andrewglind/hatchet/wiki/Raw-Pointer-Interop)** - the hxcpp pointer types
+- **[Raw-Pointer Interop](https://github.com/andrewglind/hatchet/wiki/Raw-Pointer-Interop)** — the hxcpp pointer types
 
 **Internals**
 
