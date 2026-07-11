@@ -251,6 +251,45 @@ class Ratio {
 }
 
 #[test]
+fn mixed_int_float_arithmetic_infers_float() {
+    // An arithmetic op with one Int and one Float operand yields Float (C++'s
+    // usual arithmetic conversions, and Haxe's). The inferred result type must
+    // reflect that regardless of operand order, or a `var` bound to it would be
+    // declared `int` and truncate the double the expression computes.
+    let src = "\
+class Calc {
+  public var n:Int;
+  public var f:Float;
+  public function new() { this.n = 7; this.f = 2.0; }
+  public function go():Float {
+    var a = this.n / this.f;   // Int / Float
+    var b = this.f / this.n;   // Float / Int
+    var c = this.n + this.f;   // Int + Float
+    var d = this.n * 2;        // Int * Int stays int
+    return a + b + c + d;
+  }
+}
+";
+    let out = gen_one(src, "Calc");
+    assert!(
+        out.contains("double a = this->n / this->f;"),
+        "Int / Float infers Float (no truncating `int a`):\n{out}"
+    );
+    assert!(
+        out.contains("double b = this->f / this->n;"),
+        "Float / Int infers Float regardless of operand order:\n{out}"
+    );
+    assert!(
+        out.contains("double c = this->n + this->f;"),
+        "Int + Float infers Float:\n{out}"
+    );
+    assert!(
+        out.contains("int d = this->n * 2;"),
+        "Int * Int stays int:\n{out}"
+    );
+}
+
+#[test]
 fn float_modulo_lowers_to_fmod() {
     // Haxe `%` works on Floats; C++ `%` is integer-only, so a float operand
     // lowers to `fmod` (C89 <math.h>, portable to VC6). Int % Int stays `%`.

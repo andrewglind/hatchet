@@ -210,31 +210,6 @@ impl<'a> BodyGen<'a> {
                     return (format!("{tcode} = {tmp}"), Ty::default());
                 }
             }
-            // `dest = cpp.Pointer.ofArray(SRC).raw` does NOT fill fixed C-array storage.
-            // A bare `.raw` is just a pointer (`&SRC[0]`), good only for an immediate
-            // native call: it cannot populate a native `T[N]` field (a C array is
-            // non-assignable), and into a genuine `T*` field it merely aliases SRC's
-            // buffer. The portable way to fill fixed storage is an explicit element loop:
-            // `for (i in 0...src.length) dest[i] = src[i];`. Warn when this reads as a
-            // fill — a non-local target (a struct field/element) or a *fresh* source
-            // (literal/comprehension, which can only mean "fill") — then let `.raw` lower
-            // to its ordinary pointer assignment below (illegal/dangling for fixed storage,
-            // so the C++ compiler rejects it too — fail loud).
-            if let Some(src) = as_of_array_raw(value) {
-                let into_storage = !matches!(&**target, Expr::Ident(_));
-                let fresh_src = matches!(
-                    unwrap_ascription(src),
-                    Expr::ArrayLit(_) | Expr::Comprehension { .. }
-                );
-                if into_storage || fresh_src {
-                    self.warn(
-                        "`cpp.Pointer.ofArray(...).raw` does not fill fixed C-array storage; \
-                         populate a native `T[N]` field with an explicit element loop instead: \
-                         `for (i in 0...src.length) dest[i] = src[i];`"
-                            .to_string(),
-                    );
-                }
-            }
             // plain reassignment: warn when a nullable value lands in a
             // non-nullable target.
             let (tcode, tty) = self.gen_lvalue(target);
@@ -616,7 +591,7 @@ impl<'a> BodyGen<'a> {
                 ) {
                     cast_signed_for_unsigned_cmp(&mut l, &lty, &mut r, &rty);
                 }
-                let ty = binop_result_ty(*op, lty);
+                let ty = binop_result_ty(*op, lty, &rty);
                 (format!("{l} {} {r}", binop(*op)), ty)
             }
             Expr::Ternary { cond, then, els } => {
@@ -1472,6 +1447,41 @@ impl<'a> BodyGen<'a> {
                         .cloned()
                     {
                         if info.kind == TypeKind::Class {
+                            // A `Module.func()` call may target a *module-level*
+                            // function (declared at the top of `Module.hx`) rather
+                            // than a static member of the primary class `Module`.
+                            // Haxe allows this — the module name doubles as the
+                            // class name — and such a function lowers to a namespace
+                            // free function, so the class qualifier must be dropped:
+                            // emit `func(...)` (namespace-qualified), not
+                            // `Class::func(...)`.
+                            let is_member = matches!(
+                                self.prog.type_decl(&info),
+                                Some(Decl::Class(c)) if self.class_defines_method(c, method)
+                            );
+                            if !is_member {
+                                if let Some(f) = self.module_free_fn(info.module_index, method) {
+                                    let mj = info.module_index;
+                                    let param_tys: Vec<Option<Ty>> =
+                                        f.params.iter().map(|p| self.param_ty_in(p, mj)).collect();
+                                    let sink = param_sink_flags(&f.params);
+                                    let a = self.gen_args_owned(args, &param_tys, &sink, false);
+                                    let ret = match &f.ret {
+                                        Some(t) => self.ty_of_in(t, mj),
+                                        None => Ty {
+                                            base: "void".into(),
+                                            ..Default::default()
+                                        },
+                                    };
+                                    let ns = info.cpp_namespace();
+                                    let prefix = if ns == self.ns || ns.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("{}::", ns.join("::"))
+                                    };
+                                    return (format!("{prefix}{method}({a})"), ret);
+                                }
+                            }
                             let recv_ty = Ty {
                                 base: info.name.clone(),
                                 info: Some(info.clone()),
@@ -1825,21 +1835,6 @@ fn as_cpp_pointer_call(e: &Expr) -> Option<(&str, &Expr)> {
     is_pointer.then(|| (method.as_str(), &args[0]))
 }
 
-/// `cpp.Pointer.ofArray(SRC).raw` → `Some(SRC)` (the array expression). Used to spot
-/// the fixed C-array initialisation idiom in assignment / object-literal position.
-pub(super) fn as_of_array_raw(e: &Expr) -> Option<&Expr> {
-    let Expr::Field(recv, name) = e else {
-        return None;
-    };
-    if name != "raw" {
-        return None;
-    }
-    match as_cpp_pointer_call(recv)? {
-        ("ofArray", src) => Some(src),
-        _ => None,
-    }
-}
-
 /// The base identifier an lvalue is rooted at: `r` for `r`, `r.f`, `r.f[i]`. Used to
 /// tell whether an assignment ultimately writes through a (const-ref) parameter.
 /// `this.f`, index/field on a call result, etc. have no plain-identifier root.
@@ -1848,17 +1843,6 @@ fn lvalue_root_ident(target: &Expr) -> Option<&str> {
         Expr::Ident(n) => Some(n),
         Expr::Field(recv, _) | Expr::Index(recv, _) | Expr::Paren(recv) => lvalue_root_ident(recv),
         _ => None,
-    }
-}
-
-/// Strip grouping / ascription wrappers (`(e)`, `cast(e, T)`, `(e : T)`) to reach the
-/// underlying expression — e.g. the `[..]` inside `([..] : Array<cpp.UInt8>)`.
-pub(super) fn unwrap_ascription(e: &Expr) -> &Expr {
-    match e {
-        Expr::Paren(inner) | Expr::Cast { expr: inner, .. } | Expr::TypeCheck { expr: inner, .. } => {
-            unwrap_ascription(inner)
-        }
-        _ => e,
     }
 }
 

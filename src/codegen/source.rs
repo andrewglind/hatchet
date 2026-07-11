@@ -1252,7 +1252,7 @@ fn binop(op: BinOp) -> &'static str {
     }
 }
 
-fn binop_result_ty(op: BinOp, lhs: Ty) -> Ty {
+fn binop_result_ty(op: BinOp, lhs: Ty, rhs: &Ty) -> Ty {
     use BinOp::*;
     match op {
         Eq | Ne | Lt | Gt | Le | Ge | And | Or => Ty {
@@ -1260,6 +1260,11 @@ fn binop_result_ty(op: BinOp, lhs: Ty) -> Ty {
             ..Default::default()
         },
         UShr => int_ty(),
+        // Arithmetic promotes to Float when *either* operand is a Float — the C++
+        // (and Haxe) usual-arithmetic-conversion rule. Keying the result on the
+        // left operand alone mis-infers `var r = intField / floatField` as `int`,
+        // which then truncates the double the expression actually computes.
+        Add | Sub | Mul | Div | Mod if is_float_base(&lhs) || is_float_base(rhs) => float_ty(),
         _ => lhs,
     }
 }

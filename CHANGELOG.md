@@ -2,6 +2,59 @@
 
 All notable changes to Hatchet are documented here. Versions follow the project's milestones.
 
+## v0.2.9 — Type-resolution & arithmetic fixes (2026-07-11)
+
+A correctness release fixing three lowering bugs. A `Module.func()` call that targets a
+module-level function no longer emits a bogus class qualifier; a `typedef` alias is now fully
+transparent — it takes on the shape of whatever it names, everywhere; and mixed Int/Float
+arithmetic infers `Float`, so a `var` bound to it no longer truncates. The fixed-C-array
+"fill" detection added during the raw-pointer work — undocumented since v0.2.8 — is removed.
+
+### Fixes
+
+- **`Module.func()` for a module-level function drops the class qualifier.** Haxe lets you
+  call a *module-level* function through the module name — `Palette.mix(a, b)` where `mix` is
+  declared at the top of `Palette.hx`, not a member of the primary class `Palette`. Such a
+  function lowers to a namespace free function, so Hatchet no longer emits the non-existent
+  `Palette::mix(...)`; it emits `mix(...)` (namespace-qualified as needed, e.g. `util::mix`).
+  A genuine static member (`Registry.slot(...)`) still uses scope resolution,
+  `Registry::slot(...)`.
+
+- **A `typedef` alias is fully transparent.** A Haxe `typedef X = Y` is the same type as `Y`
+  everywhere, but Hatchet made shape decisions (pointer-vs-value, reference-vs-container,
+  by-value-vs-`const&`, member dispatch) from the alias *name* rather than its target — so an
+  alias only behaved correctly for a couple of shapes. Aliases are now resolved through
+  *before* every such decision, while the alias name is kept in the emitted spelling. Fixes,
+  across every alias shape:
+    - `typedef Color = cpp.UInt32` (primitive) — passed **by value** (optional gets a default),
+      not `const Color&` or a `Color*` pointer.
+    - `typedef Panel = Widget` (a class) — a **`Panel*`** with `->` dispatch, not a sliced
+      by-value `Panel`; methods/fields resolve through the alias (`panel.tag()` → `w->tag()`).
+    - `typedef Ints = Array<Int>` (container) — passed **`const Ints&`** (Haxe's shared-reference
+      semantics), not a silent by-value copy.
+    - `typedef Vertex = Pt` (a `{ … }` struct) — `const Vertex&`, with working field access
+      (`v.x`).
+    - `typedef Name = String` — keeps the `const Name&` optimization; an optional `?n:Name`
+      defaults to `""`.
+    - `Null<Ptr>` where `typedef Ptr = cpp.RawPointer<T>` — a single pointer, no longer `Ptr*`
+      (a double pointer). A custom iterator reached through an alias now iterates transparently.
+
+- **Mixed Int/Float arithmetic infers `Float`.** An arithmetic operator's result type was
+  taken from the left operand alone, so `intField / floatField` (and `+`, `-`, `*`, `%`) was
+  inferred `Int`. A `var r = intField / floatField` was then declared `int` and truncated the
+  `double` the expression actually computes. Arithmetic now promotes to `Float` when *either*
+  operand is a `Float`, matching C++'s (and Haxe's) usual arithmetic conversions. Int-only
+  arithmetic, shifts, and the existing `Int / Int → Float` double-division cast are unchanged.
+
+### Removed: fixed-C-array "fill" detection
+
+The raw-pointer work briefly special-cased `cpp.Pointer.ofArray(...).raw` written into fixed
+C-array storage, warning that a bare `.raw` cannot fill a native `T[N]`. That handling was
+de-documented in v0.2.8 and is now removed entirely: `cpp.Pointer.ofArray(a).raw` is simply
+the address of the first element (`&(a)[0]`), with no position-dependent diagnostics. The
+general `.raw` intrinsics (`cpp.Pointer.fromStar(x).raw`, `cpp.Pointer.ofArray(a).raw`) are
+unchanged.
+
 ## v0.2.8 — C-style arrays & raw-pointer interop (2026-07-02)
 
 A native-interop release: hxcpp's raw-pointer types now lower and the `.raw` pointer

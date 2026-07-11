@@ -120,10 +120,9 @@ fn nullable_value_fields(prog: &Program, mi: usize, class: &Class) -> BTreeSet<S
 pub(crate) fn is_nullable_value_type(prog: &Program, mi: usize, ty: Option<&Type>) -> bool {
     if let Some(Type::Named { path, params, .. }) = ty {
         if path.last().map(|s| s.as_str()) == Some("Null") && params.len() == 1 {
-            if let Type::Named { path: ip, .. } = &params[0] {
-                return !prog.is_reference(ip, mi);
-            }
-            return true;
+            // A reference type — through alias typedefs — is a shared pointer the `Null`
+            // wrapper does not own; only a value `T` makes `Null<T>` an owned heap box.
+            return !prog.is_reference_deep(&params[0], mi);
         }
     }
     false
