@@ -512,6 +512,15 @@ impl Program {
     /// bounded against a pathological alias cycle. Used so a value's *container-ness*
     /// (Array/Map/String) is seen through an alias for construction/iteration/escape.
     pub fn resolve_alias_type(&self, ty: &Type, ctx_module: usize) -> Type {
+        self.resolve_alias_type_ctx(ty, ctx_module).0
+    }
+
+    /// Like [`resolve_alias_type`], but also returns the module the resolved type is
+    /// expressed in — each alias hop re-roots in the typedef's own module, so a
+    /// terminal named type (`typedef Panel = Widget`) must be re-resolved in *that*
+    /// module, not the caller's. Needed by the alias-following shape predicates
+    /// ([`is_reference_deep`](Self::is_reference_deep) / [`is_pointer_deep`](Self::is_pointer_deep)).
+    pub fn resolve_alias_type_ctx(&self, ty: &Type, ctx_module: usize) -> (Type, usize) {
         let mut cur = ty.clone();
         let mut ctx = ctx_module;
         for _ in 0..16 {
@@ -537,7 +546,33 @@ impl Program {
             cur = target.clone();
             ctx = next_ctx;
         }
-        cur
+        (cur, ctx)
+    }
+
+    /// Whether `ty`, followed through alias typedefs, is a **reference** (pointer)
+    /// type — a class/interface (never a value class). A Haxe `typedef` is transparent,
+    /// so `typedef Panel = Widget` must be a reference exactly as `Widget` is; the plain
+    /// [`is_reference`](Self::is_reference) stops at the alias and would miss it.
+    pub fn is_reference_deep(&self, ty: &Type, ctx_module: usize) -> bool {
+        let (t, tctx) = self.resolve_alias_type_ctx(ty, ctx_module);
+        match &t {
+            Type::Named { path, params, .. } if params.is_empty() => self.is_reference(path, tctx),
+            _ => false,
+        }
+    }
+
+    /// Whether `ty`, followed through alias typedefs, already lowers to a C++ pointer
+    /// at use position — a reference class, or a pointer-interop spelling (`cpp.Star`,
+    /// `cpp.RawPointer`, `cpp.ConstStar`, `cpp.ConstCharStar`, …). Used to keep a
+    /// `Null<T>` over such a type a single pointer rather than `T**`.
+    pub fn is_pointer_deep(&self, ty: &Type, ctx_module: usize) -> bool {
+        let (t, tctx) = self.resolve_alias_type_ctx(ty, ctx_module);
+        if let Type::Named { path, params, .. } = &t {
+            if params.is_empty() && self.is_reference(path, tctx) {
+                return true;
+            }
+        }
+        self.map_type_base(&t, tctx, &[]).ends_with('*')
     }
 
     /// Does `class` (or any transitive base / implemented interface, including
@@ -728,7 +763,11 @@ impl Program {
         if let Type::Named { path, params, .. } = ty {
             if path.last().map(|s| s.as_str()) == Some("Null") && params.len() == 1 {
                 let inner = self.map_type_use(&params[0], ctx_module, current_ns);
-                return if inner.ends_with('*') {
+                // Already a pointer (a reference type, a pointer-interop alias, or a
+                // spelling that ends in `*`) → the `Null` adds nullability, not another
+                // level of indirection. Resolve through aliases so `Null<Ptr>` where
+                // `typedef Ptr = cpp.RawPointer<T>` stays `Ptr`, not `Ptr*`.
+                return if inner.ends_with('*') || self.is_pointer_deep(&params[0], ctx_module) {
                     inner
                 } else {
                     format!("{inner}*")
@@ -736,8 +775,11 @@ impl Program {
             }
         }
         let base = self.map_type_base(ty, ctx_module, current_ns);
-        if let Type::Named { path, params, .. } = ty {
-            if params.is_empty() && self.is_reference(path, ctx_module) {
+        if let Type::Named { params, .. } = ty {
+            // A reference type at use position is a pointer. Follow alias typedefs so an
+            // alias of a class (`typedef Panel = Widget`) is a `Panel*`, not a sliced
+            // by-value `Panel`. The alias *name* is kept in the spelling.
+            if params.is_empty() && self.is_reference_deep(ty, ctx_module) {
                 return format!("{base}*");
             }
         }

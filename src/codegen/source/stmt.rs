@@ -228,19 +228,6 @@ impl<'a> BodyGen<'a> {
             Stmt::Return(Some(e), line) => {
                 self.current_line = *line;
                 self.prelude_ind = ind;
-                // Returning `cpp.Pointer.ofArray(...).raw` hands back a raw pointer into
-                // a Haxe array that does not outlive the call — it dangles (and a
-                // `const`-ref array parameter won't even compile). Warn and point at
-                // inlining at the use site.
-                if super::expr::as_of_array_raw(super::expr::unwrap_ascription(e)).is_some() {
-                    self.warn(
-                        "returning `cpp.Pointer.ofArray(...).raw` yields a pointer into a Haxe \
-                         array that does not outlive this function — it dangles. Inline \
-                         `cpp.Pointer.ofArray(...).raw` at the use site instead, so the array's \
-                         lifetime covers the pointer"
-                            .to_string(),
-                    );
-                }
                 // A returned value's heap arguments are owned by the caller.
                 self.new_args_escape = true;
                 if matches!(e, Expr::Null) {

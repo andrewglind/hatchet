@@ -32,20 +32,24 @@ pub(crate) fn param_decl(prog: &Program, mi: usize, ns: &[String], p: &Param) ->
     let name = &p.name;
     let ty = p.ty.as_ref();
 
+    // Shape decisions follow the type *through* alias typedefs (a Haxe `typedef` is
+    // transparent): `typedef Panel = Widget` is a reference, `typedef Ints = Array<Int>`
+    // a container, `typedef Name = String` a string. The emitted spelling still uses the
+    // alias name via `map_type_base` / `map_type_use`.
     if let Some(t) = ty {
-        if let Type::Named { path, params, .. } = t {
-            if params.is_empty() && prog.is_reference(path, mi) {
-                let base = prog.map_type_base(t, mi, ns);
-                return if p.optional {
-                    format!("{base}* {name} = NULL")
-                } else {
-                    format!("{base}* {name}")
-                };
-            }
+        if matches!(t, Type::Named { params, .. } if params.is_empty()) && prog.is_reference_deep(t, mi)
+        {
+            let base = prog.map_type_base(t, mi, ns);
+            return if p.optional {
+                format!("{base}* {name} = NULL")
+            } else {
+                format!("{base}* {name}")
+            };
         }
     }
 
-    let base_name = ty.and_then(|t| t.base_name());
+    let resolved = ty.map(|t| prog.resolve_alias_type(t, mi));
+    let base_name = resolved.as_ref().and_then(|t| t.base_name());
     if let Some(t) = ty {
         if is_value_struct(prog, mi, t) {
             let base = prog.map_type_base(t, mi, ns);
@@ -58,10 +62,15 @@ pub(crate) fn param_decl(prog: &Program, mi: usize, ns: &[String], p: &Param) ->
     }
 
     if base_name == Some("String") {
+        // Spell via the alias name where there is one (`const Name&`), falling back to
+        // `std::string` for a direct `String`.
+        let t = ty
+            .map(|t| prog.map_type_use(t, mi, ns))
+            .unwrap_or_else(|| "std::string".to_string());
         return if p.optional {
-            format!("std::string {name} = {}", param_default(prog, mi, ns, p))
+            format!("{t} {name} = {}", param_default(prog, mi, ns, p))
         } else {
-            format!("const std::string& {name}")
+            format!("const {t}& {name}")
         };
     }
     if matches!(base_name, Some("Array") | Some("Map")) && !p.optional {
@@ -85,7 +94,8 @@ fn param_default(prog: &Program, mi: usize, ns: &[String], p: &Param) -> String 
             return lit;
         }
     }
-    match p.ty.as_ref().and_then(|t| t.base_name()) {
+    let resolved = p.ty.as_ref().map(|t| prog.resolve_alias_type(t, mi));
+    match resolved.as_ref().and_then(|t| t.base_name()) {
         Some("Float") => "0.0".to_string(),
         Some("Bool") => "false".to_string(),
         Some("String") => "\"\"".to_string(),
@@ -98,22 +108,24 @@ fn param_default(prog: &Program, mi: usize, ns: &[String], p: &Param) -> String 
 }
 
 pub(crate) fn is_value_struct(prog: &Program, mi: usize, ty: &Type) -> bool {
-    if let Type::Named { path, params, .. } = ty {
-        if !params.is_empty() {
-            return false;
-        }
-        let name = path.last().map(|s| s.as_str()).unwrap_or("");
-        if crate::sema::types::map_primitive(name).is_some()
-            || crate::sema::types::is_uint_shim(name)
-        {
-            return false;
-        }
-        return matches!(
-            prog.kind_of(path, mi),
-            Some(TypeKind::StructTypedef) | Some(TypeKind::AliasTypedef)
-        );
+    // Resolve through alias typedefs first: an alias inherits the value-vs-reference
+    // shape of what it *names*, not "typedef, therefore struct". `typedef Color =
+    // cpp.UInt32` aliases a primitive (a value, but passed by value with a default —
+    // not by const-ref, and an optional one is not a pointer); `typedef Ints =
+    // Array<Int>` a container. Only a `{ … }` struct — reached directly or through an
+    // alias chain — is genuinely value-struct-shaped.
+    let resolved = prog.resolve_alias_type(ty, mi);
+    let Type::Named { path, params, .. } = &resolved else {
+        return false;
+    };
+    if !params.is_empty() {
+        return false;
     }
-    false
+    let name = path.last().map(|s| s.as_str()).unwrap_or("");
+    if crate::sema::types::map_primitive(name).is_some() || crate::sema::types::is_uint_shim(name) {
+        return false;
+    }
+    matches!(prog.kind_of(path, mi), Some(TypeKind::StructTypedef))
 }
 
 /// A literal default value for a struct/enum field in a generated ctor.

@@ -648,6 +648,22 @@ impl<'a> BodyGen<'a> {
         }
     }
 
+    /// A module-level free function (`function name(...) {...}`) declared at the
+    /// top level of module `mj` — the target of a Haxe `Module.name()` call whose
+    /// `name` is a module function rather than a member of the primary class.
+    pub(super) fn module_free_fn(&self, mj: usize, name: &str) -> Option<&'a Function> {
+        self.prog
+            .modules
+            .get(mj)?
+            .file
+            .decls
+            .iter()
+            .find_map(|d| match d {
+                Decl::Function(f) if f.name.as_deref() == Some(name) && f.body.is_some() => Some(f),
+                _ => None,
+            })
+    }
+
     /// `@sink` flags for a bare call: an own-class method, else a module-level
     /// free function of that name.
     pub(super) fn bare_sink_params(&self, name: &str) -> Vec<bool> {

@@ -1,4 +1,4 @@
-//! cpp pointer / RawPointer interop, fromStar/ofArray, and fixed-array fill diagnostics.
+//! cpp pointer / RawPointer interop, fromStar/ofArray `.raw` intrinsics.
 mod common;
 use common::*;
 
@@ -103,97 +103,28 @@ class Holder {
 }
 
 #[test]
-fn of_array_raw_into_native_fixed_array_warns() {
-    // `cpp.Pointer.ofArray(..).raw` does NOT fill a native fixed C-array field
-    // (`uint8_t table[N]`, bound as `cpp.RawPointer<cpp.UInt8>`): a C array is
-    // non-assignable and a pointer into the temporary vector would dangle. Hatchet no
-    // longer copies behind the developer's back — it warns and points at the portable
-    // explicit element loop. (The unsupported idiom is not hxcpp-portable either: hxcpp
-    // would emit an illegal `table = ptr` array assignment.)
-    let src = "\
-@:native(\"ext::Ramp\")
-typedef Ramp = {
-  color:cpp.UInt32,
-  table:cpp.RawPointer<cpp.UInt8>
-}
-
-class Builder {
-  public function new() {}
-  public function make():Ramp {
-    return {
-      color: 255,
-      table: cpp.Pointer.ofArray(([0, 12, 24]:Array<cpp.UInt8>)).raw
-    };
-  }
-}
-";
-    let (out, warnings) = gen_one_diag(src, "Builder");
-    assert!(
-        warnings
-            .iter()
-            .any(|(_, w)| w.contains("fixed C-array") && w.contains("explicit element loop")),
-        "filling a fixed C-array field via ofArray(...).raw must warn: {warnings:?}"
-    );
-    // The magic copy loop is gone — no synthesised `for`-copy into `.table[...]`.
-    assert!(
-        !out.contains(".table[") || !out.contains("for ("),
-        "the copy lowering must no longer synthesise a fill loop:\n{out}"
-    );
-}
-
-#[test]
-fn returning_of_array_raw_warns_about_dangling() {
-    // A helper that wraps a Haxe array and returns `cpp.Pointer.ofArray(...).raw`
-    // hands back a pointer into an array that dies with the call — it dangles.
-    // Returning it must warn.
+fn of_array_raw_lowers_to_element_address_without_warning() {
+    // `cpp.Pointer.ofArray(a).raw` lowers to the address of the first element,
+    // `&(a)[0]` — the pointer for handing a Haxe array's storage to a native call.
+    // The old fixed-C-array "fill" detection and its warnings were removed in v0.2.9;
+    // the intrinsic now carries no special-case handling and emits no diagnostic.
     let src = "\
 class Lib {
   public function new() {}
-  public static function wrap(a:Array<cpp.UInt8>):cpp.RawPointer<cpp.UInt8> {
-    return cpp.Pointer.ofArray(a).raw;
+  public function f():Void {
+    var a:Array<cpp.UInt8> = [1, 2, 3];
+    var p:cpp.RawPointer<cpp.UInt8> = cpp.Pointer.ofArray(a).raw;
   }
 }
 ";
-    let dir = std::env::temp_dir().join(format!("hatchet_dangl_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("Lib.hx"), src).unwrap();
-    let prog = Program::from_src_dir(&dir).expect("build program");
-    let idx = prog
-        .modules
-        .iter()
-        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Lib"))
-        .unwrap();
-    let (_, warnings, _) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
+    let (out, warnings) = gen_one_diag(src, "Lib");
     assert!(
-        warnings
-            .iter()
-            .any(|(_, w)| w.contains("ofArray") && w.contains("dangles")),
-        "returning ofArray(...).raw must warn about the dangling pointer: {warnings:?}"
+        out.contains("&(a)[0]"),
+        "ofArray(a).raw lowers to the first element's address:\n{out}"
     );
-}
-
-#[test]
-fn inline_of_array_raw_field_fill_warns() {
-    // Filling a fixed C-array field inline (`{ table: ofArray([...]).raw }`) is no longer
-    // a supported copy — it warns and points at the optional-field + explicit-loop idiom.
-    let src = "\
-@:native(\"ext::Ramp\")
-typedef Ramp = { table:cpp.RawPointer<cpp.UInt8> }
-
-class Lib {
-  public function new() {}
-  public function make():Ramp {
-    return { table: cpp.Pointer.ofArray([1, 2, 3]).raw };
-  }
-}
-";
-    let (_, warnings) = gen_one_diag(src, "Lib");
     assert!(
-        warnings
-            .iter()
-            .any(|(_, w)| w.contains("fixed C-array") && w.contains("optional")),
-        "inline ofArray(...).raw field-fill must warn and point at the optional-field idiom: {warnings:?}"
+        !warnings.iter().any(|(_, w)| w.contains("fixed C-array")),
+        "the removed fill machinery must emit no fixed-C-array warning: {warnings:?}"
     );
 }
 
@@ -217,45 +148,6 @@ class A {
 }
 
 #[test]
-fn of_array_raw_into_bare_local_pointer_warns_not_copies() {
-    // A bare `cpp.RawPointer<T>` local has no backing storage: `ofArray(...).raw` stays
-    // an ordinary pointer assignment and no element-copy is synthesised (which would
-    // write through an uninitialised pointer). Since a fresh array can only mean "fill
-    // fixed storage", Hatchet warns and points at inlining.
-    let src = "\
-class Lib {
-  public function new() {}
-  public function f():Void {
-    var p:cpp.RawPointer<cpp.UInt8>;
-    p = cpp.Pointer.ofArray([1, 2, 3]).raw;
-  }
-}
-";
-    let dir = std::env::temp_dir().join(format!("hatchet_barelocal_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("Lib.hx"), src).unwrap();
-    let prog = Program::from_src_dir(&dir).expect("build program");
-    let idx = prog
-        .modules
-        .iter()
-        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some("Lib"))
-        .unwrap();
-    let (out, warnings, _) = generate_source_diagnostics(&prog, idx, 1, false).unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        warnings
-            .iter()
-            .any(|(_, w)| w.contains("fixed C-array") && w.contains("explicit element loop")),
-        "filling a bare RawPointer local from an array literal must warn: {warnings:?}"
-    );
-    // No element-copy is synthesised through the bare (uninitialised) pointer.
-    assert!(
-        !out.contains("p[0] ="),
-        "no element-copy through the bare (uninitialised) pointer:\n{out}"
-    );
-}
-
-#[test]
 fn comprehension_still_materialises() {
     // An ordinary array comprehension builds its own vector (`push_back`). This held a
     // carve-out for the removed `ofArray(...).raw` fusion; with the copy lowering gone,
@@ -273,38 +165,6 @@ class Builder {
     assert!(
         out.contains("push_back"),
         "a comprehension materialises a vector:\n{out}"
-    );
-}
-
-#[test]
-fn of_array_raw_assignment_statement_warns() {
-    // The warning also fires for a plain assignment statement into a fixed-array field,
-    // not just an object-literal field initialiser — the copy lowering is gone there too.
-    let src = "\
-@:native(\"ext::Ramp\")
-typedef Ramp = {
-  table:cpp.RawPointer<cpp.UInt8>
-}
-
-class Builder {
-  var r:Ramp;
-  public function new() {}
-  public function fill():Void {
-    this.r.table = cpp.Pointer.ofArray(([1, 2, 3, 4]:Array<cpp.UInt8>)).raw;
-  }
-}
-";
-    let (out, warnings) = gen_one_diag(src, "Builder");
-    assert!(
-        warnings
-            .iter()
-            .any(|(_, w)| w.contains("fixed C-array") && w.contains("explicit element loop")),
-        "assignment-form ofArray fixed-array fill must warn: {warnings:?}"
-    );
-    // No synthesised copy loop into the array storage.
-    assert!(
-        !out.contains("= {1, 2, 3, 4}"),
-        "the magic copy must no longer materialise a local C array:\n{out}"
     );
 }
 

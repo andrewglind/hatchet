@@ -82,6 +82,159 @@ class Use {
 }
 
 #[test]
+fn alias_typedef_to_primitive_is_a_value_not_a_struct() {
+    // `typedef Color = cpp.UInt32` aliases a primitive, so a `Color` parameter is
+    // passed by value (an optional one gets a default), NOT by `const Color&` and
+    // not as a `Color*` pointer — the alias must be resolved through before the
+    // value-vs-reference decision. A `typedef` to a `{ … }` struct still lowers to
+    // the value-struct shape (`const V&`, optional `V*`).
+    let src = "\
+typedef Color = cpp.UInt32;
+typedef Pt = { var x:Int; var y:Int; };
+class Painter {
+  public function new() {}
+  public function tint(c:Color):Color { return c; }
+  public function opt(?c:Color):Color { return this.tint(0); }
+  public function move(p:Pt):Void {}
+  public function optPt(?p:Pt):Void {}
+}
+";
+    let out = gen_one(src, "Painter");
+    assert!(
+        out.contains("Color Painter::tint(Color c)"),
+        "primitive alias param is by value:\n{out}"
+    );
+    assert!(
+        !out.contains("const Color&") && !out.contains("Color* c"),
+        "primitive alias is neither const-ref nor pointer:\n{out}"
+    );
+    assert!(
+        out.contains("Color Painter::opt(Color c"),
+        "optional primitive alias is a defaulted value, not a pointer:\n{out}"
+    );
+    // The struct alias is unaffected — still a value struct.
+    assert!(
+        out.contains("void Painter::move(const Pt& p)"),
+        "struct typedef stays a const-ref value struct:\n{out}"
+    );
+    assert!(
+        out.contains("void Painter::optPt(Pt* p)"),
+        "optional struct typedef stays a pointer:\n{out}"
+    );
+}
+
+#[test]
+fn alias_typedef_inherits_its_target_shape() {
+    // A Haxe `typedef` is transparent: an alias takes on the value-vs-reference shape of
+    // whatever it names, not "typedef, therefore value struct". Covers the shapes that
+    // used to be mis-lowered — reference class (slicing), container (by-value copy),
+    // string (lost const-ref), optional-string default, and `Null<pointer-alias>`
+    // (double pointer) — plus member/method dispatch through the alias.
+    let src = "\
+typedef Name  = String;
+typedef Ints  = Array<Int>;
+typedef Ptr   = cpp.RawPointer<cpp.UInt8>;
+typedef Pt    = { var x:Int; var y:Int; };
+typedef Vertex = Pt;
+class Widget {
+  public var id:Int;
+  public function new() { this.id = 0; }
+  public function tag():Int { return this.id; }
+}
+typedef Panel = Widget;
+class Uses {
+  public function new() {}
+  public function name(n:Name):Void {}
+  public function ints(xs:Ints):Void {}
+  public function ptr(p:Ptr):Void {}
+  public function panel(w:Panel):Int { return w.tag(); }
+  public function vertex(v:Vertex):Int { return v.x; }
+  public function optName(?n:Name):Void {}
+  public function nulPtr(p:Null<Ptr>):Void {}
+}
+";
+    let out = gen_one(src, "Uses");
+    // A reference-class alias is a pointer, not a sliced by-value copy — and dispatches `->`.
+    assert!(
+        out.contains("int Uses::panel(Panel* w)") && out.contains("return w->tag();"),
+        "class alias is a pointer with `->` dispatch:\n{out}"
+    );
+    // A struct alias is a const-ref value struct whose fields resolve.
+    assert!(
+        out.contains("int Uses::vertex(const Vertex& v)") && out.contains("return v.x;"),
+        "struct alias is a const-ref value struct with working field access:\n{out}"
+    );
+    // A container alias is passed by const-ref (Haxe reference semantics), not by value.
+    assert!(
+        out.contains("void Uses::ints(const Ints& xs)"),
+        "container alias is a const-ref, not a by-value copy:\n{out}"
+    );
+    // A string alias keeps the const-ref optimization; an optional one defaults to "".
+    assert!(
+        out.contains("void Uses::name(const Name& n)"),
+        "string alias keeps const-ref:\n{out}"
+    );
+    assert!(
+        out.contains("void Uses::optName(Name n"),
+        "optional string alias is a by-value `Name`, not a pointer:\n{out}"
+    );
+    // A pointer-interop alias passes by value, and `Null<Ptr>` stays a single pointer.
+    assert!(
+        out.contains("void Uses::ptr(Ptr p)") && out.contains("void Uses::nulPtr(Ptr p)"),
+        "pointer alias passes by value; Null<Ptr> is not a double pointer:\n{out}"
+    );
+}
+
+#[test]
+fn module_function_called_via_class_name_drops_the_class_qualifier() {
+    // Haxe allows `Module.func()` where `func` is a *module-level* function, not a
+    // member of the primary class `Module` (the module name doubles as the class
+    // name). Such a function lowers to a namespace free function, so the class
+    // qualifier must be erased: `func(...)`, never `Module::func(...)`.
+    let src = "\
+class Palette {
+  public var count:Int;
+  public function new() { this.count = 0; }
+}
+function mix(a:Int, b:Int):Int { return a + b; }
+class User {
+  public function new() {}
+  public function go():Int { return Palette.mix(2, 3); }
+}
+";
+    let out = gen_one(src, "User");
+    assert!(
+        out.contains("return mix(2, 3);"),
+        "module function called via the class name drops the qualifier:\n{out}"
+    );
+    assert!(
+        !out.contains("Palette::mix"),
+        "no class scope-resolution for a module-level free function:\n{out}"
+    );
+}
+
+#[test]
+fn static_member_call_still_uses_scope_resolution_when_a_module_fn_shadows() {
+    // The module-function rewrite must not swallow a *genuine* static member: when
+    // the primary class declares the method, `Type.method()` stays `Type::method()`.
+    let src = "\
+class Registry {
+  public function new() {}
+  public static function slot(i:Int):Int { return i; }
+}
+class User {
+  public function new() {}
+  public function go():Int { return Registry.slot(7); }
+}
+";
+    let out = gen_one(src, "User");
+    assert!(
+        out.contains("Registry::slot(7)"),
+        "a real static member keeps scope resolution:\n{out}"
+    );
+}
+
+#[test]
 fn cyclic_value_types_define_forwarders_out_of_line() {
     // A `@:op([])` forwarder that returns a *later*-defined sibling value class
     // (the sibling is incomplete in the class body) must be declared in-class and

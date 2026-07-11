@@ -279,7 +279,25 @@ impl<'a> BodyGen<'a> {
         let base = base_use.trim_end_matches('*').to_string();
         let info = match ht {
             Type::Named { path, params, .. } if params.is_empty() => {
-                self.prog.resolve_type(path, ctx).cloned()
+                let direct = self.prog.resolve_type(path, ctx).cloned();
+                // A Haxe `typedef` is transparent: for an alias of a class / interface /
+                // struct (`typedef Panel = Widget`, `typedef Vertex = Pt`) the *dispatch*
+                // info must be the target's, so method and field lookup see the real
+                // members. A container alias (`typedef Ints = Array<…>`, target has type
+                // params) keeps the alias info so `deref_alias` can still follow it to the
+                // `std::vector` / `std::map` head.
+                match &direct {
+                    Some(di) if di.kind == TypeKind::AliasTypedef => {
+                        let (target, tctx) = self.prog.resolve_alias_type_ctx(ht, ctx);
+                        match &target {
+                            Type::Named { path: tp, params: tpar, .. } if tpar.is_empty() => {
+                                self.prog.resolve_type(tp, tctx).cloned().or(direct)
+                            }
+                            _ => direct,
+                        }
+                    }
+                    _ => direct,
+                }
             }
             _ => None,
         };
