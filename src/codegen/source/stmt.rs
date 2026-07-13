@@ -18,6 +18,17 @@ impl<'a> BodyGen<'a> {
         ));
     }
 
+    /// Warn that an `@sink` tag on a value local is a silent no-op: there is no
+    /// owned heap pointer to hand off (a value local is freed automatically at
+    /// scope close, and cannot be transferred out), so suppressing its free is
+    /// meaningless. The declaration-site counterpart to the value-parameter case.
+    fn warn_sink_noop_on_value(&mut self, name: &str) {
+        self.warn(format!(
+            "`@sink` on `{name}` has no effect — it is a value local (freed \
+             automatically at scope close), not an owned pointer to hand off"
+        ));
+    }
+
     pub(super) fn gen_stmt(&mut self, st: &Stmt, ind: usize, out: &mut String) {
         let t = "\t".repeat(ind);
         self.prelude_ind = ind;
@@ -32,6 +43,7 @@ impl<'a> BodyGen<'a> {
                 init,
                 is_final: _,
                 delete,
+                sink,
                 line,
             } => {
                 self.current_line = *line;
@@ -40,14 +52,17 @@ impl<'a> BodyGen<'a> {
                 self.new_args_escape = self.escaping.contains(name);
                 let declared = ty.as_ref().map(|t| self.ty_of(t));
                 // The struct/array/map literal initialisers handled below early-return,
-                // and all bind a *value* local — so an `@delete` on them is a no-op. Warn
-                // here before those returns; the general path warns for other value inits.
-                if *delete
-                    && (matches!(init, Some(Expr::ObjectLit(_)))
-                        || matches!(init, Some(Expr::ArrayLit(v)) if !v.is_empty())
-                        || matches!(init, Some(Expr::MapLit(v)) if !v.is_empty()))
-                {
+                // and all bind a *value* local — so an `@delete`/`@sink` on them is a
+                // no-op. Warn here before those returns; the general path warns for
+                // other value inits.
+                let value_literal_init = matches!(init, Some(Expr::ObjectLit(_)))
+                    || matches!(init, Some(Expr::ArrayLit(v)) if !v.is_empty())
+                    || matches!(init, Some(Expr::MapLit(v)) if !v.is_empty());
+                if *delete && value_literal_init {
                     self.warn_delete_noop_on_value(name);
+                }
+                if *sink && value_literal_init {
+                    self.warn_sink_noop_on_value(name);
                 }
                 // var x = map.get(k)  →  bind x as a map-iterator alias. A null
                 // check on x then lowers to `it == map.end()` and any value/member
@@ -150,7 +165,13 @@ impl<'a> BodyGen<'a> {
                 if *delete && !is_ptr {
                     self.warn_delete_noop_on_value(name);
                 }
-                if forced || (owns_heap && !self.escaping.contains(name)) {
+                // `@sink` suppresses the scope-close free: the developer hands the
+                // pointer off elsewhere (the inverse of `@delete`). On a value local
+                // there is no owned pointer to hand off, so it is a no-op — warn.
+                if *sink && !is_ptr {
+                    self.warn_sink_noop_on_value(name);
+                }
+                if !*sink && (forced || (owns_heap && !self.escaping.contains(name))) {
                     self.register_owned(&emit);
                 }
             }

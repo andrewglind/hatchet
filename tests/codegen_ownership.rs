@@ -214,6 +214,180 @@ class Shelf {
 }
 
 #[test]
+fn sink_on_new_argument_transfers_ownership_and_suppresses_scope_free() {
+    // Haxe permits metadata on any expression, so `@sink new Vertex(...)` in argument
+    // position is valid source. A call-site `@sink` marks the argument as *transferred*
+    // to the callee: the fresh allocation is emitted inline (NOT hoisted into a
+    // scope-owned local), and the caller emits no scope-close `delete` for it — the
+    // developer asserts the callee now owns it. Only the un-marked owned local `q` is
+    // freed here. (Even though this `Quad`'s constructor retains nothing, the marker is
+    // honoured: worst case a leak if misused, never a double-free.)
+    let out = gen_one(
+        "class Vertex { public function new(x:Float) {} }\n\
+         class Quad { public function new(a:Vertex, b:Vertex) {} }\n\
+         class Quads {\n\
+           public function new() {}\n\
+           public function make():Void {\n\
+             var q = new Quad(@sink new Vertex(1.0), @sink new Vertex(2.0));\n\
+           }\n\
+         }\n",
+        "Quads",
+    );
+    // The marker never survives into C++, and the vertices are inline.
+    assert!(
+        !out.contains("@sink"),
+        "the @sink marker must not leak into C++:\n{out}"
+    );
+    assert!(
+        out.contains("new Quad(new Vertex(1.0), new Vertex(2.0))"),
+        "sink'd `new` args are emitted inline (transferred), not hoisted:\n{out}"
+    );
+    // The transferred vertices are NOT freed by the caller — only `q` is.
+    let make = out.split("Quads::make(").nth(1).expect("make present");
+    assert_eq!(
+        make.matches("delete ").count(),
+        1,
+        "only the un-sink'd owned local `q` is freed; the sink'd vertices are not:\n{out}"
+    );
+    assert!(
+        make.contains("delete q;"),
+        "the un-marked owned local `q` is still freed:\n{out}"
+    );
+}
+
+#[test]
+fn sink_on_owned_local_argument_drops_its_scope_free() {
+    // `@sink` on an already-owned local (`foo(@sink v)`) transfers ownership to the
+    // callee, so the caller drops the local's scope-close `delete` — mirroring the
+    // `new`-argument case for a named local.
+    let out = gen_one(
+        "class Vertex { public function new(x:Float) {} }\n\
+         class Quad { public function new(a:Vertex) {} }\n\
+         class Quads {\n\
+           public function new() {}\n\
+           public function make():Void {\n\
+             var v = new Vertex(1.0);\n\
+             var q = new Quad(@sink v);\n\
+           }\n\
+         }\n",
+        "Quads",
+    );
+    let make = out.split("Quads::make(").nth(1).expect("make present");
+    assert!(
+        !make.contains("delete v;"),
+        "the transferred local `v` must not be freed by the caller:\n{out}"
+    );
+    assert!(
+        make.contains("delete q;"),
+        "the retained owned local `q` is still freed:\n{out}"
+    );
+}
+
+#[test]
+fn new_argument_without_sink_is_still_hoisted_and_freed() {
+    // Contrast to the `@sink` cases: an un-marked `new` argument into a constructor
+    // that does not take ownership is hoisted into a scope-owned local and freed at
+    // scope close (the caller owns it). This is what `@sink` opts out of.
+    let out = gen_one(
+        "class Vertex { public function new(x:Float) {} }\n\
+         class Quad { public function new(a:Vertex) {} }\n\
+         class Quads {\n\
+           public function new() {}\n\
+           public function make():Void {\n\
+             var q = new Quad(new Vertex(1.0));\n\
+           }\n\
+         }\n",
+        "Quads",
+    );
+    let make = out.split("Quads::make(").nth(1).expect("make present");
+    assert!(
+        make.contains("= new Vertex(1.0);"),
+        "the un-sink'd `new` arg is hoisted into an owned local:\n{out}"
+    );
+    assert_eq!(
+        make.matches("delete ").count(),
+        2,
+        "both the hoisted vertex and `q` are freed:\n{out}"
+    );
+}
+
+#[test]
+fn sink_var_suppresses_the_scope_close_free() {
+    // `@sink var x = new X()` is the declaration-site counterpart to a call-site
+    // `@sink`: it suppresses the scope-close `delete` of `x` (the developer hands the
+    // object off elsewhere), the inverse of `@delete var`. A sibling un-marked owned
+    // local is still freed.
+    let out = gen_one(
+        "class Vertex { public function new(x:Float) {} }\n\
+         class Sink {\n\
+           public function new() {}\n\
+           public function f():Void {\n\
+             @sink var s:Vertex = new Vertex(1.0);\n\
+             var t:Vertex = new Vertex(2.0);\n\
+           }\n\
+         }\n",
+        "Sink",
+    );
+    let f = out.split("Sink::f(").nth(1).expect("f present");
+    assert!(
+        !f.contains("delete s;"),
+        "@sink var must suppress the scope-close free of `s`:\n{out}"
+    );
+    assert!(
+        f.contains("delete t;"),
+        "the un-marked owned local `t` is still freed:\n{out}"
+    );
+}
+
+#[test]
+fn sink_var_on_a_value_local_warns_noop() {
+    // `@sink` only means something for an owned heap pointer. On a value local there
+    // is nothing to hand off (it is freed automatically at scope close), so the tag is
+    // a no-op and must warn — mirroring `@delete` on a value local.
+    let (_, warnings) = gen_one_diag(
+        "class Sink {\n\
+           public function new() {}\n\
+           public function f():Void {\n\
+             @sink var n:Int = 5;\n\
+           }\n\
+         }\n",
+        "Sink",
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|(_, w)| w.contains("@sink") && w.contains("no effect") && w.contains("n")),
+        "@sink on a value local must warn that it has no effect: {warnings:?}"
+    );
+}
+
+#[test]
+fn sink_argument_into_owning_constructor_is_emitted_inline() {
+    // When the constructor stores its argument into an `@owned` field (so the object
+    // frees it), the escape analysis already marks that position owned — so a
+    // `@sink new …` argument is emitted inline and the receiver owns it, with no
+    // caller-side hoist or free. Here the marker and the analysis agree.
+    let out = gen_one(
+        "class Vertex { public function new(x:Float) {} }\n\
+         class Quad {\n\
+           @owned var a:Vertex;\n\
+           public function new(a:Vertex) { this.a = a; }\n\
+         }\n\
+         class Quads {\n\
+           public function new() {}\n\
+           public function make():Void {\n\
+             var q = new Quad(@sink new Vertex(1.0));\n\
+           }\n\
+         }\n",
+        "Quads",
+    );
+    assert!(
+        out.contains("new Quad(new Vertex(1"),
+        "the sink'd `new` is transferred inline to the owning constructor:\n{out}"
+    );
+}
+
+#[test]
 fn nullable_alias_container_map_dereferences_the_pointer() {
     // A `Null<Indicies>` where `typedef Indicies = Array<Int>` is a *pointer* to the
     // resolved `std::vector<int>`. Resolving the alias for container-method dispatch

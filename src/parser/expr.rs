@@ -270,6 +270,17 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn parse_primary(&mut self) -> PResult<Expr> {
+        // Leading expression metadata (`@sink new Vertex(...)`, `@:privateAccess e`,
+        // …). Haxe permits metadata on any expression. It is carried on an
+        // `Expr::Meta` wrapper, transparent to type/value everywhere; the one
+        // meaningful case is a call-site `@sink`, which marks an argument as
+        // transferred to the callee (suppressing the caller's scope-close free —
+        // see `gen_args_owned`). Anything else is inert, as hxcpp treats it.
+        if matches!(self.peek(), TokKind::Meta(_)) {
+            let meta = self.parse_meta_list()?;
+            let inner = self.parse_primary()?;
+            return Ok(Expr::Meta(meta, Box::new(inner)));
+        }
         match self.peek().clone() {
             TokKind::Int(s) => {
                 self.bump();

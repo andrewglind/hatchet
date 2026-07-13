@@ -224,6 +224,16 @@ pub enum Expr {
         pattern: String,
         flags: String,
     },
+
+    /// Expression-position metadata: `@sink new Vertex(...)`, `@:privateAccess e`,
+    /// … . Haxe permits metadata on any expression. It is transparent to type and
+    /// value everywhere — codegen and the analyses see straight through to `inner`
+    /// — with one exception: a call-site `@sink` marks the argument as *transferred*
+    /// to the callee, suppressing the caller's scope-close free of a `new`/owned
+    /// local at that position (honoured in `gen_args_owned`). Other metadata is
+    /// carried but inert (hxcpp ignores expression-position metadata at the C++
+    /// target, and so does Hatchet).
+    Meta(Vec<Meta>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -295,6 +305,11 @@ pub enum Stmt {
         /// end of this scope (the local-scope counterpart to `@owned` on a field).
         /// Overrides the ownership analysis for this local.
         delete: bool,
+        /// `@sink var x = …`: the developer's explicit request that `x` is *not*
+        /// freed at scope close — ownership is handed off elsewhere. The inverse of
+        /// `delete`, and the declaration-site counterpart to a call-site `@sink`.
+        /// Overrides the ownership analysis for this local.
+        sink: bool,
         /// Source line (1-based) of the `var`/`final`, for diagnostics.
         line: usize,
     },

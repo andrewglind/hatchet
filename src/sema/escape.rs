@@ -411,6 +411,10 @@ fn scan_expr_escapes(
         Expr::Cast { expr, .. } | Expr::TypeCheck { expr, .. } => {
             scan_expr_escapes(prog, mi, expr, escaping, fields, locals, out)
         }
+        // Expression metadata (`@sink e`, …) is transparent to escape analysis.
+        Expr::Meta(_, inner) => {
+            scan_expr_escapes(prog, mi, inner, escaping, fields, locals, out)
+        }
         _ => {}
     }
 }
@@ -902,6 +906,9 @@ impl<'a> Walk<'a> {
             }
             Expr::Ident(x) => Source::Local(x.clone()),
             Expr::Paren(inner) => self.value(inner, bound),
+            // Expression metadata is transparent (`@sink new X()` carries the alloc
+            // through unchanged); the call-site `@sink` transfer is applied in codegen.
+            Expr::Meta(_, inner) => self.value(inner, bound),
             Expr::Cast { expr, .. } => self.value(expr, bound),
             Expr::Call(target, args) => match self.call(target, args) {
                 Some(id) => {
