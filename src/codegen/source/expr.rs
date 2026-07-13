@@ -313,6 +313,11 @@ impl<'a> BodyGen<'a> {
                 let (code, _) = self.gen_expr(inner);
                 (code, Ty::default())
             }
+            // Expression-position metadata is transparent: emit the inner
+            // expression with its own type. A call-site `@sink` is consumed
+            // earlier, in `gen_args_owned`, where the argument position is known;
+            // here (any other position) it has no effect, matching hxcpp.
+            Expr::Meta(_, inner) => self.gen_expr_inner(inner),
             // Regex literals are flagged `Unsupported` in validation, so a module
             // using one is never generated; this arm only keeps the match total.
             Expr::Regex { .. } => {
@@ -1648,6 +1653,18 @@ impl<'a> BodyGen<'a> {
         args.iter()
             .enumerate()
             .map(|(i, a)| {
+                // A call-site `@sink` on this argument forces ownership transfer to
+                // the callee — the caller must not free a `new`/owned local at this
+                // position — independent of what the callee's signature or the escape
+                // analysis inferred. Unwrap the (transparent) metadata wrapper and OR
+                // its `sink` into the position's owned flag.
+                let (a, sink_here) = match a {
+                    Expr::Meta(metas, inner) => {
+                        (&**inner, metas.iter().any(|m| m.name == "sink"))
+                    }
+                    other => (other, false),
+                };
+                let owned_here = owned.get(i).copied().unwrap_or(false) || sink_here;
                 let target = param_tys.get(i).and_then(|t| t.clone());
                 // A `Null<T>`/`Dynamic`/`{}` parameter is a pointer/`void*`; a value
                 // argument is heap-allocated so the callee can own (and free) it.
@@ -1697,18 +1714,18 @@ impl<'a> BodyGen<'a> {
                     // double-free.
                     Expr::New(nty, _) if !self.value_new(nty) => {
                         let (code, vty) = self.gen_expr(a);
-                        if owned.get(i).copied().unwrap_or(false) {
+                        if owned_here {
                             code
                         } else {
                             self.place_new_arg(code, vty)
                         }
                     }
-                    // A scope-owned local handed to a `@sink` parameter: the
-                    // callee takes ownership, so transfer it (drop the scope-close
-                    // delete) rather than freeing here and dangling the callee's copy.
+                    // A scope-owned local handed to a `@sink` parameter (or marked
+                    // `@sink` at the call site): the callee takes ownership, so
+                    // transfer it (drop the scope-close delete) rather than freeing
+                    // here and dangling the callee's copy.
                     Expr::Ident(name)
-                        if owned.get(i).copied().unwrap_or(false)
-                            && self.lookup_local(name).is_some() =>
+                        if owned_here && self.lookup_local(name).is_some() =>
                     {
                         let code = self.gen_expr(a).0;
                         self.transfer_owned(name);

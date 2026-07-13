@@ -2,6 +2,38 @@
 
 All notable changes to Hatchet are documented here. Versions follow the project's milestones.
 
+## v0.3.0 — `@sink` in more positions (2026-07-13)
+
+`@sink` means what it always has — *ownership leaves here; this scope does not free the value* —
+but until now it could only be written on a **parameter**. This release lets you write it where
+the hand-off actually happens: on a **call argument** and on a **local declaration**.
+
+### Metadata is allowed on any expression
+
+Haxe permits `@meta expr` on any expression, but Hatchet's expression parser had no arm for a
+leading metadata token. Expression-position metadata now parses and is transparent to
+type and value — it changes nothing about how the wrapped expression lowers. Metadata other than
+`@sink` is carried but inert, matching hxcpp, which ignores expression-position metadata at the
+C++ target.
+
+### `@sink` on a call argument and a local declaration
+
+The same transfer semantics as a `@sink` parameter, now available at two more sites:
+
+- A `@sink new X(...)` **call argument** is emitted **inline** — not hoisted into a scope-owned
+  local that the caller deletes.
+- A `@sink local` **call argument** (an already-owned local) has its scope-close `delete`
+  **dropped**, transferring the object to the callee.
+- A `@sink var x = new X(...)` **local declaration** suppresses the scope-close `delete` of `x`
+  entirely — the inverse of `@delete var` — for when ownership is handed off with no single call
+  to attach the marker to.
+
+`@sink` is an assertion that ownership leaves the current scope, so it applies even
+when the destination is opaque to Hatchet (an `@:native` class, or a hand-off the analysis cannot
+follow) — it overrides the escape analysis. If nothing actually takes ownership the result is a
+leak, never a double-free. `@sink` on a *value* local or argument (nothing to hand off) is a
+no-op and warns.
+
 ## v0.2.9 — Type-resolution & arithmetic fixes (2026-07-11)
 
 A correctness release fixing three lowering bugs. A `Module.func()` call that targets a

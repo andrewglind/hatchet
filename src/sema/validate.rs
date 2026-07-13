@@ -1198,6 +1198,9 @@ impl<'a> UnsupportedWalker<'a> {
             }
             // `untyped EXPR` is still a real, transpiled expression — recurse into it.
             Expr::Untyped(inner) => self.expr(inner),
+            // Expression-position metadata (`@sink e`, …) is transparent — validate
+            // the wrapped expression.
+            Expr::Meta(_, inner) => self.expr(inner),
             Expr::Int(_)
             | Expr::Float(_)
             | Expr::Str { .. }
@@ -1609,6 +1612,9 @@ impl Collector {
             }
             // `untyped EXPR` is still a real, transpiled expression — recurse into it.
             Expr::Untyped(inner) => self.expr(inner, ctx),
+            // Expression-position metadata (`@sink e`, …) is transparent — validate
+            // the wrapped expression.
+            Expr::Meta(_, inner) => self.expr(inner, ctx),
             // Leaves with no nested expressions or types.
             Expr::Int(_)
             | Expr::Float(_)

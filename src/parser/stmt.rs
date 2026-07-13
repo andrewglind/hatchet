@@ -22,8 +22,14 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a `var`/`final` local declaration (the keyword is current). `delete`
-    /// carries an `@delete` marker requesting a scope-close free.
-    pub(super) fn parse_var_stmt(&mut self, line: usize, delete: bool) -> PResult<Stmt> {
+    /// carries an `@delete` marker requesting a scope-close free; `sink` carries an
+    /// `@sink` marker suppressing it (they are mutually exclusive).
+    pub(super) fn parse_var_stmt(
+        &mut self,
+        line: usize,
+        delete: bool,
+        sink: bool,
+    ) -> PResult<Stmt> {
         let is_final = self.at_kw(Kw::Final);
         self.bump();
         let name = self.expect_ident()?;
@@ -44,6 +50,7 @@ impl<'a> Parser<'a> {
             init,
             is_final,
             delete,
+            sink,
             line,
         })
     }
@@ -51,7 +58,9 @@ impl<'a> Parser<'a> {
     pub(super) fn parse_stmt(&mut self) -> PResult<Stmt> {
         let line = self.line();
         match self.peek().clone() {
-            TokKind::Kw(Kw::Var) | TokKind::Kw(Kw::Final) => self.parse_var_stmt(line, false),
+            TokKind::Kw(Kw::Var) | TokKind::Kw(Kw::Final) => {
+                self.parse_var_stmt(line, false, false)
+            }
             // `@delete var x = …` — the developer asks for `x` to be freed at the
             // end of this scope (the local-scope counterpart to `@owned`). It must
             // sit immediately before a local `var`/`final`.
@@ -62,7 +71,20 @@ impl<'a> Parser<'a> {
                         self.err("@delete must immediately precede a local `var` declaration")
                     );
                 }
-                self.parse_var_stmt(line, true)
+                self.parse_var_stmt(line, true, false)
+            }
+            // `@sink var x = …` — the developer asks that `x` is NOT freed at scope
+            // close (ownership is handed off elsewhere): the inverse of `@delete`,
+            // and the declaration-site counterpart to a call-site `@sink`. Only the
+            // `var`/`final` form is special-cased here; a `@sink` on any other
+            // expression statement falls through to the general expression path,
+            // where it is carried as (inert) expression metadata.
+            TokKind::Meta(name)
+                if name == "sink"
+                    && matches!(self.peek2(), TokKind::Kw(Kw::Var) | TokKind::Kw(Kw::Final)) =>
+            {
+                self.bump();
+                self.parse_var_stmt(line, false, true)
             }
             TokKind::Kw(Kw::If) => self.parse_if(),
             TokKind::Kw(Kw::For) => self.parse_for(),
