@@ -846,6 +846,29 @@ impl<'a> HeaderGen<'a> {
         // `(never, default)`) stays a directly-writable field in its declared
         // access group.
         for f in &c.fields {
+            // `static` fields are not per-instance members. A literal-initialised
+            // (or uninitialised) static is a plain class static (`static T NAME;`),
+            // defined out-of-line in the `.cpp`. A non-literal initializer is a
+            // Meyers singleton: the field becomes a `static T& NAME()` accessor whose
+            // function-local `static` holds the value, so the initializer runs on
+            // first use rather than at an unspecified point in the static-init order.
+            // A `final` singleton returns `const T&` (it is immutable); a `var` one
+            // stays writable through the returned reference. Both are read via
+            // `Class::NAME`(`()`) — never `this->NAME`.
+            if f.is_static {
+                let fty = self.field_type(c, f, &nullable);
+                let decl = if is_meyers_static(self.prog, self.mi, f) {
+                    let cst = if f.is_final { "const " } else { "" };
+                    format!("{t}\tstatic {cst}{fty}& {}();\n", f.name)
+                } else {
+                    format!("{t}\tstatic {fty} {};\n", f.name)
+                };
+                match f.access {
+                    Access::Public => public.push_str(&decl),
+                    _ => protected.push_str(&decl),
+                }
+                continue;
+            }
             // Haxe physicality: a `(get, never)` property without `@:isVar` is
             // purely computed — it has no backing field at all (`(get, null)`
             // keeps one: `null` write access is a physical store within the class).

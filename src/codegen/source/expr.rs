@@ -833,6 +833,18 @@ impl<'a> BodyGen<'a> {
         }
         // implicit `this` field?
         if let Some(f) = self.class_field(name) {
+            // A `static` field is class-scoped, not a per-instance `this->` member:
+            // read it via the class qualifier (`Class::NAME`), or the Meyers
+            // accessor (`Class::NAME()`) for a non-literal initializer.
+            if f.is_static {
+                let cls = self.self_class_cpp_name();
+                let call = if crate::codegen::is_meyers_static(self.prog, self.mi, f) {
+                    "()"
+                } else {
+                    ""
+                };
+                return (format!("{cls}::{name}{call}"), self.field_ty(f));
+            }
             let ty = self.field_ty(f);
             // A custom `(get, …)` property reads through its accessor, exactly as
             // in Haxe — except inside that accessor itself, where the backing
@@ -1047,6 +1059,24 @@ impl<'a> BodyGen<'a> {
             if self.lookup_local(obj).is_none() && self.class_field(obj).is_none() {
                 if let Some(res) = intrinsic_field(obj, name) {
                     return res;
+                }
+            }
+        }
+
+        // `Class.NAME` where NAME is a `static` field: a class-qualified static read
+        // (`ns::Class::NAME`), or the Meyers accessor (`ns::Class::NAME()`) for a
+        // non-literal initializer — never member access (`.`/`->`).
+        if let Expr::Ident(tname) = recv {
+            if self.lookup_local(tname).is_none() && self.class_field(tname).is_none() {
+                if let Some(info) = self
+                    .prog
+                    .resolve_type(std::slice::from_ref(tname), self.mi)
+                    .cloned()
+                {
+                    if let Some(f) = self.class_static_field(&info, name) {
+                        let ty = self.member_field_ty(&info, name).unwrap_or_default();
+                        return (self.qualified_static_ref(&info, f), ty);
+                    }
                 }
             }
         }
