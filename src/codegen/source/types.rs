@@ -468,6 +468,44 @@ impl<'a> BodyGen<'a> {
         }
     }
 
+    /// The current class's emitted C++ name (its `@:native` rename, if any) — the
+    /// qualifier for reading its own `static` fields (`Class::NAME`).
+    pub(super) fn self_class_cpp_name(&self) -> String {
+        self.prog
+            .resolve_type(std::slice::from_ref(&self.class.name), self.mi)
+            .map(|t| t.cpp_name().to_string())
+            .unwrap_or_else(|| self.class.name.clone())
+    }
+
+    /// A `static` field declared on the class described by `info` (searching base
+    /// classes), or `None` when `name` is not a static field there. Used to route a
+    /// `Class.NAME` access to a class-qualified static read rather than `.`/`->`.
+    pub(super) fn class_static_field(&self, info: &TypeInfo, name: &str) -> Option<&'a Field> {
+        if let Some(Decl::Class(c)) = self.prog.type_decl(info) {
+            return self.find_field(c, name).filter(|f| f.is_static);
+        }
+        None
+    }
+
+    /// The class-qualified read for a `static` field on `info`: `ns::Class::NAME` for
+    /// a plain static, or the Meyers accessor `ns::Class::NAME()` for a non-literal
+    /// initializer. The namespace prefix is added only when the class lives in a
+    /// namespace other than the one being generated into.
+    pub(super) fn qualified_static_ref(&self, info: &TypeInfo, f: &Field) -> String {
+        let ns = info.cpp_namespace();
+        let prefix = if ns == self.ns || ns.is_empty() {
+            String::new()
+        } else {
+            format!("{}::", ns.join("::"))
+        };
+        let call = if crate::codegen::is_meyers_static(self.prog, self.mi, f) {
+            "()"
+        } else {
+            ""
+        };
+        format!("{prefix}{}::{}{call}", info.cpp_name(), f.name)
+    }
+
     /// Find a field in `class` or any of its base classes.
     pub(super) fn find_field(&self, class: &'a Class, name: &str) -> Option<&'a Field> {
         if let Some(f) = class.fields.iter().find(|f| f.name == name) {

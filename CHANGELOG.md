@@ -2,6 +2,31 @@
 
 All notable changes to Hatchet are documented here. Versions follow the project's milestones.
 
+## v0.3.1 — Static fields (2026-07-20)
+
+Class `static` fields are now lowered as genuine class-scoped statics instead of being
+mistakenly emitted as per-instance members. A **scalar / `String`** static with a **literal**
+initializer (or none) is a plain class static — `static T NAME;` in the header, with an out-of-line
+`T Class::NAME = <literal>;` definition — and reads as `Class::NAME`.
+
+Otherwise the field is lowered as a **Meyers singleton**: a `static T& NAME()` accessor whose
+function-local `static` holds the value and is initialised on the first call, read as
+`Class::NAME()`. This is the case for **any struct / container / reference-typed** static (C++98
+cannot constant-initialise one as a class-scope data member) and for a **scalar with a non-literal
+initializer** (a call, `new`, arithmetic, …) — deferring it to first use rather than running it at
+an unspecified point in the C++ static-initialisation order (the "static init order fiasco"). A
+function-local `static` is initialised exactly once by the language, so no guard flag is needed;
+when the initializer builds a temporary (e.g. an array), that setup is folded into a one-off
+`_init_*` helper so it too runs once. A `final` field returns `const T&` (it is immutable); a `var`
+stays writable through the returned reference. Reads resolve correctly whether written bare inside
+the class or qualified (`Class.NAME`) from elsewhere.
+
+Because the accessor-vs-data-member choice is driven by the field's **type**, a consuming
+`extern` / `@proxy` binding — which carries no initializer — reads the field the same way the
+producing class emits it: a struct-typed `static` bound through an extern is called
+(`native::Class::NAME()`), matching the native Meyers accessor, while a scalar `static final` stays
+a plain data-member read.
+
 ## v0.3.0 — `@sink` in more positions (2026-07-13)
 
 `@sink` means what it always has — *ownership leaves here; this scope does not free the value* —

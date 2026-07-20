@@ -107,6 +107,70 @@ fn param_default(prog: &Program, mi: usize, ns: &[String], p: &Param) -> String 
     }
 }
 
+/// Whether a static field's initializer is a compile-time literal (or is a
+/// negation/complement of one). Such an initializer can be lowered as a plain
+/// out-of-line static definition (`T Class::NAME = <lit>;`). A *non-literal*
+/// initializer — a call, `new`, container/object literal, an identifier, arithmetic
+/// on non-constants, an interpolated string, etc. — runs arbitrary code at load
+/// time and must instead use the Meyers-singleton form (see [`is_meyers_static`]).
+pub(crate) fn is_literal_init(e: &Expr) -> bool {
+    match e {
+        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null => true,
+        Expr::Str { interpolated, .. } => !interpolated,
+        Expr::Paren(inner) => is_literal_init(inner),
+        Expr::Unary {
+            op: UnOp::Neg | UnOp::BitNot | UnOp::Not,
+            expr,
+            prefix: true,
+        } => is_literal_init(expr),
+        _ => false,
+    }
+}
+
+/// Whether a `static` field is lowered as a Meyers singleton — a `static T& NAME()`
+/// accessor returning a reference, backed by a function-local `static` initialised
+/// on first use — rather than a plain class static (`static T NAME;`, read directly
+/// as `Class::NAME`).
+///
+/// The decision must be derivable from the *declaration* alone, so that a producing
+/// class and a consuming `extern`/`@proxy` binding of the same field agree on the
+/// read shape (`Class::NAME` vs `Class::NAME()`) — the extern side carries no
+/// initializer to inspect. A **struct / container / reference** type can never be a
+/// C++98 constant-initialised class-scope data member, so it is *always* a Meyers
+/// accessor. A **scalar / `String`** (or untyped) static is a Meyers accessor only
+/// when its initializer is *non-literal* — a literal (or absent) one is a plain data
+/// member, while a computed one would otherwise run at an unspecified point in the
+/// static-initialisation order (the "static init order fiasco").
+pub(crate) fn is_meyers_static(prog: &Program, mi: usize, f: &Field) -> bool {
+    if !f.is_static {
+        return false;
+    }
+    if let Some(ty) = f.ty.as_ref() {
+        if !static_type_is_scalar_or_string(prog, mi, ty) {
+            return true;
+        }
+    }
+    f.init.as_ref().is_some_and(|e| !is_literal_init(e))
+}
+
+/// Whether a static field's type is a primitive scalar or `String` (following alias
+/// typedefs) — the only shapes that can be a plain constant-initialised C++ data
+/// member. A parameterised or non-primitive named type (struct/container/reference)
+/// is not.
+fn static_type_is_scalar_or_string(prog: &Program, mi: usize, ty: &Type) -> bool {
+    let resolved = prog.resolve_alias_type(ty, mi);
+    let Type::Named { path, params, .. } = &resolved else {
+        return false;
+    };
+    if !params.is_empty() {
+        return false;
+    }
+    let name = path.last().map(|s| s.as_str()).unwrap_or("");
+    name == "String"
+        || crate::sema::types::map_primitive(name).is_some()
+        || crate::sema::types::is_uint_shim(name)
+}
+
 pub(crate) fn is_value_struct(prog: &Program, mi: usize, ty: &Type) -> bool {
     // Resolve through alias typedefs first: an alias inherits the value-vs-reference
     // shape of what it *names*, not "typedef, therefore struct". `typedef Color =

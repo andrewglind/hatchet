@@ -269,6 +269,101 @@ class Atlas {
 }
 
 #[test]
+fn static_fields_lower_to_class_scoped_statics() {
+    // A `static` field is class-scoped, never a per-instance `this->` member. A
+    // literal-initialised static is a plain class static (`static T NAME;` in the
+    // header + an out-of-line `T C::NAME = <lit>;`); a *non-literal* initializer
+    // becomes a Meyers singleton — a `static T& NAME()` accessor whose function-local
+    // `static` is populated on first use, sidestepping the static-initialisation-order
+    // fiasco. Both are read via the class qualifier (`C::NAME` / `C::NAME()`), from
+    // inside the class (a bare reference) and from another class (`C.NAME`).
+    let src = "\
+typedef Vec = { var x:Float; var y:Float; }
+
+final Build = function(a:Array<Float>):Vec { return { x: a[0], y: a[1] }; }
+
+class Store {
+  public static var Origin:Vec = Build([1.0, 2.0]);
+  public static final Unit:Vec = Build([1.0, 0.0]);
+  public static final MAX:Int = 10;
+  public static var Label:String = \"hi\";
+  public function new() {}
+  public static function first():Vec { return Origin; }
+  public static function cap():Int { return MAX; }
+}
+
+class Reader {
+  public function new() {}
+  public function get():Vec { return Store.Unit; }
+  public function lim():Int { return Store.MAX; }
+}
+";
+    let header = gen_header(src, "Store");
+    let out = gen_one(src, "Store");
+
+    // Header: Meyers accessor for each non-literal static (`const T&` for the `final`
+    // one, `T&` for the `var`); plain `static` declarations for the literal ones —
+    // never plain instance fields.
+    assert!(
+        header.contains("static Vec& Origin();"),
+        "non-literal `var` static → mutable Meyers accessor:\n{header}"
+    );
+    assert!(
+        header.contains("static const Vec& Unit();"),
+        "non-literal `final` static → const Meyers accessor:\n{header}"
+    );
+    assert!(
+        header.contains("static int MAX;") && header.contains("static std::string Label;"),
+        "literal statics → plain `static` declarations:\n{header}"
+    );
+    assert!(
+        !header.contains("\tVec Origin;"),
+        "a static must not be emitted as a per-instance field:\n{header}"
+    );
+
+    // Source: a function-local `static` is initialised exactly once by the language,
+    // so there is NO guard flag; the initializer's array-building prelude is folded
+    // into a one-off `_init_*` helper. A `final` singleton caches in a `static const`.
+    assert!(
+        out.contains("Vec& Store::Origin() {")
+            && out.contains("static Vec _hx_v = _init_Store_Origin();"),
+        "Meyers `var`: function-local static from a one-off helper:\n{out}"
+    );
+    assert!(
+        out.contains("const Vec& Store::Unit() {")
+            && out.contains("static const Vec _hx_v = _init_Store_Unit();"),
+        "Meyers `final`: const function-local static:\n{out}"
+    );
+    assert!(
+        out.contains("_init_Store_Origin() {") && out.contains("_init_Store_Unit() {"),
+        "each Meyers static gets a one-off init helper:\n{out}"
+    );
+    assert!(
+        !out.contains("static bool"),
+        "no redundant guard flag — the function-local static already inits once:\n{out}"
+    );
+    assert!(
+        out.contains("int Store::MAX = 10;") && out.contains("std::string Store::Label = \"hi\";"),
+        "literal statics → out-of-line definitions:\n{out}"
+    );
+
+    // Reads route through the class qualifier — `()` only for the Meyers form — for
+    // both a bare in-class reference and a qualified `Class.NAME` from another class.
+    assert!(
+        out.contains("return Store::Origin();") && out.contains("return Store::Unit();"),
+        "static read → accessor call (bare and qualified):\n{out}"
+    );
+    assert!(
+        out.contains("return Store::MAX;"),
+        "plain static read → qualified, no call:\n{out}"
+    );
+    assert!(
+        !out.contains("this->Origin") && !out.contains("this->MAX") && !out.contains("this->Label"),
+        "a static read must never go through this->:\n{out}"
+    );
+}
+
+#[test]
 fn array_pop_removes_and_returns_the_last_element() {
     // `Array.pop()` must both read the last element AND shrink the vector — a bare
     // `back()` (the prior lowering) never removed it.

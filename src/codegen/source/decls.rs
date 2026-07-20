@@ -38,7 +38,91 @@ impl<'a> BodyGen<'a> {
             s.push_str(&self.method_impl(&name, &m));
             s.push('\n');
         }
+        for f in self.class.fields.clone() {
+            if f.is_static {
+                s.push_str(&self.static_field_def(&name, &f));
+                s.push('\n');
+            }
+        }
         s
+    }
+
+    /// Out-of-line definition for a `static` field.
+    ///
+    /// A literal-initialised (or uninitialised) static gets a plain namespace-scope
+    /// definition: `T Class::NAME = <lit>;`. A non-literal initializer becomes a
+    /// Meyers singleton — the `static T& Class::NAME()` accessor declared in the
+    /// header, whose function-local `static` holds the value. A function-local
+    /// `static` is initialised exactly once by the language, so no guard flag is
+    /// needed; when the initializer hoists a prelude (e.g. building an array), that
+    /// setup is folded into a one-off `_init_*` helper so it too runs once (the same
+    /// idiom as a file-scoped `Array` final's builder). A `final` field is cached in
+    /// a `static const` and returned by `const T&`.
+    pub(super) fn static_field_def(&mut self, class_name: &str, f: &Field) -> String {
+        self.push_scope();
+        self.current_fn = f.name.clone();
+        let vty = self.field_ty(f);
+        let spelling = self.decl_spelling(&vty);
+
+        if !crate::codegen::is_meyers_static(self.prog, self.mi, f) {
+            // Plain class static: `T Class::NAME[ = <lit>];`.
+            let init = f.init.as_ref().map(|e| {
+                self.expected = Some(vty.clone());
+                let (code, _) = self.gen_expr(e);
+                self.expected = None;
+                code
+            });
+            self.pop_scope();
+            return match init {
+                Some(code) => format!(
+                    "\t{spelling} {class_name}::{name} = {code};\n",
+                    name = f.name
+                ),
+                None => format!("\t{spelling} {class_name}::{name};\n", name = f.name),
+            };
+        }
+
+        // Meyers singleton accessor. `const` for an immutable (`final`) field.
+        let init = f.init.as_ref().expect("meyers static has an initializer");
+        let cst = if f.is_final { "const " } else { "" };
+        self.prelude_ind = 2;
+        self.expected = Some(vty.clone());
+        let (code, _) = self.gen_expr(init);
+        self.expected = None;
+        let mut prelude = String::new();
+        self.flush(&mut prelude);
+        self.pop_scope();
+        let inl = self.inline_kw();
+
+        if prelude.is_empty() {
+            // No hoisting: initialise the function-local static directly.
+            return format!(
+                "\t{inl}{cst}{spelling}& {class_name}::{name}() {{\n\
+                 \t\tstatic {cst}{spelling} _hx_v = {code};\n\
+                 \t\treturn _hx_v;\n\
+                 \t}}\n",
+                name = f.name,
+            );
+        }
+
+        // The initializer hoists a prelude: fold it into a one-off init helper so it
+        // runs exactly once, and let the function-local static cache the result.
+        let helper = format!("_init_{}_{}", self.class.name, f.name);
+        // In a header-only amalgamation the accessor is `inline` (shared across TUs),
+        // so the helper it calls must have external linkage too (`inline`), not the
+        // file-local `static` used in a `.cpp`.
+        let helper_kw = if self.inline_defs { "inline " } else { "static " };
+        format!(
+            "\t{helper_kw}{spelling} {helper}() {{\n\
+             {prelude}\
+             \t\treturn {code};\n\
+             \t}}\n\
+             \t{inl}{cst}{spelling}& {class_name}::{name}() {{\n\
+             \t\tstatic {cst}{spelling} _hx_v = {helper}();\n\
+             \t\treturn _hx_v;\n\
+             \t}}\n",
+            name = f.name,
+        )
     }
 
     pub(super) fn ctor_impl(&mut self, class_name: &str, ctor: &Function) -> String {

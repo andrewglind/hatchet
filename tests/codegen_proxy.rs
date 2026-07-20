@@ -51,6 +51,47 @@ class User {
 }
 
 #[test]
+fn struct_typed_static_read_through_an_extern_calls_the_meyers_accessor() {
+    // A struct-typed `static` field is emitted (by the producing side) as a Meyers
+    // accessor — a function `Class::NAME()`, not a data member. The extern/`@proxy`
+    // binding carries no initializer, so Meyers-ness is decided by the *type*: a
+    // struct (never a C++98 constant-initialised data member) is always an accessor,
+    // so a read through the extern must call it — `native::Class::NAME()` — to match
+    // the native definition. A scalar `static final` stays a plain data member read.
+    let src = "\
+typedef Matrix = { var m:Array<Float>; }
+
+@:include(\"Transforms.h\") @:native(\"modules::Transforms\")
+extern class TransformsNative {
+  public static final Identity:Matrix;
+  public static final COUNT:Int;
+}
+
+@proxy(\"modules::Transforms\")
+abstract Transforms(cpp.Pointer<TransformsNative>) {
+  public static final Identity:Matrix = {};
+  public static final COUNT:Int = 0;
+}
+
+class Game {
+  public function new() {}
+  public function use():Matrix { return Transforms.Identity; }
+  public function n():Int { return Transforms.COUNT; }
+}
+";
+    let out = gen_one(src, "Game");
+    assert!(
+        out.contains("return modules::Transforms::Identity();"),
+        "struct static through the extern → Meyers accessor call:\n{out}"
+    );
+    assert!(
+        out.contains("return modules::Transforms::COUNT;")
+            && !out.contains("COUNT()"),
+        "scalar static through the extern stays a plain data-member read:\n{out}"
+    );
+}
+
+#[test]
 fn produce_proxy_abstract_class_is_a_native_base_subclasses_derive_from() {
     // `@proxy("native")` on an `abstract class` is the produced-base form: the base
     // is never emitted, but a subclass `extends` it as the native base
