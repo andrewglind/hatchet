@@ -6,7 +6,6 @@
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
-use crate::ast::*;
 use crate::sema::Program;
 
 use super::*;
