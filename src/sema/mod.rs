@@ -402,6 +402,29 @@ impl Program {
     /// class JValue`) is missed by its native spelling. Tries the Haxe name first
     /// (the common case), then falls back to matching a type's `cpp_name()`, so
     /// member access on a renamed container element still resolves (`vals[i].s`).
+    /// Recover a type from a C++ spelling as emitted in namespace `current_ns`
+    /// (`mucus::Vertex`, or `Vertex` for a same-namespace type). A qualified
+    /// spelling is matched exactly on namespace + C++ name, so two types sharing
+    /// a leaf name (`mucus::Vertex` struct vs `modules::Vertex` proxy) never
+    /// alias; an unqualified one prefers `current_ns`. Anything unmatched falls
+    /// back to the bare-leaf `resolve_type_by_cpp`.
+    pub fn resolve_type_by_cpp_spelling(
+        &self,
+        spelling: &str,
+        ctx_module: usize,
+        current_ns: &[String],
+    ) -> Option<&TypeInfo> {
+        let s = spelling.trim().trim_start_matches("::");
+        let (ns, leaf): (Vec<String>, &str) = match s.rsplit_once("::") {
+            Some((ns, leaf)) => (ns.split("::").map(str::to_string).collect(), leaf),
+            None => (current_ns.to_vec(), s),
+        };
+        self.types
+            .iter()
+            .find(|t| t.proxy_native.is_none() && t.cpp_name() == leaf && t.cpp_namespace() == ns)
+            .or_else(|| self.resolve_type_by_cpp(leaf, ctx_module))
+    }
+
     pub fn resolve_type_by_cpp(&self, bare: &str, ctx_module: usize) -> Option<&TypeInfo> {
         let owned = [bare.to_string()];
         if let Some(t) = self.resolve_type(&owned, ctx_module) {

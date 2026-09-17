@@ -429,3 +429,92 @@ class Probe {
         "index-assign auto-extend routes through the (now mutable) getter:\n{out}"
     );
 }
+
+/// Transpile a multi-package synthetic tree (`(relative path, source)` pairs) and
+/// return module `stem`'s generated `.cpp`.
+fn gen_tree(files: &[(&str, &str)], stem: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("hatchet_tree_{stem}_{}", std::process::id()));
+    for (rel, src) in files {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, src).unwrap();
+    }
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let idx = prog
+        .modules
+        .iter()
+        .position(|m| m.path.file_stem().and_then(|s| s.to_str()) == Some(stem))
+        .unwrap();
+    let out = generate_source(&prog, idx).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+#[test]
+fn struct_member_types_resolve_in_the_declaring_module_not_a_same_named_proxy() {
+    // `mucus.Vertex` (a value struct) and `modules.Vertex` (a consume proxy → a
+    // native pointer) share a leaf name, and the user imports both. A member of a
+    // `mucus` typedef (`Mesh.vertices:Array<Vertex>`, `Line.a:Vertex`) must resolve
+    // `Vertex` where it was *declared* — `mucus::Vertex` — not in the user's scope,
+    // where `Vertex` is the proxy. Otherwise indexing the vector emits `->` (as if
+    // the element were a pointer) and a nested struct literal is typed as the proxy.
+    let mucus = "\
+package mucus;
+@:include(\"Mucus.h\") @:native(\"mucus::Vertex\")
+extern typedef Vertex = { x:cpp.Float32, y:cpp.Float32 }
+@:include(\"Mucus.h\") @:native(\"mucus::Line\")
+extern typedef Line = { a:Vertex, b:Vertex }
+@:include(\"Mucus.h\") @:native(\"mucus::Mesh\")
+extern typedef Mesh = { vertices:Array<Vertex> }
+";
+    let modules = "\
+package modules;
+@:include(\"Vertex.h\") @:native(\"modules::Vertex\")
+extern class VertexNative { public function new(x:Float, y:Float); }
+@proxy(\"modules::Vertex\") abstract Vertex(cpp.Pointer<VertexNative>) {
+  public function new(x:Float, y:Float) { this = null; }
+}
+";
+    let room = "\
+package game;
+import mucus.Mucus;
+import modules.Modules;
+class Room {
+  var mesh:mucus.Mucus.Mesh;
+  var line:mucus.Mucus.Line;
+  public function new() {}
+  public function edit():Void {
+    for (i in 0...this.mesh.vertices.length) {
+      this.mesh.vertices[i].x = 1.0;
+      var f:Float = this.mesh.vertices[i].y;
+    }
+  }
+  public function build(v:mucus.Mucus.Vertex):Void {
+    this.line = { a: { x: 1.0, y: 2.0 }, b: v };
+    this.mesh = { vertices: [ { x: 3.0, y: 4.0 } ] };
+  }
+}
+";
+    let out = gen_tree(
+        &[
+            ("mucus/Mucus.hx", mucus),
+            ("modules/Modules.hx", modules),
+            ("game/Room.hx", room),
+        ],
+        "Room",
+    );
+    assert!(
+        out.contains("this->mesh.vertices[_i1].x = 1.0;")
+            && out.contains("this->mesh.vertices[_i1].y;")
+            && !out.contains("]->"),
+        "a vector-of-structs element is a value (`.`), not a pointer:\n{out}"
+    );
+    assert!(
+        !out.contains("modules::Vertex"),
+        "nested literals never resolve to the same-named proxy:\n{out}"
+    );
+    assert!(
+        out.contains("mucus::Vertex _f") && out.contains("std::vector<mucus::Vertex> _f"),
+        "nested struct / array-of-struct literals take the declared member type:\n{out}"
+    );
+}
