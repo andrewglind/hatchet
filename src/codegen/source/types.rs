@@ -97,8 +97,10 @@ impl<'a> BodyGen<'a> {
                 let v = v.trim();
                 let is_ptr = v.ends_with('*');
                 let base = v.trim_end_matches('*').trim().to_string();
-                let bare = base.rsplit("::").next().unwrap_or(&base);
-                let info = self.prog.resolve_type_by_cpp(bare, self.mi).cloned();
+                let info = self
+                    .prog
+                    .resolve_type_by_cpp_spelling(&base, self.mi, &self.ns)
+                    .cloned();
                 return (
                     key,
                     Ty {
@@ -432,9 +434,13 @@ impl<'a> BodyGen<'a> {
             let base = inner.trim_end_matches('*').trim().to_string();
             // Recover the user/native type so member access on the loop variable
             // still resolves (`for (tile in tiles) tile.GetExtents()`). Resolve via
-            // the C++ leaf name so a `@:native`-renamed element type is found too.
-            let bare = base.rsplit("::").next().unwrap_or(&base);
-            let info = self.prog.resolve_type_by_cpp(bare, self.mi).cloned();
+            // the C++ spelling so a `@:native`-renamed element type is found too —
+            // matched on its qualified name, so a same-leaf type in another
+            // namespace (a `modules::Vertex` proxy vs `mucus::Vertex`) can't alias.
+            let info = self
+                .prog
+                .resolve_type_by_cpp_spelling(&base, self.mi, &self.ns)
+                .cloned();
             return Ty {
                 base,
                 is_ptr,
@@ -658,23 +664,32 @@ impl<'a> BodyGen<'a> {
     pub(super) fn accessor_field_ty(&self, info: &TypeInfo, name: &str) -> Ty {
         match self.lookup_field(info, name) {
             Some(f) => match &f.ty {
-                Some(t) => self.ty_of(t),
+                Some(t) => self.ty_of_in(t, info.module_index),
                 None => Ty::default(),
             },
             None => Ty::default(),
         }
     }
 
+    /// The type of member `name` on `info`. A member's declared type is resolved in
+    /// the scope of the module that *declares* it, not the using module: a
+    /// `mucus.Mesh { vertices:Array<Vertex> }` means `mucus::Vertex` even where the
+    /// user also imports a same-named `modules::Vertex`.
     pub(super) fn member_field_ty(&self, info: &TypeInfo, name: &str) -> Option<Ty> {
         match self.prog.type_decl(info)? {
-            Decl::Class(c) => self.find_field(c, name).map(|f| self.field_ty(f)),
+            Decl::Class(c) if info.module_index == self.mi => {
+                self.find_field(c, name).map(|f| self.field_ty(f))
+            }
+            Decl::Class(c) => self
+                .find_field(c, name)
+                .map(|f| f.ty.as_ref().map(|t| self.ty_of_in(t, info.module_index)).unwrap_or_default()),
             Decl::Typedef(Typedef {
                 target: TypedefTarget::Struct(fields),
                 ..
             }) => fields
                 .iter()
                 .find(|f| f.name == name)
-                .map(|f| self.ty_of(&f.ty)),
+                .map(|f| self.ty_of_in(&f.ty, info.module_index)),
             _ => None,
         }
     }
@@ -701,7 +716,7 @@ impl<'a> BodyGen<'a> {
                     return t;
                 }
                 match &m.ret {
-                    Some(t) => self.ty_of(t),
+                    Some(t) => self.ty_of_in(t, info.module_index),
                     None => Ty::default(),
                 }
             }

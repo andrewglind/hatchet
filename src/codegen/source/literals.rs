@@ -84,8 +84,11 @@ impl<'a> BodyGen<'a> {
         if e.info.is_none() && !e.base.is_empty() {
             // Recover info from the element's bare name for struct expansion
             // (via the C++ leaf name, so a `@:native`-renamed type resolves too).
-            let bare = e.base.rsplit("::").next().unwrap_or(&e.base);
-            if let Some(info) = self.prog.resolve_type_by_cpp(bare, self.mi).cloned() {
+            if let Some(info) = self
+                .prog
+                .resolve_type_by_cpp_spelling(&e.base, self.mi, &self.ns)
+                .cloned()
+            {
                 return Ty {
                     info: Some(info),
                     ..e

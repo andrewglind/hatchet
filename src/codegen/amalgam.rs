@@ -4,7 +4,6 @@
 
 use std::fmt::Write;
 
-use crate::ast::*;
 use crate::sema::Program;
 
 use super::header::HeaderGen;

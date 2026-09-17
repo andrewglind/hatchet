@@ -2,6 +2,27 @@
 
 All notable changes to Hatchet are documented here. Versions follow the project's milestones.
 
+## v0.3.2 — Member types resolve where they are declared (2026-09-17)
+
+A correctness release fixing two lowering bugs that share one root cause. When a module imports
+two types with the same leaf name — typically a `@proxy` handle and an unrelated native value
+struct, such as a `ui.Vertex` proxy alongside a `gfx.Vertex` struct — Hatchet could pick the wrong
+one while typing the *members* of the other module's types.
+
+### Fixes
+
+- **A member's type resolves in the module that declares it.** The field types of a `typedef`
+  struct or class, a property's field type, and a method's return type were resolved in the scope
+  of the module *using* them rather than the module *declaring* them.
+
+- **Types recovered from a C++ spelling match the qualified name.** A vector's element type or a
+  map's value type is recovered from its emitted spelling (`std::vector<gfx::Vertex>`). That lookup
+  used only the leaf name (`Vertex`), so it too could land on a same-named type in another
+  namespace; it now matches namespace + name exactly, falling back to the leaf name only when no
+  qualified match exists.
+
+Existing code whose type names don't collide generates byte-identical output.
+
 ## v0.3.1 — Static fields (2026-07-20)
 
 Class `static` fields are now lowered as genuine class-scoped statics instead of being
