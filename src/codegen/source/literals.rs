@@ -61,7 +61,7 @@ impl<'a> BodyGen<'a> {
                 }
                 _ => {
                     let field_ptr = member.as_ref().map(|m| m.is_ptr).unwrap_or(false);
-                    let (vcode, vty) = self.gen_expr(value);
+                    let (vcode, vty) = self.gen_expr_hinted(value, member.clone());
                     self.flush(out);
                     if !field_ptr && vty.is_ptr {
                         // value is a pointer, target field is a value: null-guarded deref
@@ -216,7 +216,7 @@ impl<'a> BodyGen<'a> {
                 self.expand_object_into_local(&tmp, &elem, fields, ind, out);
                 let _ = writeln!(out, "{t}{name}.push_back({tmp});");
             } else {
-                let (c, _) = self.gen_expr(el);
+                let (c, _) = self.gen_expr_hinted(el, Some(elem.clone()));
                 self.flush(out);
                 let _ = writeln!(out, "{t}{name}.push_back({c});");
             }
@@ -248,7 +248,7 @@ impl<'a> BodyGen<'a> {
                 self.expand_object_into_local(&tmp, val, fields, ind, out);
                 let _ = writeln!(out, "{t}{name}[{kc}] = {tmp};");
             } else {
-                let (vc, _) = self.gen_expr(v);
+                let (vc, _) = self.gen_expr_hinted(v, Some(val.clone()));
                 self.flush(out);
                 let _ = writeln!(out, "{t}{name}[{kc}] = {vc};");
             }

@@ -1045,6 +1045,14 @@ fn intrinsic_field(obj: &str, name: &str) -> Option<(String, Ty)> {
     Some((code.to_string(), float_ty()))
 }
 
+/// `cpp.Float32` — a 32-bit C++ `float`, distinct from Haxe `Float` (`double`).
+fn float32_ty() -> Ty {
+    Ty {
+        base: "float".into(),
+        ..Default::default()
+    }
+}
+
 fn float_ty() -> Ty {
     // Haxe `Float` lowers to C++ `double` (64-bit, matching official targets).
     Ty {
@@ -1324,7 +1332,9 @@ fn unop(op: UnOp) -> &'static str {
 
 /// A Haxe `Float` literal as C++. Haxe `Float` lowers to `double`, and an
 /// unsuffixed C++ floating literal *is* a `double` — emit it unchanged (no `f`
-/// suffix, which would truncate it to single precision).
+/// suffix, which would truncate it to single precision). A literal landing in a
+/// `cpp.Float32` context takes the suffix at the emission site; see the
+/// `Expr::Float` arm of `gen_expr_inner`.
 pub(crate) fn float_lit(s: &str) -> String {
     s.to_string()
 }

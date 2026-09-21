@@ -781,8 +781,10 @@ class Use {
         out.contains("std::vector<Vec2>"),
         "Array<Vec2> is a value vector:\n{out}"
     );
+    // The pushed value is bound to an element-typed local first (the VC6
+    // `push_back`-temporary route-around) — still a value, still no heap.
     assert!(
-        out.contains("pts.push_back(Vec2(1.0, 2.0))"),
+        out.contains("Vec2 _elem1 = Vec2(1.0, 2.0);") && out.contains("pts.push_back(_elem1)"),
         "pushed value, no heap:\n{out}"
     );
     assert!(

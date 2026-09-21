@@ -808,7 +808,7 @@ class Grid {
         "construction should be hoisted to a Cell* local:\n{out}"
     );
     assert!(
-        out.contains("->GetValue());"),
+        out.contains("->GetValue()"),
         "the property should be read off the local via the accessor:\n{out}"
     );
     assert!(

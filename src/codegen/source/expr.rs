@@ -215,9 +215,7 @@ impl<'a> BodyGen<'a> {
             let (tcode, tty) = self.gen_lvalue(target);
             // The target type is the contextual hint for the RHS (e.g. an
             // `Array.map` result whose element type comes from the LHS).
-            self.expected = Some(tty.clone());
-            let (vcode, vty) = self.gen_expr(value);
-            self.expected = None;
+            let (vcode, vty) = self.gen_expr_hinted(value, Some(tty.clone()));
             if vty.nullable && !tty.nullable {
                 self.warn(format!(
                     "'{tcode}' is assigned a Null<T> value but is not a `Null<T>`; nullable values should be held in a `Null<T>`"
@@ -296,7 +294,20 @@ impl<'a> BodyGen<'a> {
                     ..Default::default()
                 },
             ),
-            Expr::Float(s) => (float_lit(s), float_ty()),
+            // A float literal takes the `f` suffix when the context it lands in is a
+            // 32-bit `float` (`cpp.Float32`): a bare `0.1` is a `double` literal, so
+            // `float f = 0.1;` or a `float` parameter narrows it at the conversion —
+            // which MSVC reports as C4305 on every such line. The value is unchanged
+            // (`0.1` narrowed *is* `0.1f`); the suffix just says so in the source, so
+            // a VC6 build stays warning-clean. A genuine `double` context is left
+            // alone — narrowing there would change behaviour, not just quiet a warning.
+            Expr::Float(s) => {
+                if self.expects_float() {
+                    (format!("{}f", float_lit(s)), float32_ty())
+                } else {
+                    (float_lit(s), float_ty())
+                }
+            }
             Expr::Bool(b) => (
                 b.to_string(),
                 Ty {
@@ -504,8 +515,13 @@ impl<'a> BodyGen<'a> {
                     && (matches!(lhs.as_ref(), Expr::Null) || matches!(rhs.as_ref(), Expr::Null));
                 let saved_deref = self.no_nullable_deref;
                 self.no_nullable_deref = null_cmp;
-                let (l, lty) = self.gen_expr(lhs);
-                let (r, rty) = self.gen_expr(rhs);
+                // The operands do not inherit the expression's target type: Haxe
+                // arithmetic on `Float` is double arithmetic whatever it is assigned
+                // to, so a literal operand must stay a `double` literal (suffixing it
+                // would quietly make the whole computation single-precision, which is
+                // a behaviour change, not the cosmetic one this hint is for).
+                let (l, lty) = self.gen_expr_hinted(lhs, None);
+                let (r, rty) = self.gen_expr_hinted(rhs, None);
                 self.no_nullable_deref = saved_deref;
                 // A Haxe `String` lowers to a value `std::string`, which has no null
                 // state. A `Null<String>` (a pointer) compares against `NULL` as
@@ -1762,7 +1778,10 @@ impl<'a> BodyGen<'a> {
                         code
                     }
                     _ => {
-                        let (code, vty) = self.gen_expr(a);
+                        // The parameter's type is this argument's context (and it
+                        // replaces any enclosing one, which belongs to the call's
+                        // own target, not to its arguments).
+                        let (code, vty) = self.gen_expr_hinted(a, target.clone());
                         if heap && !vty.is_ptr {
                             // Null<T> → allocate T; void*/Dynamic → allocate the
                             // argument's own type (it converts to void* implicitly).

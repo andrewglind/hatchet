@@ -4,6 +4,111 @@
 use super::*;
 
 impl<'a> BodyGen<'a> {
+    /// Bind a container element argument (`push`/`insert`) to a named local of the
+    /// **element type** unless it already is one.
+    ///
+    /// `std::vector<T>::push_back` takes `const T&`, so an argument that is not
+    /// already a `T` lvalue materialises a temporary at the call site and binds the
+    /// reference to *that*. VC6's optimiser has been observed reusing such a
+    /// temporary across loop iterations under `/O2` — `indices.push(base + 1)` in a
+    /// loop then pushes the first iteration's values repeatedly (the element *count*
+    /// is right, the values are not). The values are correct in Debug, correct on
+    /// modern MSVC, and the generated C++ is valid — but Hatchet exists to emit C++98
+    /// that behaves on VC6, so it routes around it: emit `T _elem1 = <arg>;` into the
+    /// statement prelude and pass that named variable.
+    ///
+    /// Exempt, because no loop-varying temporary is involved:
+    /// * a literal (any temporary is loop-invariant, so reusing it is harmless);
+    /// * a struct/array/map literal, already hoisted into an element-typed temp;
+    /// * a plain local or `this` field **whose type is exactly the element type** —
+    ///   an lvalue of `T`, which binds directly with no conversion. (Note that
+    ///   `v + 1` where `v` is a `uint16_t` is *not* exempt: C++ promotes it to `int`,
+    ///   so it converts back to a temporary like any other expression.)
+    /// * a pointer element type, where nothing converts and hoisting a `new` would
+    ///   disturb the ownership lowering.
+    pub(super) fn bind_elem_arg(&mut self, arg: Option<&Expr>, code: String, elem: &Ty) -> String {
+        if elem.base.is_empty() || elem.is_ptr {
+            return code;
+        }
+        let Some(arg) = arg else { return code };
+        if !self.elem_arg_needs_temp(arg, elem) {
+            return code;
+        }
+        let tmp = self.fresh("elem");
+        let spell = self.decl_spelling(elem);
+        let t = "\t".repeat(self.prelude_ind);
+        self.prelude
+            .push_str(&format!("{t}{spell} {tmp} = {code};\n"));
+        tmp
+    }
+
+    /// Whether two types are the same C++ type, looking through alias typedefs — a
+    /// local declared `Tileset` *is* an `Array<Tile>` element and a `Node` *is* a
+    /// `Vector`, however each is spelled, so pushing one needs no conversion (and
+    /// must not copy a container twice).
+    fn same_shape(&self, a: &Ty, b: &Ty) -> bool {
+        a.is_ptr == b.is_ptr && self.canonical_base(&a.base) == self.canonical_base(&b.base)
+    }
+
+    /// Follow alias typedefs by *spelling* to the underlying type's C++ base. Unlike
+    /// `deref_alias` this keys on the name rather than a `Ty`'s carried `info`, which
+    /// for an alias may already have been resolved to the target — so both spellings
+    /// of the same type reach the same answer.
+    fn canonical_base(&self, base: &str) -> String {
+        let mut base = base.to_string();
+        for _ in 0..16 {
+            let Some(info) = self
+                .prog
+                .resolve_type_by_cpp_spelling(&base, self.mi, &self.ns)
+            else {
+                break;
+            };
+            if info.kind != TypeKind::AliasTypedef {
+                break;
+            }
+            let Some(Decl::Typedef(td)) = self.prog.type_decl(info) else {
+                break;
+            };
+            let TypedefTarget::Alias(target) = &td.target else {
+                break;
+            };
+            let next = self.ty_of_in(target, info.module_index).base;
+            if next == base || next.is_empty() {
+                break;
+            }
+            base = next;
+        }
+        base
+    }
+
+    /// Whether a container element argument must be bound to a typed local first;
+    /// see [`bind_elem_arg`](Self::bind_elem_arg) for the exemptions.
+    fn elem_arg_needs_temp(&self, arg: &Expr, elem: &Ty) -> bool {
+        match arg {
+            // Grouping / expression-position metadata is transparent.
+            Expr::Paren(inner) | Expr::Meta(_, inner) => self.elem_arg_needs_temp(inner, elem),
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str { .. } | Expr::Null => false,
+            Expr::ObjectLit(_) | Expr::ArrayLit(_) | Expr::MapLit(_) => false,
+            // A plain variable / own field is an lvalue: safe when it is already
+            // spelled as the element type, a conversion (and so a temporary) if not.
+            Expr::Ident(n) => match self.lookup_local(n).or_else(|| {
+                self.class_field(n)
+                    .filter(|_| self.lookup_local(n).is_none())
+                    .map(|f| self.field_ty(f))
+            }) {
+                Some(ty) => !self.same_shape(&ty, elem),
+                None => true,
+            },
+            Expr::Field(recv, name) if matches!(&**recv, Expr::This) => {
+                match self.class_field(name).map(|f| self.field_ty(f)) {
+                    Some(ty) => !self.same_shape(&ty, elem),
+                    None => true,
+                }
+            }
+            _ => true,
+        }
+    }
+
     pub(super) fn container_call(
         &mut self,
         rcode: &str,
@@ -21,13 +126,15 @@ impl<'a> BodyGen<'a> {
                 // The pushed value is typed by the element type (so an object
                 // literal becomes a temp of the element struct, not an anon one).
                 let elem = self.elem_member_ty(_rty);
-                let a = self.gen_args_typed(args, &[Some(elem)], false);
+                let a = self.gen_args_typed(args, &[Some(elem.clone())], false);
+                let a = self.bind_elem_arg(args.first(), a, &elem);
                 Some((format!("{rcode}.push_back({a})"), Ty::default()))
             }
             "insert" => {
                 let pos = self.gen_expr(&args[0]).0;
                 let elem = self.elem_member_ty(_rty);
-                let val = self.gen_args_typed(&args[1..2], &[Some(elem)], false);
+                let val = self.gen_args_typed(&args[1..2], &[Some(elem.clone())], false);
+                let val = self.bind_elem_arg(args.get(1), val, &elem);
                 Some((
                     format!("{rcode}.insert({rcode}.begin() + {pos}, {val})"),
                     Ty::default(),
@@ -283,7 +390,8 @@ impl<'a> BodyGen<'a> {
             // `Array.unshift(x)` → insert `x` at the front (Void).
             "unshift" => {
                 let elem = self.elem_member_ty(_rty);
-                let val = self.gen_args_typed(args, &[Some(elem)], false);
+                let val = self.gen_args_typed(args, &[Some(elem.clone())], false);
+                let val = self.bind_elem_arg(args.first(), val, &elem);
                 Some((
                     format!("{rcode}.insert({rcode}.begin(), {val})"),
                     Ty::default(),

@@ -2,6 +2,60 @@
 
 All notable changes to Hatchet are documented here. Versions follow the project's milestones.
 
+## v0.3.3 — VC6-safe conversions at call sites (2026-09-22)
+
+Two independent conversion hazards, both are routed around in the generator rather than worked around in Haxe.
+
+### Pushed values are bound to an element-typed local
+
+`std::vector<T>::push_back` takes `const T&`, so an argument that is not already a `T` lvalue
+materialises a temporary at the call site and binds the reference to that. VC6's optimiser has been
+observed **reusing that temporary across loop iterations** under `/O2`: a loop of
+`indices.push(base + 1)` produced the right element *count* with the first iteration's values
+repeated, which downstream drew one wall of a corridor five times over. It is correct in Debug,
+correct on modern MSVC, and the generated C++ is valid — the miscompile is VC6's.
+
+`push`, `insert` and `unshift` now bind such an argument to a named local of the element type first:
+
+```cpp
+uint16_t _elem2 = base + 1;
+indices.push_back(_elem2);
+```
+
+Left inline, because no loop-varying temporary is involved: a literal (any temporary it makes is
+loop-invariant), a plain local or `this` field **already of the element type**, a struct/array/map
+literal (already hoisted into an element-typed temp), and a pointer element type (nothing converts,
+and hoisting a `new` would disturb the ownership lowering). Alias typedefs are looked through, so a
+local declared `Tileset` still pushes straight into an `Array<Tile>` with no redundant copy. Note
+that `v + 1` where `v` is a `cpp.UInt16` is *not* exempt: C++ promotes it to `int`, so it converts
+back to a temporary like any other expression.
+
+The trigger has not been isolated to the temporary with certainty — the other candidate is the
+induction variable, which no generator change could address — so this is a route-around of the
+mechanism Hatchet controls, not a confirmed fix.
+
+### Floating literals and narrowings in `cpp.Float32` contexts
+
+Every Haxe floating literal was emitted as a C++ `double` literal, whatever it landed in, so a
+`cpp.Float32` (C++ `float`) target narrowed at the conversion — which MSVC reports as C4305 on each
+line. A literal in a `float` context is now emitted with the `f` suffix, in every position where
+the target type is known: an argument to a `cpp.Float32` parameter, a local or field initialiser or
+assignment, a `return`, an `Array<cpp.Float32>` element, and a struct-literal field.
+
+```cpp
+camera->SetPerspective(70.0f, 0.1f, 100.0f);   // was 70.0, 0.1, 100.0 — C4305
+```
+
+An **expression** (rather than a literal) narrowing into a `float` context is the C4244 counterpart,
+and is now made explicit with a cast — `this->fx = (float)(someFloatValue);` — which is exactly what
+the conversion does anyway.
+
+Arithmetic keeps Haxe's semantics: `Float` arithmetic *is* double arithmetic whatever it is assigned
+to, so an operand keeps its `double` literal and `return a * 0.5;` still computes in double,
+narrowing once at the end (`return (float)(a * 0.5);`). Suffixing the operand would silently make
+the computation single-precision — a behaviour change rather than a cosmetic one. Genuine `Float` /
+`double` contexts are untouched.
+
 ## v0.3.2 — Member types resolve where they are declared (2026-09-17)
 
 A correctness release fixing two lowering bugs that share one root cause. When a module imports

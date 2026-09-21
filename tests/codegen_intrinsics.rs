@@ -784,3 +784,65 @@ fn stringtools_statics_lower_without_using() {
     );
 }
 
+
+#[test]
+fn pushed_expressions_bind_to_an_element_typed_local() {
+    // `std::vector<T>::push_back` takes `const T&`, so a pushed *expression*
+    // materialises a temporary and binds the reference to it — which VC6's
+    // optimiser has been seen reusing across loop iterations (correct element
+    // count, first iteration's values repeated). Hatchet binds such an argument to
+    // a named local of the element type first. A plain variable of the element
+    // type, and a literal, are left inline — nothing converts, and a literal's
+    // temporary is loop-invariant anyway.
+    let src = "\
+class Mesh {
+  public function new() {}
+  public function quadIndices(quads:Int):Array<cpp.UInt16> {
+    var indices:Array<cpp.UInt16> = [];
+    for (q in 0...quads) {
+      var base:Int = q * 4;
+      indices.push(base + 1);
+    }
+    return indices;
+  }
+  public function plain(a:Int, b:Int, s:cpp.UInt16):Array<Int> {
+    var out:Array<Int> = [];
+    out.push(a);
+    out.push(7);
+    out.push(a + b);
+    out.insert(0, a + b);
+    return out;
+  }
+  public function narrow(v:cpp.UInt16):Array<cpp.UInt16> {
+    var out:Array<cpp.UInt16> = [];
+    out.push(v);
+    out.push(v + 1);
+    return out;
+  }
+}
+";
+    let out = gen_one(src, "Mesh");
+    assert!(
+        out.contains("uint16_t _elem2 = base + 1;") && out.contains("indices.push_back(_elem2);"),
+        "a converted expression is bound to an element-typed local:\n{out}"
+    );
+    assert!(
+        out.contains("out.push_back(a);") && out.contains("out.push_back(7);"),
+        "a plain element-typed variable and a literal stay inline:\n{out}"
+    );
+    assert!(
+        out.contains("int _elem3 = a + b;") && out.contains("out.push_back(_elem3);"),
+        "an rvalue expression is bound even when it needs no conversion:\n{out}"
+    );
+    assert!(
+        out.contains("int _elem4 = a + b;")
+            && out.contains("out.insert(out.begin() + 0, _elem4);"),
+        "`insert` binds its value argument the same way:\n{out}"
+    );
+    // `v + 1` promotes to `int` in C++ even though `v` is already the element
+    // type, so it converts back to a temporary and must be bound too.
+    assert!(
+        out.contains("out.push_back(v);") && out.contains("uint16_t _elem5 = v + 1;"),
+        "an arithmetic expression on an element-typed variable is bound:\n{out}"
+    );
+}

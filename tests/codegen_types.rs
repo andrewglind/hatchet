@@ -426,3 +426,74 @@ class User {
         "chained call resolves and dispatches via `->`:\n{out}"
     );
 }
+
+#[test]
+fn float32_contexts_take_suffixed_float_literals() {
+    // A bare C++ floating literal is a `double`, so one landing in a `cpp.Float32`
+    // (C++ `float`) context narrows at the conversion — MSVC reports C4305 on every
+    // such line, and a VC6 build is expected to compile clean. In a `float` context
+    // the literal is emitted `0.1f`; a genuine `Float`/`double` context is untouched.
+    let src = "\
+@:include(\"t.h\") @:native(\"Target\") extern class Target {
+  public function F32(a:cpp.Float32, b:cpp.Float32):Void;
+  public function F64(a:Float, b:Float):Void;
+}
+class Use {
+  var fx:cpp.Float32;
+  var dx:Float;
+  public function new() { this.fx = 0.1; this.dx = 0.1; }
+  public function calls(t:Target):Void {
+    t.F32(70.0, 0.1);
+    t.F64(70.0, 0.1);
+  }
+  public function locals():Void {
+    var f:cpp.Float32 = 0.1;
+    var d:Float = 0.1;
+    f = 0.25;
+    this.fx = 0.3;
+  }
+  public function ret():cpp.Float32 { return 0.1; }
+  public function arr():Array<cpp.Float32> {
+    var xs:Array<cpp.Float32> = [0.1];
+    xs.push(0.2);
+    return xs;
+  }
+  public function arith(a:cpp.Float32):cpp.Float32 { return a * 0.5; }
+}
+";
+    let out = gen_one(src, "Use");
+    assert!(
+        out.contains("t->F32(70.0f, 0.1f);"),
+        "literal arguments to `cpp.Float32` parameters are suffixed:\n{out}"
+    );
+    assert!(
+        out.contains("t->F64(70.0, 0.1);"),
+        "a `Float` (double) parameter is left alone:\n{out}"
+    );
+    assert!(
+        out.contains("float f = 0.1f;")
+            && out.contains("double d = 0.1;")
+            && out.contains("f = 0.25f;")
+            && out.contains("this->fx = 0.3f;")
+            && out.contains("this->fx = 0.1f;")
+            && out.contains("this->dx = 0.1;"),
+        "`cpp.Float32` locals and fields are suffixed, `Float` ones are not:\n{out}"
+    );
+    assert!(
+        out.contains("return 0.1f;"),
+        "a literal returned from a `cpp.Float32` function is suffixed:\n{out}"
+    );
+    assert!(
+        out.contains("xs.push_back(0.1f);") && out.contains("xs.push_back(0.2f);"),
+        "`Array<cpp.Float32>` elements are suffixed:\n{out}"
+    );
+    // Haxe arithmetic on `Float` is double arithmetic whatever it is assigned to,
+    // so an operand keeps its `double` literal — suffixing it there would make the
+    // computation single-precision, a behaviour change rather than a cosmetic one.
+    // The narrowing back to `float` is instead made explicit with a cast, which is
+    // what the conversion does anyway (and is what silences C4244).
+    assert!(
+        out.contains("return (float)(a * 0.5);"),
+        "an arithmetic operand stays a double literal, narrowed by an explicit cast:\n{out}"
+    );
+}

@@ -504,7 +504,7 @@ class Room {
         "Room",
     );
     assert!(
-        out.contains("this->mesh.vertices[_i1].x = 1.0;")
+        out.contains("this->mesh.vertices[_i1].x = 1.0f;")
             && out.contains("this->mesh.vertices[_i1].y;")
             && !out.contains("]->"),
         "a vector-of-structs element is a value (`.`), not a pointer:\n{out}"

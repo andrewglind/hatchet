@@ -331,6 +331,44 @@ impl<'a> BodyGen<'a> {
         Some(ty)
     }
 
+    /// Whether the value currently being generated lands in a 32-bit `float`
+    /// context (`cpp.Float32`), so a floating literal must carry the `f` suffix.
+    pub(super) fn expects_float(&self) -> bool {
+        self.expected
+            .as_ref()
+            .is_some_and(|t| !t.is_ptr && t.base == "float")
+    }
+
+    /// Generate `e` with `hint` as the contextual target type, restoring the
+    /// previous one afterwards. Used where the target is known but is not an
+    /// assignment/declaration sink — a call argument, a container element, a struct
+    /// field — and equally to *stop* an enclosing hint leaking into a nested
+    /// expression that has a target type of its own.
+    pub(super) fn gen_expr_hinted(&mut self, e: &Expr, hint: Option<Ty>) -> (String, Ty) {
+        let saved = std::mem::replace(&mut self.expected, hint.clone());
+        let (code, ty) = self.gen_expr(e);
+        self.expected = saved;
+        (self.narrow_to_float(hint.as_ref(), code, &ty), ty)
+    }
+
+    /// Make a `double` → `float` narrowing explicit with a `(float)` cast when the
+    /// value lands in a `cpp.Float32` context. Haxe arithmetic on `Float` *is*
+    /// double arithmetic, so the conversion happens either way and the cast changes
+    /// nothing at runtime — it only says so in the source, where MSVC would
+    /// otherwise report C4244 on the line (the expression counterpart of the `f`
+    /// suffix a literal gets). A literal has already been emitted as `float`, so it
+    /// arrives here needing nothing.
+    pub(super) fn narrow_to_float(&self, target: Option<&Ty>, code: String, ty: &Ty) -> String {
+        let narrows = target.is_some_and(|t| !t.is_ptr && t.base == "float")
+            && !ty.is_ptr
+            && ty.base == "double";
+        if narrows {
+            format!("(float)({code})")
+        } else {
+            code
+        }
+    }
+
     pub(super) fn decl_spelling(&self, ty: &Ty) -> String {
         if ty.is_ptr {
             format!("{}*", ty.base)

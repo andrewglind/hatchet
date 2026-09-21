@@ -118,9 +118,7 @@ impl<'a> BodyGen<'a> {
                 } else if let Some(e) = init {
                     // The declared type is the contextual hint for the initialiser
                     // (used by `Array.map` to type its result element).
-                    self.expected = declared.clone();
-                    let (c, ty) = self.gen_expr(e);
-                    self.expected = None;
+                    let (c, ty) = self.gen_expr_hinted(e, declared.clone());
                     (Some(c), Some(ty))
                 } else {
                     (None, None)
@@ -286,10 +284,7 @@ impl<'a> BodyGen<'a> {
                     // returned expression — so a value-position `switch`/etc. in
                     // `return` position unifies its arms to the function's return
                     // type (e.g. a base class) rather than its first arm's type.
-                    let saved = self.expected.take();
-                    self.expected = Some(self.current_ret.clone());
-                    let (c, cty) = self.gen_expr(e);
-                    self.expected = saved;
+                    let (c, cty) = self.gen_expr_hinted(e, Some(self.current_ret.clone()));
                     self.flush(out);
                     // A nullable (`Null<T>`) function returns a pointer; a value
                     // result is heap-allocated to match. (A `Null<String>` read in
