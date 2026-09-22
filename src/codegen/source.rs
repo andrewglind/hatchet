@@ -1415,6 +1415,9 @@ fn unop(op: UnOp) -> &'static str {
 /// suffix, which would truncate it to single precision). A literal landing in a
 /// `cpp.Float32` context takes the suffix at the emission site; see the
 /// `Expr::Float` arm of `gen_expr_inner`.
+/// suffix, which would truncate it to single precision). A literal landing in a
+/// `cpp.Float32` context takes the suffix at the emission site; see the
+/// `Expr::Float` arm of `gen_expr_inner`.
 pub(crate) fn float_lit(s: &str) -> String {
     s.to_string()
 }
