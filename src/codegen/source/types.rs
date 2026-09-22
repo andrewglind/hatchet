@@ -348,25 +348,37 @@ impl<'a> BodyGen<'a> {
         let saved = std::mem::replace(&mut self.expected, hint.clone());
         let (code, ty) = self.gen_expr(e);
         self.expected = saved;
-        (self.narrow_to_float(hint.as_ref(), code, &ty), ty)
+        let promoted = promoted_ty(e, &ty);
+        (self.narrow_to_target(hint.as_ref(), code, &promoted), ty)
     }
 
-    /// Make a `double` → `float` narrowing explicit with a `(float)` cast when the
-    /// value lands in a `cpp.Float32` context. Haxe arithmetic on `Float` *is*
-    /// double arithmetic, so the conversion happens either way and the cast changes
-    /// nothing at runtime — it only says so in the source, where MSVC would
-    /// otherwise report C4244 on the line (the expression counterpart of the `f`
-    /// suffix a literal gets). A literal has already been emitted as `float`, so it
-    /// arrives here needing nothing.
-    pub(super) fn narrow_to_float(&self, target: Option<&Ty>, code: String, ty: &Ty) -> String {
-        let narrows = target.is_some_and(|t| !t.is_ptr && t.base == "float")
-            && !ty.is_ptr
-            && ty.base == "double";
-        if narrows {
-            format!("(float)({code})")
-        } else {
-            code
+    /// Make a **narrowing** conversion explicit with a cast when the value lands in
+    /// a smaller scalar context — `double` → `float` (`cpp.Float32`), or a wider
+    /// integer → a narrower one (`Int` → `cpp.UInt16`, the index-buffer idiom).
+    ///
+    /// The conversion happens either way; Haxe arithmetic on `Float` *is* double
+    /// arithmetic and on `Int` *is* `int` arithmetic, so the cast changes nothing at
+    /// runtime. It only says so in the source. Two reasons to say it:
+    ///
+    /// * MSVC otherwise reports C4244 on every such line, and a VC6 build is
+    ///   expected to compile clean (this is the expression counterpart of the `f`
+    ///   suffix a float literal gets);
+    /// * VC6 `/O2` has been observed **miscompiling** a `uint16_t` narrowed from a
+    ///   loop-derived `int` — every iteration takes the first one's value. Whether
+    ///   an explicit cast suppresses that is unconfirmed (it needs a real VC6
+    ///   Release build to test), but it is the one lever the generator has, and it
+    ///   is correct to pull regardless of the answer.
+    ///
+    /// A literal has already been emitted in the target type, so it arrives here
+    /// needing nothing.
+    pub(super) fn narrow_to_target(&self, target: Option<&Ty>, code: String, ty: &Ty) -> String {
+        let Some(target) = target.filter(|t| !t.is_ptr && !ty.is_ptr) else {
+            return code;
+        };
+        if scalar_narrows(&ty.base, &target.base) {
+            return format!("({})({code})", target.base);
         }
+        code
     }
 
     pub(super) fn decl_spelling(&self, ty: &Ty) -> String {

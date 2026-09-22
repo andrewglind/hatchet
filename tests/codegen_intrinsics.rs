@@ -823,7 +823,7 @@ class Mesh {
 ";
     let out = gen_one(src, "Mesh");
     assert!(
-        out.contains("uint16_t _elem2 = base + 1;") && out.contains("indices.push_back(_elem2);"),
+        out.contains("uint16_t _elem2 = (uint16_t)(base + 1);") && out.contains("indices.push_back(_elem2);"),
         "a converted expression is bound to an element-typed local:\n{out}"
     );
     assert!(
@@ -842,7 +842,7 @@ class Mesh {
     // `v + 1` promotes to `int` in C++ even though `v` is already the element
     // type, so it converts back to a temporary and must be bound too.
     assert!(
-        out.contains("out.push_back(v);") && out.contains("uint16_t _elem5 = v + 1;"),
+        out.contains("out.push_back(v);") && out.contains("uint16_t _elem5 = (uint16_t)(v + 1);"),
         "an arithmetic expression on an element-typed variable is bound:\n{out}"
     );
 }

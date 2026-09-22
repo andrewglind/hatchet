@@ -1045,6 +1045,86 @@ fn intrinsic_field(obj: &str, name: &str) -> Option<(String, Ty)> {
     Some((code.to_string(), float_ty()))
 }
 
+/// The type an expression's *C++* value actually has, for deciding whether storing
+/// it somewhere narrows. C++ applies the **integral promotions** to the operands of
+/// an arithmetic or bitwise operator, so `v + 1` on two `uint16_t`s is an `int`
+/// expression even though Haxe (and Hatchet's inference) calls the result `UInt16` —
+/// and assigning it back to a `uint16_t` is therefore a narrowing after all. Any
+/// other expression keeps its inferred type.
+fn promoted_ty(e: &Expr, ty: &Ty) -> Ty {
+    let promotes = match e {
+        Expr::Paren(inner) | Expr::Meta(_, inner) => return promoted_ty(inner, ty),
+        // A literal is written directly in the target type — `uint16_t n = 0;`
+        // converts nothing, so it needs no cast to say so.
+        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Str { .. } | Expr::Null => {
+            return Ty::default()
+        }
+        Expr::Binary { op, .. } => matches!(
+            op,
+            BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Mod
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr
+                | BinOp::UShr
+        ),
+        Expr::Unary { op, .. } => matches!(op, UnOp::Neg | UnOp::BitNot),
+        _ => false,
+    };
+    match scalar_rank(&ty.base) {
+        // integral, narrower than `int` → the expression is an `int`
+        Some((false, bits)) if promotes && !ty.is_ptr && bits < 32 => Ty {
+            base: "int".into(),
+            ..ty.clone()
+        },
+        _ => ty.clone(),
+    }
+}
+
+/// The (kind, width-in-bits) of a C++ scalar spelling Hatchet emits, or `None` for
+/// anything else (a struct, container, `std::string`, …). `bool` is deliberately
+/// absent: a conversion to it is a truth test, not a narrowing.
+fn scalar_rank(base: &str) -> Option<(bool, u8)> {
+    // (is_floating, bits)
+    let r = match base {
+        "char" | "signed char" | "unsigned char" | "int8_t" | "uint8_t" => (false, 8),
+        "short" | "unsigned short" | "int16_t" | "uint16_t" => (false, 16),
+        "int" | "unsigned int" | "long" | "unsigned long" | "int32_t" | "uint32_t" => (false, 32),
+        "size_t" | "int64_t" | "uint64_t" => (false, 64),
+        "float" => (true, 32),
+        "double" => (true, 64),
+        _ => return None,
+    };
+    Some(r)
+}
+
+/// Whether converting a `from` value to a `to` context is a **narrowing** — a
+/// smaller destination of the same kind (`double` → `float`, `int` → `uint16_t`),
+/// or any floating value into an integer. Same-width conversions that only change
+/// signedness are not narrowing, and neither is any widening.
+fn scalar_narrows(from: &str, to: &str) -> bool {
+    if from == to {
+        return false;
+    }
+    match (scalar_rank(from), scalar_rank(to)) {
+        (Some((from_float, from_bits)), Some((to_float, to_bits))) => {
+            if from_float && !to_float {
+                return true; // float → integer always loses the fraction
+            }
+            if !from_float && to_float {
+                return false; // integer → float widens in kind
+            }
+            to_bits < from_bits
+        }
+        _ => false,
+    }
+}
+
 /// `cpp.Float32` — a 32-bit C++ `float`, distinct from Haxe `Float` (`double`).
 fn float32_ty() -> Ty {
     Ty {

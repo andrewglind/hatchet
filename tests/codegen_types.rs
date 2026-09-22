@@ -497,3 +497,53 @@ class Use {
         "an arithmetic operand stays a double literal, narrowed by an explicit cast:\n{out}"
     );
 }
+
+#[test]
+fn narrowing_conversions_are_explicit_casts() {
+    // A value stored into a smaller scalar than it has narrows at the conversion.
+    // Hatchet makes that explicit — `(uint16_t)(...)` — rather than relying on the
+    // implicit conversion: it is what the conversion does anyway, it keeps MSVC
+    // quiet (C4244), and VC6 `/O2` has been seen miscompiling an implicit
+    // `int` → `uint16_t` narrowing of a loop-derived value.
+    let src = "\
+class Mesh {
+  var small:cpp.UInt16;
+  public function new() { this.small = 0; }
+  public function indices(quads:Int):Array<cpp.UInt16> {
+    var out:Array<cpp.UInt16> = [];
+    var n:cpp.UInt16 = 0;
+    for (q in 0...quads) {
+      var base:Int = q * 4;
+      out.push(base + 1);
+      n = n + 1;
+    }
+    this.small = n;
+    return out;
+  }
+  public function wide(a:Int, b:Int):Int { return a + b; }
+}
+";
+    let out = gen_one(src, "Mesh");
+    assert!(
+        out.contains("uint16_t _elem2 = (uint16_t)(base + 1);"),
+        "an `int` expression narrowed into a `cpp.UInt16` element is cast:\n{out}"
+    );
+    // `n + 1` promotes to `int` in C++ even though both sides are `UInt16`, so
+    // storing it back into a `uint16_t` narrows and is cast too.
+    assert!(
+        out.contains("n = (uint16_t)(n + 1);"),
+        "an arithmetic result promoted to `int` is cast back:\n{out}"
+    );
+    assert!(
+        out.contains("this->small = n;"),
+        "a same-typed value needs no cast:\n{out}"
+    );
+    assert!(
+        out.contains("uint16_t n = 0;") && !out.contains("(uint16_t)(0)"),
+        "a literal is written in the target type, uncast:\n{out}"
+    );
+    assert!(
+        out.contains("return a + b;"),
+        "a widening / same-width context is untouched:\n{out}"
+    );
+}

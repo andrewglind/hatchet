@@ -4,35 +4,45 @@ All notable changes to Hatchet are documented here. Versions follow the project'
 
 ## v0.3.3 — VC6-safe conversions at call sites (2026-09-22)
 
-Two independent conversion hazards, both are routed around in the generator rather than worked around in Haxe.
+Conversion hazards at call sites, routed around in the generator rather than worked around in Haxe.
+
+### Narrowing conversions are explicit casts
+
+A value stored into a smaller scalar than it has now says so — `(uint16_t)(base + 1)`,
+`(float)(a * 0.5)` — instead of relying on the implicit conversion. The conversion happens either
+way (Haxe arithmetic on `Int` is `int` arithmetic and on `Float` is double arithmetic), so nothing
+changes at runtime; it silences MSVC C4244, and it is the one lever the generator has against a VC6
+`/O2` miscompile in which a `uint16_t` narrowed from a **loop-derived `int`** takes the first
+iteration's value on every iteration — correct element count, repeated values. Whether the cast
+suppresses that is **unconfirmed**: it needs a real VC6 Release build to tell.
+
+Applied wherever the target type is known — a call argument, a local or field initialiser or
+assignment, a `return`, a container element, a struct-literal field — and only for genuine
+narrowings: a smaller destination of the same kind, or a floating value into an integer. Literals
+are written in the target type already, so they are not cast. C++ **integral promotion** is
+accounted for: `n + 1` where `n` is a `cpp.UInt16` is an `int` expression, so storing it back into a
+`uint16_t` is a narrowing and is cast.
 
 ### Pushed values are bound to an element-typed local
 
 `std::vector<T>::push_back` takes `const T&`, so an argument that is not already a `T` lvalue
-materialises a temporary at the call site and binds the reference to that. VC6's optimiser has been
-observed **reusing that temporary across loop iterations** under `/O2`: a loop of
-`indices.push(base + 1)` produced the right element *count* with the first iteration's values
-repeated, which downstream drew one wall of a corridor five times over. It is correct in Debug,
-correct on modern MSVC, and the generated C++ is valid — the miscompile is VC6's.
-
-`push`, `insert` and `unshift` now bind such an argument to a named local of the element type first:
+materialises a temporary at the call site and binds the reference to that. `push`, `insert` and
+`unshift` now bind such an argument to a named local of the element type first:
 
 ```cpp
-uint16_t _elem2 = base + 1;
+uint16_t _elem2 = (uint16_t)(base + 1);
 indices.push_back(_elem2);
 ```
 
-Left inline, because no loop-varying temporary is involved: a literal (any temporary it makes is
-loop-invariant), a plain local or `this` field **already of the element type**, a struct/array/map
-literal (already hoisted into an element-typed temp), and a pointer element type (nothing converts,
-and hoisting a `new` would disturb the ownership lowering). Alias typedefs are looked through, so a
-local declared `Tileset` still pushes straight into an `Array<Tile>` with no redundant copy. Note
-that `v + 1` where `v` is a `cpp.UInt16` is *not* exempt: C++ promotes it to `int`, so it converts
-back to a temporary like any other expression.
+Left inline: a literal, a plain local or `this` field **already of the element type**, a
+struct/array/map literal (already hoisted into an element-typed temp), and a pointer element type
+(nothing converts, and hoisting a `new` would disturb the ownership lowering). Alias typedefs are
+looked through, so a local declared `Tileset` still pushes straight into an `Array<Tile>` with no
+redundant copy.
 
-The trigger has not been isolated to the temporary with certainty — the other candidate is the
-induction variable, which no generator change could address — so this is a route-around of the
-mechanism Hatchet controls, not a confirmed fix.
+This began as a suspected fix for the VC6 miscompile above; that diagnosis was **wrong** — the fault
+survives it, and the narrowing is the isolated trigger. It is kept as hardening: binding the
+reference to a named variable is the shape hand-written C++ would have, at no runtime cost.
 
 ### Floating literals and narrowings in `cpp.Float32` contexts
 
@@ -47,8 +57,7 @@ camera->SetPerspective(70.0f, 0.1f, 100.0f);   // was 70.0, 0.1, 100.0 — C4305
 ```
 
 An **expression** (rather than a literal) narrowing into a `float` context is the C4244 counterpart,
-and is now made explicit with a cast — `this->fx = (float)(someFloatValue);` — which is exactly what
-the conversion does anyway.
+covered by the explicit casts above — `this->fx = (float)(someFloatValue);`.
 
 Arithmetic keeps Haxe's semantics: `Float` arithmetic *is* double arithmetic whatever it is assigned
 to, so an operand keeps its `double` literal and `return a * 0.5;` still computes in double,
