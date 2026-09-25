@@ -619,6 +619,22 @@ impl<'a> BodyGen<'a> {
                 let (c, _) = self.gen_expr(cond);
                 let (a, aty) = self.gen_expr(then);
                 let (b, _) = self.gen_expr(els);
+                // A Haxe string literal is typed `String` but *emitted* as a bare
+                // C++ literal (a `const char*`). When both arms are literals the
+                // conditional's C++ type is `const char*` too, while Hatchet has
+                // typed the expression `std::string` — so every use downstream is
+                // generated for a `std::string` it does not have: `+` becomes
+                // pointer arithmetic on two pointers (which does not compile), `==`
+                // becomes a pointer comparison (which compiles, and is wrong), and
+                // `.length()` is a member call on a pointer. Materialise the
+                // `std::string` here, once, so the value matches its type.
+                if aty.base == "std::string"
+                    && !aty.is_ptr
+                    && emits_c_string_literal(then)
+                    && emits_c_string_literal(els)
+                {
+                    return (format!("std::string({c} ? {a} : {b})"), aty);
+                }
                 (format!("{c} ? {a} : {b}"), aty)
             }
             Expr::Assign { op, target, value } => {
@@ -1139,7 +1155,12 @@ impl<'a> BodyGen<'a> {
                 return (format!("{rcode}.size()"), size_ty());
             }
             if cty.base == "std::string" {
-                return (format!("{rcode}.length()"), size_ty());
+                // A literal receiver is a `const char*`: materialise it, since
+                // `"abc".length()` is a member call on a pointer.
+                return (
+                    format!("{}.length()", as_string_value(recv, &rcode)),
+                    size_ty(),
+                );
             }
         }
 
@@ -1582,9 +1603,12 @@ impl<'a> BodyGen<'a> {
                     return res;
                 }
             }
-            // Haxe String methods → std::string expressions (Tier 1).
+            // Haxe String methods → std::string expressions (Tier 1). A literal
+            // receiver is a `const char*`, which has no members, so it is
+            // materialised first (`std::string("abc").find(…)`).
             if cty.base == "std::string" {
-                if let Some(res) = self.string_call(&rcode, method, args) {
+                let recv_code = as_string_value(recv, &rcode);
+                if let Some(res) = self.string_call(&recv_code, method, args) {
                     return res;
                 }
             }
@@ -1899,6 +1923,31 @@ fn as_cpp_pointer_call(e: &Expr) -> Option<(&str, &Expr)> {
         _ => false,
     };
     is_pointer.then(|| (method.as_str(), &args[0]))
+}
+
+/// Whether this expression is emitted as a bare C++ string literal — a
+/// `const char*` — rather than as a `std::string` value. True for a Haxe string
+/// literal with nothing to interpolate (an interpolated one is built into a
+/// `std::string` accumulator), seen through transparent wrappers. Hatchet types
+/// both as `String`, so code generated *for* a `std::string` has to know which of
+/// the two it actually has in hand.
+/// A receiver's code as a genuine `std::string` value: a bare literal receiver is
+/// wrapped (`"abc"` → `std::string("abc")`), anything already holding a
+/// `std::string` is left exactly as it was.
+fn as_string_value(recv: &Expr, rcode: &str) -> String {
+    if emits_c_string_literal(recv) {
+        format!("std::string({rcode})")
+    } else {
+        rcode.to_string()
+    }
+}
+
+fn emits_c_string_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Paren(inner) | Expr::Meta(_, inner) => emits_c_string_literal(inner),
+        Expr::Str { raw, interpolated } => !*interpolated || !has_interpolation(raw),
+        _ => false,
+    }
 }
 
 /// The base identifier an lvalue is rooted at: `r` for `r`, `r.f`, `r.f[i]`. Used to

@@ -51,6 +51,17 @@ class Demo {
 		return a + "|" + b + "|" + c + "|" + d + "|" + buf.toString() + "|" + rep + "|" + tr + "|" + (sw ? "T" : "F") + (ew ? "T" : "F") + "|" + hx;
 	}
 
+	// A `?:` whose arms are both string literals is a `const char*` in C++ unless
+	// Hatchet materialises it; concatenating or comparing one must still work.
+	public function ternaries(flag:Bool):String {
+		var suffix = (flag ? "on" : "off") + "!";     // "on!"
+		var prefix = ">" + (flag ? "yes" : "no");     // ">yes"
+		var same = (flag ? "A" : "B") == "A";         // true
+		var n = (flag ? "abc" : "de").length;         // 3
+		var lit = "abcd".length;                      // 4 (literal receiver)
+		return suffix + "|" + prefix + "|" + (same ? "T" : "F") + "|" + Std.string(n) + "|" + Std.string(lit);
+	}
+
 	public function arrays():String {
 		var xs = [1, 2, 3];
 		var ys = [4, 5];
@@ -74,6 +85,7 @@ int main() {
 	lib::Demo d;
 	printf("%s\n", d.strings().c_str());
 	printf("%s\n", d.arrays().c_str());
+	printf("%s\n", d.ternaries(true).c_str());
 	return 0;
 }
 "#;
@@ -157,5 +169,9 @@ fn stdlib_lowerings_compile_and_run() {
     assert!(
         stdout.contains("5|3|1|2|2,5,8"),
         "array lowerings wrong:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("on!|>yes|T|3|4"),
+        "string-literal ternaries / literal receivers wrong:\n{stdout}"
     );
 }

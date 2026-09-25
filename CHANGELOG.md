@@ -2,6 +2,37 @@
 
 All notable changes to Hatchet are documented here. Versions follow the project's milestones.
 
+## v0.3.4 — String literals match the type they are given (2026-09-25)
+
+A Haxe string literal is typed `String` but emitted as a plain C++ literal — a `const char*`, not a
+`std::string`. That is deliberate (it keeps `s == "x"` and `f("x")` free of a pointless temporary),
+but in two positions the value then did not behave as the `String` Hatchet had typed it, and the code
+generated around it was generated for a `std::string` that was not there. Both now materialise the
+value, as `std::string("…")`, exactly where it is needed.
+
+### A `?:` with a literal in both arms
+
+The conditional's own C++ type was `const char*`, so:
+
+```cpp
+(cond ? "A" : "B") + " x"     // invalid operands to binary + — did not compile
+(cond ? "A" : "B") == "A"     // compiled, and compared addresses instead of text
+(cond ? "A" : "BB").length    // member call on a pointer
+```
+
+all three now work off `std::string(cond ? "A" : "B")`. The silent one is the reason this is worth
+more than a compile fix: the comparison built without error and answered by pointer identity.
+
+Only when **both** arms are literals — if either already holds a `std::string`, C++ unifies the
+conditional to `std::string` on its own and the output is unchanged. Non-string ternaries are
+untouched.
+
+### A literal receiver of a member
+
+`"abc".length`, `"abc".charAt(1)`, `"abc".indexOf("c")` and `"abc".charCodeAt(0)` emitted member
+calls on a `const char*`. The receiver is now materialised for the call. (`substr`, `split` and the
+case conversions were already correct — they read the receiver through a temporary.)
+
 ## v0.3.3 — VC6-safe conversions at call sites (2026-09-22)
 
 Conversion hazards at call sites, routed around in the generator rather than worked around in Haxe.

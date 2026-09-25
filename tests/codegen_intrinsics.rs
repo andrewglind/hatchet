@@ -846,3 +846,81 @@ class Mesh {
         "an arithmetic expression on an element-typed variable is bound:\n{out}"
     );
 }
+
+#[test]
+fn a_ternary_of_string_literals_is_a_real_string() {
+    // A Haxe string literal is typed `String` but emitted as a bare C++ literal —
+    // a `const char*`. When both arms of a `?:` are literals the conditional is a
+    // `const char*` too, while Hatchet has typed the expression `std::string`, so
+    // everything generated downstream is generated for a `std::string` it does not
+    // have: `+` would be pointer + pointer (which does not compile) and `==` a
+    // pointer comparison (which compiles, and is wrong). The value is materialised
+    // once, at the conditional.
+    let src = "\
+class Pick {
+  public function new() {}
+  public function suffix(c:Bool):String { return (c ? \"A\" : \"B\") + \" x\"; }
+  public function prefix(c:Bool):String { return \"x \" + (c ? \"A\" : \"B\"); }
+  public function both(c:Bool):String { return (c ? \"A\" : \"B\") + (c ? \"C\" : \"D\"); }
+  public function eq(c:Bool):Bool { return (c ? \"A\" : \"B\") == \"A\"; }
+  public function len(c:Bool):Int { return (c ? \"A\" : \"BB\").length; }
+  public function nums(c:Bool):Int { return (c ? 1 : 2) + 3; }
+  public function mixed(s:String, c:Bool):String { return (c ? s : \"B\") + \"!\"; }
+}
+";
+    let out = gen_one(src, "Pick");
+    assert!(
+        out.contains("(std::string(c ? \"A\" : \"B\")) + \" x\"")
+            && out.contains("\"x \" + (std::string(c ? \"A\" : \"B\"))"),
+        "a literal-armed ternary concatenates as a std::string:\n{out}"
+    );
+    assert!(
+        out.contains("(std::string(c ? \"A\" : \"B\")) + (std::string(c ? \"C\" : \"D\"))"),
+        "two literal-armed ternaries concatenate:\n{out}"
+    );
+    assert!(
+        out.contains("(std::string(c ? \"A\" : \"B\")) == \"A\""),
+        "comparison is a string compare, not a pointer compare:\n{out}"
+    );
+    assert!(
+        out.contains("(std::string(c ? \"A\" : \"BB\")).length()"),
+        "a member call on the result resolves:\n{out}"
+    );
+    // Only literal arms need it: a non-string ternary, and one whose arm already
+    // holds a `std::string`, are left exactly as they were.
+    assert!(
+        out.contains("(c ? 1 : 2) + 3"),
+        "a non-string ternary is untouched:\n{out}"
+    );
+    assert!(
+        out.contains("(c ? s : \"B\") + \"!\""),
+        "an arm that is already a std::string needs no wrapper:\n{out}"
+    );
+}
+
+#[test]
+fn string_methods_on_a_literal_receiver_resolve() {
+    // Same mismatch, other side: `"abc".length` would be a member call on a
+    // `const char*`. The receiver is materialised for the call.
+    let src = "\
+class Lit {
+  public function new() {}
+  public function len():Int { return \"abcd\".length; }
+  public function at():String { return \"abc\".charAt(1); }
+  public function find():Int { return \"abc\".indexOf(\"c\"); }
+  public function code():Int { return \"abc\".charCodeAt(0); }
+}
+";
+    let out = gen_one(src, "Lit");
+    for needle in [
+        "std::string(\"abcd\").length()",
+        "std::string(\"abc\").substr(1, 1)",
+        "std::string(\"abc\").find(\"c\")",
+        "std::string(\"abc\").at(0)",
+    ] {
+        assert!(
+            out.contains(needle),
+            "expected {needle:?} — a literal receiver is materialised:\n{out}"
+        );
+    }
+}
