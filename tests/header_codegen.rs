@@ -345,3 +345,44 @@ fn custom_accessor_of_public_property_stays_public() {
         );
     }
 }
+
+#[test]
+fn a_final_lambda_is_declared_with_the_types_it_is_defined_with() {
+    // A top-level `final` bound to an arrow is a namespace free function. Where the
+    // arrow leaves a parameter bare, its type comes from the binding's function-type
+    // annotation — and the header's *declaration* must fill them exactly as the
+    // definition does. Typing them from the bare params instead defaults each to
+    // `int`, which declares a different function from the one defined: a phantom
+    // overload that nothing defines, so a call binding it fails to link.
+    let dir = std::env::temp_dir().join(format!("hatchet_finalfn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Api.hx"),
+        "package p;\n\
+         typedef Cfg = { n:Int };\n\
+         final pick:(Cfg, String, Bool) -> Bool = (cfg, key, fallback) -> fallback;\n\
+         final scale:(Cfg, cpp.Float32) -> cpp.Float32 = (cfg, by) -> by;\n\
+         final typed:(Int) -> Int = (n:Int) -> n;\n",
+    )
+    .unwrap();
+    let prog = Program::from_src_dir(&dir).expect("build program");
+    let out = header(&prog, "Api");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        out.contains("bool pick(const Cfg& cfg, const std::string& key, bool fallback);"),
+        "params come from the binding's function type, not `int`:\n{out}"
+    );
+    assert!(
+        out.contains("float scale(const Cfg& cfg, float by);"),
+        "every param position is filled from the annotation:\n{out}"
+    );
+    assert!(
+        out.contains("int typed(int n);"),
+        "an annotated arrow param is unaffected:\n{out}"
+    );
+    assert!(
+        !out.contains("(int cfg"),
+        "no parameter falls back to `int`:\n{out}"
+    );
+}

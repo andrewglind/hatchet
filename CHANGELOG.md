@@ -2,6 +2,12 @@
 
 All notable changes to Hatchet are documented here. Versions follow the project's milestones.
 
+## v0.3.5 — A free function's declaration is typed like its definition (2026-10-01)
+
+A correctness release that fixes top-level `final` bound to an arrow. Where the arrow leaves a
+parameter bare its type comes from the binding's function-type annotation. The **definition** did
+that; the header's forward **declaration** did not, defaulting every such parameter to `int`.
+
 ## v0.3.4 — String literals match the type they are given (2026-09-25)
 
 A Haxe string literal is typed `String` but emitted as a plain C++ literal — a `const char*`, not a
