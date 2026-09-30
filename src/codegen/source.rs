@@ -959,7 +959,11 @@ fn is_null_type(ty: &Option<Type>) -> bool {
 /// `a`/`b` unannotated on the arrow, but the binding's `(Vector, Vector)` types
 /// them — without this they would default to `int` and `a.x` would be invalid.
 /// An arrow param that *is* annotated wins over the binding's type.
-fn effective_lambda_params(params: &[Param], decl_ty: Option<&Type>) -> Vec<Param> {
+///
+/// The header's forward declaration of the same free function must fill its
+/// parameters identically, or the declaration and the definition are two different
+/// overloads — one of them never defined.
+pub(crate) fn effective_lambda_params(params: &[Param], decl_ty: Option<&Type>) -> Vec<Param> {
     let func_params = match decl_ty {
         Some(Type::Func { params, .. }) => Some(params),
         _ => None,

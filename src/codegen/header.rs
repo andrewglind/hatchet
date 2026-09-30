@@ -1122,7 +1122,15 @@ impl<'a> HeaderGen<'a> {
                 _ => "double".to_string(),
             },
         };
-        Some(format!("{ret_cpp} {}({})", g.name, self.params(params)))
+        // The arrow's params are typed the same way the definition types them —
+        // from the binding's function-type annotation where the arrow leaves a
+        // param bare (`optional:(JObject, String, Bool) -> Bool = (o, k, f) -> …`).
+        // Declaring them from the bare params instead defaults each to `int`, which
+        // does not merely read wrong: it declares a *different* function from the
+        // one defined below it, so the call either resolves to the undefined
+        // declaration or is ambiguous.
+        let params = crate::codegen::source::effective_lambda_params(params, g.ty.as_ref());
+        Some(format!("{ret_cpp} {}({})", g.name, self.params(&params)))
     }
 
     fn params(&self, params: &[Param]) -> String {
